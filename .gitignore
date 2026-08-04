@@ -1,0 +1,10 @@
+
+# Backups
+*.bak
+hyprland.conf.bak
+
+# Temporary/Cache files
+*.log
+cache/
+tmp/
+*.swp
