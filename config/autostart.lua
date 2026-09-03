@@ -28,9 +28,9 @@ hl.on("hyprland.start", function()
     -- ==========================================
     
     -- Launch Firefox with exact inline dashboard geometry silently on Workspace 9
-    hl.exec_cmd("[float; size 920 655; move 20 45; workspace 9 silent] firefox --new-window https://www.youtube.com")
+    hl.exec_cmd("[float; size 736 524; move 16 36; workspace 9 silent] firefox --new-window https://www.youtube.com")
     -- Launch terminal dashboard apps
     hl.exec_cmd("ghostty --class=com.dash.cava -e cava")
-    hl.exec_cmd("ghostty --class=com.dash.btop -e btop")
+    hl.exec_cmd("ghostty --class=com.dash.rain -e cbonsai -li")
     hl.exec_cmd("ghostty --class=com.dash.clock -e tty-clock -c")
 end)

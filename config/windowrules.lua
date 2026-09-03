@@ -1,41 +1,18 @@
--- config/windowrules.lua
-
--- Ignore maximize requests from apps
-hl.window_rule({
-    name = "suppress-maximize-events",
-    match = { class = ".*" },
-    suppress_event = "maximize",
-})
-
--- Fix some dragging issues with XWayland
-hl.window_rule({
-    name = "fix-xwayland-drags",
-    match = { class = "^$", title = "^$", xwayland = true, float = true, fullscreen = false, pin = false },
-    no_focus = true,
-})
-
--- Disable blur for floating XWayland windows
-hl.window_rule({
-    name = "no-blur-xwayland-float",
-    match = { xwayland = true, float = true },
-    no_blur = true,
-})
-
 -- 1. Bottom-Left: Cava Audio Visualizer
 hl.window_rule({
     match = { class = "com.dash.cava" },
     float = true,
-    size = { 1200, 340 },
-    move = { 20, 720 },
+    size = { 960, 272 },   -- Reduced 20% from 1200x340
+    move = { 16, 576 },    -- Reduced 20% from 20x720
     workspace = "9 silent",
 })
 
--- 2. Top-Right: btop System Monitor
+-- 2. Top-Right: Bonsai Tree
 hl.window_rule({
-    match = { class = "com.dash.btop" },
+    match = { class = "com.dash.rain" },
     float = true,
-    size = { 920, 600 },
-    move = { 980, 45 },
+    size = { 736, 480 },
+    move = { 784, 36 },
     workspace = "9 silent",
 })
 
@@ -43,7 +20,7 @@ hl.window_rule({
 hl.window_rule({
     match = { class = "com.dash.clock" },
     float = true,
-    size = { 600, 280 },
-    move = { 1300, 780 },
+    size = { 480, 224 },   -- Reduced 20% from 600x280
+    move = { 1040, 624 },  -- Reduced 20% from 1300x780
     workspace = "9 silent",
 })
