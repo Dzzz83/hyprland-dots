@@ -1,3 +1,5 @@
+-- config/windowrules.lua
+
 -- 1. Bottom-Left: Cava Audio Visualizer
 hl.window_rule({
     match = { class = "com.dash.cava" },

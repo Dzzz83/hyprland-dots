@@ -1,6 +1,8 @@
+-- config/binds.lua
 local mainMod = "SUPER"
 
 hl.bind(mainMod .. " + Return", hl.dsp.exec_cmd("ghostty"))
+
 -- Window & System Actions
 hl.bind(mainMod .. " + Q", hl.dsp.window.close())
 hl.bind(mainMod .. " + SHIFT + CTRL + Escape", hl.dsp.exit())
@@ -29,6 +31,15 @@ hl.bind("CTRL + SHIFT + Escape", hl.dsp.exec_cmd("ghostty --class=floating_btop 
 -- Super + Left/Right: Cycle previous/next workspace
 hl.bind(mainMod .. " + left",  hl.dsp.focus({ workspace = "-1" }))
 hl.bind(mainMod .. " + right", hl.dsp.focus({ workspace = "+1" }))
+
+-- Super + Shift + Left/Right: Move active window to next/prev workspace and follow it
+hl.bind(mainMod .. " + SHIFT + left", function()
+    hl.dispatch(hl.dsp.window.move({ workspace = "-1" }))
+end)
+
+hl.bind(mainMod .. " + SHIFT + right", function()
+    hl.dispatch(hl.dsp.window.move({ workspace = "+1" }))
+end)
 
 -- Super + Up/Down: Jump 10 workspaces by triggering +1 ten times instantly
 hl.bind(mainMod .. " + up", function()
