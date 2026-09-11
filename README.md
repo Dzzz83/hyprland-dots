@@ -1,28 +1,53 @@
-# Hyprland Dotfiles
+# 🪟 Dzzz83 Hyprland Dotfiles
 
 A modular, Lua-based Hyprland configuration running on CachyOS. 
 This setup features a custom 2D workspace grid, a dedicated Workspace 9 dashboard, Catppuccin Mocha theming, and consolidated configs for Waybar, Rofi, Wlogout, and Cava using symlinks for easy dotfile management.
 
 ## 🖥️ Environment & OS
 *   **OS:** CachyOS (Arch Linux)
-*   **Compositor:** Hyprland 0.56.1 (Using the **new Lua config API**)
+*   **Compositor:** Hyprland 0.56.1+ (Using the **new Lua config API**)
 *   **Shell:** fish
 *   **Terminal:** Ghostty
 *   **Bar / Launcher:** Waybar, Rofi, SwayNC
 *   **Theme:** Catppuccin Mocha
 
+### 🌳 Branch Guide
+*   `main`: Base config / Old Laptop (Lenovo Legion 5, 1920x1080 @ 1.2 scale)
+*   `slim-pro-9i`: New Laptop (Lenovo Slim Pro 9i, 3200x2000 @ 1.67 scale)
+
 ---
 
-## 🚀 Installation Guide (Fresh Install / New Machine)
+## 🚀 Full Installation Guide (Fresh Install)
 
-If you are setting this up on a new laptop (like the Lenovo Slim Pro 9i) or starting fresh:
-
-1. **Clone the repository:**
+1. **Clone the correct branch:**
    ```bash
-   git clone https://github.com/Dzzz83/hyprland-dots.git ~/.config/hypr
+   # For the new laptop:
+   git clone -b slim-pro-9i https://github.com/Dzzz83/hyprland-dots.git ~/.config/hypr
    ```
 
-2. **Create Symlinks for External Apps:**
+2. **Install Core Dependencies (pacman):**
+   ```bash
+   sudo pacman -S hyprland waybar rofi swaync ghostty wlogout cava tty-clock fcitx5 nm-connection-editor nemo wl-clipboard hyprshot gtk3 playerctl brightnessctl hyprlock wev inotify-tools xdotool
+   ```
+   *(Note: `wev` and `inotify-tools` are used for debugging brightness/hardware keys).*
+
+3. **Install AUR Dependencies (paru):**
+   First, install `paru` if you don't have it:
+   ```bash
+   sudo pacman -S --needed base-devel git
+   cd ~/Downloads && git clone https://aur.archlinux.org/paru.git && cd paru && makepkg -si
+   ```
+   Then install the AUR packages:
+   ```bash
+   paru -S cbonsai networkmanager-dmenu-git
+   ```
+
+4. **Install Fonts & Icons:**
+   ```bash
+   sudo pacman -S ttf-jetbrains-mono-nerd whitesur-icon-theme-dark
+   ```
+
+5. **Create Symlinks for External Apps:**
    Since Waybar, Rofi, Wlogout, and Cava look for their configs in `~/.config/`, you must symlink them to this repo:
    ```bash
    ln -s ~/.config/hypr/waybar ~/.config/waybar
@@ -32,18 +57,18 @@ If you are setting this up on a new laptop (like the Lenovo Slim Pro 9i) or star
    ln -s ~/.config/hypr/scripts ~/.config/viegphunt
    ```
 
-3. **Ensure Colors Exist (CRITICAL):**
-   Waybar and Rofi import colors from `~/.config/colors/`. If this is a fresh install, Waybar will crash. Create dummy files:
+6. **Configure Network Manager Dmenu:**
+   Create the config file so the Waybar Wi-Fi button opens a themed Rofi menu:
    ```bash
-   mkdir -p ~/.config/colors
-   touch ~/.config/colors/colors.css
-   touch ~/.config/colors/colors.rasi
+   mkdir -p ~/.config/networkmanager-dmenu
+   echo -e '[dmenu]\ndmenu_command = rofi -dmenu -i -theme ~/.config/hypr/rofi/network.rasi\n\n[editor]\nterminal = ghostty\ngui_if_available = False' > ~/.config/networkmanager-dmenu/config.ini
    ```
 
-4. **Workspace 9 Dashboard Dependencies:**
-   The autostart launches a custom dashboard. Ensure these are installed:
+7. **Ensure Colors Exist (CRITICAL):**
+   Waybar and Rofi import colors from `~/.config/colors/`. If this is a fresh install, Waybar will crash. Create the files and populate them with Catppuccin Mocha:
    ```bash
-   sudo pacman -S firefox cava cbonsai tty-clock
+   mkdir -p ~/.config/colors
+   # Create colors.rasi and colors.css with Catppuccin Mocha variables (see repo files for reference)
    ```
 
 ---
@@ -94,30 +119,28 @@ If you are setting this up on a new laptop (like the Lenovo Slim Pro 9i) or star
 ## 📊 Workspace 9 Dashboard Layout
 
 Workspace 9 is a dedicated dashboard that auto-launches on startup. 
-*(Sizes below are for the old laptop. Scale up ~11% in Y-coordinates for the new 1.67 scale laptop).*
 
-*   **Top-Left (Firefox YouTube):** `[float; size 736 524; move 16 36; workspace 9 silent]`
-*   **Bottom-Left (Cava):** `class = com.dash.cava`, `size = 960 272`, `move = 16 576`
-*   **Top-Right (cbonsai):** `class = com.dash.rain`, `size = 736 480`, `move = 784 36`
-*   **Bottom-Right (tty-clock):** `class = com.dash.clock`, `size = 480 224`, `move = 1040 624`
+*   **Top-Left (Firefox YouTube):** `[float; size 920 727; move 20 50; workspace 9 silent]`
+*   **Bottom-Left (Cava):** `class = com.dash.cava`, `size = 1200 377`, `move = 20 799`
+*   **Top-Right (cbonsai):** `class = com.dash.rain`, `size = 920 666`, `move = 980 50`
+*   **Bottom-Right (tty-clock):** `class = com.dash.clock`, `size = 600 311`, `move = 1300 866`
 
 ---
 
 ## ⚠️ Known Bugs & Workarounds (Hyprland 0.56.1)
 
-We spent hours debugging these issues in Hyprland 0.56.1. **DO NOT revert these fixes:**
-
-1.  **Waybar Workspace Clicking Broken:** Waybar's native `hyprland/workspaces` module does not work with Hyprland 0.56's Lua IPC. 
+1.  **Waybar Workspace Clicking Broken:** Waybar's native `hyprland/workspaces` module does not work with the Lua IPC. 
     *   *Fix:* Waybar uses the `ext/workspaces` module, and workspaces are made persistent in `config/workspaces.lua`.
-2.  **Workspace Jump Freezes:** Calling `hyprctl activeworkspace` from inside a Hyprland keybind causes an IPC deadlock and freezes the laptop. 
-    *   *Fix:* The "2D Workspace Grid" (jumping 10 workspaces up/down) uses a pure Lua `for` loop in `binds.lua`.
-3.  **Cava Scrollbar/Gap Bug:** Cava miscalculates terminal height in Ghostty using the `noncurses` output, causing a scrollbar and a top gap.
+2.  **Workspace Jump Freezes:** Calling `hyprctl activeworkspace` from inside a keybind causes an IPC deadlock. 
+    *   *Fix:* The "2D Workspace Grid" uses a pure Lua `for` loop in `binds.lua`.
+3.  **Cava Scrollbar/Gap Bug:** Cava miscalculates terminal height in Ghostty using `noncurses` output.
     *   *Fix:* Cava `config` is explicitly set to `method = ncurses` under `[output]`.
+4.  **Lenovo BIOS Stealing Brightness Keys:** F5/F6 brightness keys are intercepted by firmware, bypassing `brightnessctl` and `systemd-logind`.
+    *   *Fix:* Mapped brightness to `Super + Page Up` / `Super + Page Down` using `brightnessctl -d intel_backlight`.
 
 ---
 
 ## 🎨 Theming
-
 *   **Catppuccin Mocha** is the primary color palette.
-*   **Cava** uses a custom cold color gradient (greens, teals, blues) with `bars = 0` (auto-fill width) and `sensitivity = 50`.
+*   **Cava** uses a custom cold color gradient with `bars = 0` (auto-fill width) and `sensitivity = 50`.
 *   **GTK Theming:** Applied automatically on startup via `~/.config/hypr/scripts/gtkthemes.sh`.
