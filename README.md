@@ -1,4 +1,4 @@
-# 🪟 Dzzz83 Hyprland Dotfiles
+# 🪟 Hyprland Dotfiles
 
 A modular, Lua-based Hyprland configuration running on CachyOS. 
 This setup features a custom 2D workspace grid, a dedicated Workspace 9 dashboard, Catppuccin Mocha theming, and consolidated configs for Waybar, Rofi, Wlogout, and Cava using symlinks for easy dotfile management.
