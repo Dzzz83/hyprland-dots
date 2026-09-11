@@ -62,7 +62,8 @@
             "show-per-app-label": false
         },
         "backlight": {
-            "label": "󰃟 "
+            "label": "󰃟 ",
+            "device": "intel_backlight"
         },
         "dnd": {
             "text": "Do Not Disturb"

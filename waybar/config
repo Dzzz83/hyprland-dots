@@ -30,10 +30,11 @@
 
     "network": {
         "format-wifi": "  {essid}",
-        "format-ethernet": "  Ethernet",
-        "format-linked": "  Linked (No IP)",
-        "format-disconnected": "  Disconnected",
+        "format-ethernet": "  Ethernet",
+        "format-linked": "  Linked (No IP)",
+        "format-disconnected": "  Disconnected",
         "tooltip": false,
+        "on-click": "networkmanager_dmenu", 
     },
 
     "battery": {
