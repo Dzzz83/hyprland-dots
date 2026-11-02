@@ -192,7 +192,7 @@ the older `Super + Shift + R` recorder uses `~/Videos/Recordings`.
 ## References and inspiration
 
 This setup takes inspiration from [ViegPhunt/Arch-Hyprland](https://github.com/ViegPhunt/Arch-Hyprland.git), [ViegPhunt/Dotfiles](https://github.com/ViegPhunt/Dotfiles.git), and
-[this Hyprland tutorial](https://youtu.be/j_eCc8s1v3M?si=_P0I7HL-We6sLhNG).
+[My Arch Hypr Rice Showcase](https://youtu.be/j_eCc8s1v3M?si=_P0I7HL-We6sLhNG).
 
 Thanks to [Hyprland](https://github.com/hyprwm/Hyprland), [Hyprspace](https://github.com/KZDKM/Hyprspace),
 [Wi-Fi Manager](https://github.com/Vijay-papanaboina/wifi-manager),
