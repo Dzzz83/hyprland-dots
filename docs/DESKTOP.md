@@ -92,6 +92,12 @@ cool/neutral) to 100% (3000 K, warm), and remains applied when the center is
 closed. Volume stays in the separate Sound popup. Brightness uses the laptop's
 `nvidia_0` backlight, with a 5% minimum.
 
+The media card uses full-width artwork with a dark gradient behind its title
+and playback controls, inspired by Apple Music's MiniPlayer. Long titles are
+ellipsized. The duplicate thumbnail is hidden, with a dark Mocha base intended
+as the fallback when artwork is unavailable; that state has not been visually
+verified. SwayNC's built-in widget has no seek bar.
+
 Color temperature uses [hyprsunset](https://github.com/hyprwm/hyprsunset)
 0.4.0, installed at `~/.local/bin/hyprsunset`. The helper
 `scripts/display-temperature.py` starts it at login at 6500 K and translates

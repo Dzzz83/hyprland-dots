@@ -9,7 +9,7 @@ Hyprland with Lua config, Catppuccin Mocha, translucent panels, and a workspace 
 
 - Smooth workspace slides and an Alt-held workspace preview.
 - Waybar with matching Wi-Fi, Bluetooth, sound, and battery popups.
-- SwayNC notifications with brightness and warm-light controls.
+- SwayNC notifications with an artwork-led media card, brightness, and warm-light controls.
 - One toolbar for screenshots, annotation, and screen recording.
 - Ghostty, Fish, Rofi, Thunar, and a green power menu.
 - Configs, themes, icons, wallpapers, and modified sources in one checkout.
@@ -179,6 +179,10 @@ In the capture toolbar, choose screenshot or recording before selecting a target
 Press Enter to save an edited screenshot; Escape cancels. To stop a toolbar
 recording, reopen it and click the checked record circle. Audio starts off.
 Toolbar output goes to `~/Pictures/Screenshots` and `~/Videos/Screenrecords`.
+
+The notification center (`Super + N`) shows an Apple Music inspired media card
+with full-width artwork, a dark gradient, and playback controls. Long titles
+are shortened to fit. It uses SwayNC's built-in media widget, without a seek bar.
 
 ## More details
 

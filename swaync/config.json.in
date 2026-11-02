@@ -44,7 +44,7 @@
     ],
     "widget-config": {
         "mpris": {
-            "image-size": 50,
+            "show-album-art": "never",
             "autohide": true
         },
         "backlight": {
