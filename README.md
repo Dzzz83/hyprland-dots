@@ -169,7 +169,6 @@ See [deployment and rollback](docs/MIGRATION.md) for the file mapping and recove
 | Shortcut | Action |
 | --- | --- |
 | `Super + Shift + S` | Screenshot / recording toolbar |
-| `Super + Shift + R` | Region recording; press again to stop |
 | Volume up / down | Change output volume by 5% |
 | Speaker / microphone mute | Toggle the corresponding mute |
 | Brightness up / down | Change brightness by 10% |
@@ -179,8 +178,7 @@ See [deployment and rollback](docs/MIGRATION.md) for the file mapping and recove
 In the capture toolbar, choose screenshot or recording before selecting a target.
 Press Enter to save an edited screenshot; Escape cancels. To stop a toolbar
 recording, reopen it and click the checked record circle. Audio starts off.
-Toolbar output goes to `~/Pictures/Screenshots` and `~/Videos/Screenrecords`;
-the older `Super + Shift + R` recorder uses `~/Videos/Recordings`.
+Toolbar output goes to `~/Pictures/Screenshots` and `~/Videos/Screenrecords`.
 
 ## More details
 

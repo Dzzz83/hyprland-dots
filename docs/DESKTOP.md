@@ -20,7 +20,7 @@ The local build targets Hyprland 0.57.0 and supports PNG screenshots and video;
 HDR HEIC export and the optional neural echo canceller are not installed.
 `config/capture.lua` loads it and falls back to Hyprshot if loading fails.
 Rebuild after Hyprland or Qt updates. Build, validation and rollback details are
-in [deployment notes](MIGRATION.md). Super + Shift + R retains the previous recorder.
+in [deployment notes](MIGRATION.md).
 
 ## Power and battery
 

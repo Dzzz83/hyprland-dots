@@ -20,7 +20,6 @@ hl.bind(mainMod .. " + V", hl.dsp.exec_cmd("~/.config/hypr/scripts/clipboard_lau
 hl.bind(mainMod .. " + Period", hl.dsp.exec_cmd("~/.config/hypr/scripts/emoji_launcher.sh"))
 hl.bind(mainMod .. " + SHIFT + W", hl.dsp.exec_cmd("~/.config/hypr/scripts/wallpaper_random.sh"))
 hl.bind(mainMod .. " + SHIFT + S", capture.open)
-hl.bind(mainMod .. " + SHIFT + R", hl.dsp.exec_cmd("~/.local/bin/screen-record"))
 hl.bind(mainMod .. " + H", hl.dsp.exec_cmd("~/.config/hypr/scripts/key_hints.sh"))
 hl.bind(mainMod .. " + L", hl.dsp.exec_cmd("loginctl lock-session"))
 hl.bind(mainMod .. " + N", hl.dsp.exec_cmd("swaync-client -t -sw"))
