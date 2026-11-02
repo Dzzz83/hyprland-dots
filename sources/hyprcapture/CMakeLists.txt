@@ -1,0 +1,670 @@
+cmake_minimum_required(VERSION 3.19)
+project(HyprCapture VERSION "0.5.0")
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+
+option(BUILD_TESTING "Build the optional HyprCapture test suite" OFF)
+include(CTest)
+include(GNUInstallDirs)
+
+set(HYPRCAPTURE_DEFAULT_HELPER_PATH "" CACHE FILEPATH "Optional trusted default path to hyprcapture-ui")
+set(HYPRCAPTURE_TRUSTED_BIN_DIRS "" CACHE STRING "Colon-separated extra trusted program directories")
+
+add_compile_definitions(WLR_USE_UNSTABLE)
+if(HYPRCAPTURE_DEFAULT_HELPER_PATH)
+  add_compile_definitions(HYPRCAPTURE_DEFAULT_HELPER_PATH="${HYPRCAPTURE_DEFAULT_HELPER_PATH}")
+endif()
+if(HYPRCAPTURE_TRUSTED_BIN_DIRS)
+  add_compile_definitions(HYPRCAPTURE_TRUSTED_BIN_DIRS="${HYPRCAPTURE_TRUSTED_BIN_DIRS}")
+endif()
+add_compile_options(
+  -g
+  -Wall
+  -Wextra
+  -Wno-unused-parameter
+  -Wno-unused-value
+  -Wno-missing-field-initializers
+  -Wno-narrowing
+  -Wno-pointer-arith
+  --no-gnu-unique
+)
+
+include(cmake/Dependencies.cmake)
+# Native HDR presentation is independent of the SDR Qt raster backing store.
+add_library(hyprcapture-hdr-backdrop STATIC src/ui/hdr_backdrop.cpp src/ui/hdr_gpu.cpp src/ui/hdr_shm.cpp
+  src/ui/clipboard_utils.cpp src/shared/process_environment.cpp src/shared/trusted_path.cpp)
+target_include_directories(hyprcapture-hdr-backdrop PUBLIC src)
+find_package(Threads REQUIRED)
+target_link_libraries(hyprcapture-hdr-backdrop PUBLIC Qt6::Gui Threads::Threads)
+find_package(Qt6GuiPrivate QUIET)
+pkg_check_modules(WAYLAND_CLIENT QUIET IMPORTED_TARGET wayland-client)
+pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+find_program(WAYLAND_SCANNER wayland-scanner)
+if(WAYLAND_CLIENT_FOUND AND WAYLAND_SCANNER AND TARGET Qt6::GuiPrivate AND
+   EXISTS "${WAYLAND_PROTOCOLS_DIR}/staging/color-management/color-management-v1.xml")
+  foreach(protocol color-management viewporter linux-dmabuf presentation-time)
+    if(protocol STREQUAL "color-management")
+      set(protocol_xml "${WAYLAND_PROTOCOLS_DIR}/staging/color-management/color-management-v1.xml")
+    elseif(protocol STREQUAL "linux-dmabuf")
+      set(protocol_xml "${WAYLAND_PROTOCOLS_DIR}/stable/linux-dmabuf/linux-dmabuf-v1.xml")
+    else()
+      set(protocol_xml "${WAYLAND_PROTOCOLS_DIR}/stable/${protocol}/${protocol}.xml")
+    endif()
+    add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${protocol}-client.h" "${CMAKE_CURRENT_BINARY_DIR}/${protocol}-protocol.c"
+      COMMAND ${WAYLAND_SCANNER} client-header ${protocol_xml} "${CMAKE_CURRENT_BINARY_DIR}/${protocol}-client.h"
+      COMMAND ${WAYLAND_SCANNER} private-code ${protocol_xml} "${CMAKE_CURRENT_BINARY_DIR}/${protocol}-protocol.c"
+      DEPENDS ${protocol_xml} VERBATIM)
+    target_sources(hyprcapture-hdr-backdrop PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/${protocol}-client.h" "${CMAKE_CURRENT_BINARY_DIR}/${protocol}-protocol.c")
+  endforeach()
+  target_include_directories(hyprcapture-hdr-backdrop PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+  target_compile_definitions(hyprcapture-hdr-backdrop PRIVATE HYPRCAPTURE_HDR_WAYLAND=1)
+  target_link_libraries(hyprcapture-hdr-backdrop PRIVATE Qt6::GuiPrivate PkgConfig::WAYLAND_CLIENT)
+  pkg_check_modules(HDR_GPU QUIET IMPORTED_TARGET gbm libdrm egl glesv2)
+  if(HDR_GPU_FOUND)
+    target_compile_definitions(hyprcapture-hdr-backdrop PRIVATE HYPRCAPTURE_HDR_DMABUF=1)
+    target_link_libraries(hyprcapture-hdr-backdrop PRIVATE PkgConfig::HDR_GPU)
+  endif()
+else()
+  message(WARNING "Wayland HDR presentation unavailable; overlay uses an SDR fallback")
+endif()
+
+option(HYPRCAPTURE_GAINMAP_HEIC "Build SDR-compatible HDR HEIC with ISO gain maps" ON)
+add_library(hyprcapture-hdr STATIC src/ui/hdr_image.cpp)
+target_include_directories(hyprcapture-hdr PUBLIC src)
+target_link_libraries(hyprcapture-hdr PUBLIC Qt6::Gui)
+if(HYPRCAPTURE_GAINMAP_HEIC)
+  include(cmake/UltraHDR.cmake)
+  target_compile_definitions(hyprcapture-hdr PRIVATE HYPRCAPTURE_HAVE_ULTRAHDR=1)
+  target_link_libraries(hyprcapture-hdr PRIVATE ${HYPRCAPTURE_ULTRAHDR_TARGET})
+endif()
+include_directories(${OpenCV_INCLUDE_DIRS})
+
+set(HYPRLAND_SOURCE_DIR "" CACHE PATH "Optional Hyprland source checkout to use for plugin headers")
+set(HYPRLAND_INCLUDE_DIRS ${HYPR_DEPS_INCLUDE_DIRS})
+
+if(HYPRLAND_SOURCE_DIR)
+  if(NOT EXISTS "${HYPRLAND_SOURCE_DIR}/src/plugins/PluginAPI.hpp")
+    message(FATAL_ERROR "HYPRLAND_SOURCE_DIR must point at a Hyprland checkout")
+  endif()
+
+  set(HYPRLAND_LOCAL_HEADER_ROOT "${CMAKE_CURRENT_BINARY_DIR}/hyprland-local-headers")
+  file(MAKE_DIRECTORY "${HYPRLAND_LOCAL_HEADER_ROOT}/hyprland")
+  file(REMOVE "${HYPRLAND_LOCAL_HEADER_ROOT}/hyprland/src")
+  file(REMOVE "${HYPRLAND_LOCAL_HEADER_ROOT}/hyprland/protocols")
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E create_symlink "${HYPRLAND_SOURCE_DIR}/src" "${HYPRLAND_LOCAL_HEADER_ROOT}/hyprland/src")
+  execute_process(COMMAND "${CMAKE_COMMAND}" -E create_symlink "${HYPRLAND_SOURCE_DIR}/protocols" "${HYPRLAND_LOCAL_HEADER_ROOT}/hyprland/protocols")
+  list(PREPEND HYPRLAND_INCLUDE_DIRS "${HYPRLAND_LOCAL_HEADER_ROOT}")
+endif()
+
+set(HYPRLAND_DERIVED_INCLUDE_DIRS)
+foreach(HYPRLAND_INCLUDE_DIR IN LISTS HYPRLAND_INCLUDE_DIRS)
+  list(APPEND HYPRLAND_DERIVED_INCLUDE_DIRS "${HYPRLAND_INCLUDE_DIR}")
+  if(EXISTS "${HYPRLAND_INCLUDE_DIR}/hyprland")
+    list(APPEND HYPRLAND_DERIVED_INCLUDE_DIRS "${HYPRLAND_INCLUDE_DIR}/hyprland")
+  endif()
+  if(EXISTS "${HYPRLAND_INCLUDE_DIR}/hyprland/src")
+    list(APPEND HYPRLAND_DERIVED_INCLUDE_DIRS "${HYPRLAND_INCLUDE_DIR}/hyprland/src")
+  endif()
+  if(EXISTS "${HYPRLAND_INCLUDE_DIR}/hyprland/protocols")
+    list(APPEND HYPRLAND_DERIVED_INCLUDE_DIRS "${HYPRLAND_INCLUDE_DIR}/hyprland/protocols")
+  endif()
+endforeach()
+list(REMOVE_DUPLICATES HYPRLAND_DERIVED_INCLUDE_DIRS)
+
+add_library(hyprcapture SHARED
+  src/plugin/audio_session.cpp
+  src/plugin/main.cpp
+  src/plugin/session_lock.cpp
+  src/plugin/notification.cpp
+  src/plugin/artifact_capture.cpp
+  src/plugin/window_stream.cpp
+  src/plugin/window_stream_control.cpp
+  src/plugin/window_stream_sender.cpp
+  src/plugin/window_gpu_wire.cpp
+  src/plugin/window_gpu_sender.cpp
+  src/plugin/window_gpu_export.cpp
+  src/plugin/recording.cpp
+  src/plugin/timestamped_rgba.cpp
+  src/plugin/recording_state.cpp
+  src/plugin/session_launcher.cpp
+  src/plugin/timing.cpp
+  src/shared/config.cpp
+  src/shared/process_environment.cpp
+  src/shared/supervised_process.cpp
+  src/shared/protocol.cpp
+  src/shared/rgba_transform.cpp
+  src/shared/trusted_path.cpp
+)
+
+target_include_directories(hyprcapture BEFORE PRIVATE src ${HYPRLAND_DERIVED_INCLUDE_DIRS} ${LUA_INCLUDE_DIRS})
+target_link_directories(hyprcapture PRIVATE ${HYPR_DEPS_LIBRARY_DIRS} ${LUA_LIBRARY_DIRS})
+target_link_libraries(hyprcapture PRIVATE ${HYPR_DEPS_LIBRARIES} ${LUA_LIBRARIES} nlohmann_json::nlohmann_json)
+target_link_libraries(hyprcapture PRIVATE PkgConfig::FFMPEG_MUX)
+target_link_options(hyprcapture PRIVATE -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+
+add_executable(hyprcapture-ui
+  src/audio/helper.cpp
+  src/audio/echo_source.cpp
+  src/audio/aec_policy.cpp
+  src/ui/main.cpp
+  src/ui/session_lock_guard.cpp
+  src/ui/clipboard_utils.cpp
+  src/ui/capture_overlay.cpp
+  src/ui/scroll_stitcher.cpp
+  src/plugin/window_stream.cpp
+  src/ui/scroll_capture.cpp
+  src/ui/annotation_editor.cpp
+  src/ui/pinned_image.cpp
+  src/ui/i18n.cpp
+  src/ui/remembered_settings.cpp
+  src/ui/overlay_paint.cpp
+  src/ui/result_thumbnail.cpp
+  src/ui/screenshot_notification.cpp
+  src/ui/watermark.cpp
+  src/shared/config.cpp
+  src/shared/process_environment.cpp
+  src/shared/protocol.cpp
+  src/shared/trusted_path.cpp
+)
+
+target_include_directories(hyprcapture-ui PRIVATE src)
+target_include_directories(hyprcapture-ui PRIVATE ${GIO_INCLUDE_DIRS})
+target_link_directories(hyprcapture-ui PRIVATE ${GIO_LIBRARY_DIRS})
+target_link_libraries(hyprcapture-ui PRIVATE ${OpenCV_LIBS} Qt6::Network Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg Qt6::DBus LayerShellQt::Interface nlohmann_json::nlohmann_json)
+target_link_libraries(hyprcapture-ui PRIVATE ${GIO_LIBRARIES} PkgConfig::PULSE PkgConfig::PIPEWIRE)
+target_link_options(hyprcapture-ui PRIVATE -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+
+# Optional inference stays outside the compositor and UI. No TensorFlow headers
+# are needed here; the pinned CPU runtime is loaded through its stable C ABI.
+add_library(hyprcapture-dtln STATIC src/audio/dtln.cpp src/audio/dtln_stream.cpp)
+set_target_properties(hyprcapture-dtln PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(hyprcapture-dtln PUBLIC src)
+target_link_libraries(hyprcapture-dtln PUBLIC PkgConfig::FFTW PkgConfig::SWRESAMPLE ${CMAKE_DL_LIBS})
+add_library(spa-aec-dtln SHARED src/audio/dtln_spa.cpp)
+target_link_libraries(spa-aec-dtln PRIVATE hyprcapture-dtln PkgConfig::PIPEWIRE)
+add_executable(hyprcapture-aec src/audio/aec_worker.cpp src/audio/aec_policy.cpp)
+pkg_get_variable(HYPRCAPTURE_SPA_PLUGIN_DIR libspa-0.2 plugindir)
+target_compile_definitions(hyprcapture-aec PRIVATE HYPRCAPTURE_SPA_PLUGIN_DIR="${HYPRCAPTURE_SPA_PLUGIN_DIR}")
+target_link_libraries(hyprcapture-aec PRIVATE hyprcapture-dtln Qt6::Core Qt6::Network PkgConfig::PIPEWIRE)
+qt_add_resources(hyprcapture-aec "aec-golden" PREFIX "/aec" BASE "resources/aec"
+    FILES resources/aec/golden-256.qz resources/aec/golden-512.qz)
+find_package(OpenVINO QUIET COMPONENTS Runtime)
+if(OpenVINO_FOUND)
+  add_library(hyprcapture-aec-openvino SHARED src/audio/dtln_openvino.cpp)
+  target_include_directories(hyprcapture-aec-openvino PRIVATE src)
+  target_link_libraries(hyprcapture-aec-openvino PRIVATE openvino::runtime)
+  install(TARGETS hyprcapture-aec-openvino LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/hyprcapture)
+endif()
+set(HYPRCAPTURE_AEC_MODEL_DIR "" CACHE PATH "Immutable installed DTLN model directory (e.g. Nix store)")
+set(HYPRCAPTURE_TFLITE_LIBRARY "" CACHE FILEPATH "Installed TensorFlow Lite 2.14.0 C runtime")
+foreach(aec_target hyprcapture-ui hyprcapture-aec)
+  if(HYPRCAPTURE_AEC_MODEL_DIR)
+    target_compile_definitions(${aec_target} PRIVATE HYPRCAPTURE_AEC_MODEL_DIR="${HYPRCAPTURE_AEC_MODEL_DIR}")
+  endif()
+  if(HYPRCAPTURE_TFLITE_LIBRARY)
+    target_compile_definitions(${aec_target} PRIVATE HYPRCAPTURE_TFLITE_LIBRARY="${HYPRCAPTURE_TFLITE_LIBRARY}")
+  endif()
+endforeach()
+install(TARGETS hyprcapture-aec RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS spa-aec-dtln LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/hyprcapture)
+install(PROGRAMS scripts/build-aec-runtime.sh DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME hyprcapture-build-aec-runtime)
+install(FILES nix/aec-sources.json DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME hyprcapture-aec-sources.json)
+install(FILES scripts/prepare-aec-sources.cmake DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME hyprcapture-prepare-aec-sources.cmake)
+install(PROGRAMS scripts/install-aec.sh DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME hyprcapture-install-aec)
+install(FILES resources/aec/DTLN-LICENSE.txt DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/hyprcapture)
+
+if(BUILD_TESTING)
+  # Explicit opt-in nested fixture; the live harness never selects host IPC.
+  add_executable(hyprcapture-fullscreen-window-fixture tests/fullscreen_window_fixture.cpp)
+  target_link_libraries(hyprcapture-fullscreen-window-fixture PRIVATE Qt6::Widgets)
+  add_executable(hyprcapture-real-background-status-test tests/real_background_status_test.cpp)
+  target_include_directories(hyprcapture-real-background-status-test PRIVATE src)
+  add_test(NAME real-background-status COMMAND hyprcapture-real-background-status-test)
+  add_executable(hyprcapture-capture-render-test tests/capture_render_test.cpp)
+  target_include_directories(hyprcapture-capture-render-test PRIVATE src)
+  add_test(NAME capture-render COMMAND hyprcapture-capture-render-test)
+  add_executable(hyprcapture-config-reload-test tests/config_reload_test.cpp)
+  target_include_directories(hyprcapture-config-reload-test PRIVATE src)
+  add_test(NAME config-reload COMMAND hyprcapture-config-reload-test)
+  add_executable(hyprcapture-offscreen-render-scope-test tests/offscreen_render_scope_test.cpp)
+  target_include_directories(hyprcapture-offscreen-render-scope-test PRIVATE src ${HYPR_DEPS_INCLUDE_DIRS})
+  target_link_directories(hyprcapture-offscreen-render-scope-test PRIVATE ${HYPR_DEPS_LIBRARY_DIRS})
+  target_link_libraries(hyprcapture-offscreen-render-scope-test PRIVATE hyprutils)
+  add_test(NAME offscreen-render-scope COMMAND hyprcapture-offscreen-render-scope-test)
+  add_executable(hyprcapture-session-lock-test tests/session_lock_test.cpp)
+  target_include_directories(hyprcapture-session-lock-test PRIVATE src)
+  add_test(NAME session-lock COMMAND hyprcapture-session-lock-test)
+  add_library(hyprcapture-fake-tflite SHARED tests/aec_fake_tflite.cpp)
+  add_executable(hyprcapture-aec-spa-test tests/aec_spa_test.cpp)
+  target_link_libraries(hyprcapture-aec-spa-test PRIVATE PkgConfig::PIPEWIRE ${CMAKE_DL_LIBS})
+  add_test(NAME aec-overload COMMAND hyprcapture-aec-spa-test $<TARGET_FILE:spa-aec-dtln> $<TARGET_FILE:hyprcapture-fake-tflite>)
+  set_tests_properties(aec-overload PROPERTIES TIMEOUT 10)
+  add_executable(hyprcapture-aec-delay-test tests/aec_delay_test.cpp)
+  target_link_libraries(hyprcapture-aec-delay-test PRIVATE hyprcapture-dtln)
+  add_test(NAME aec-delay COMMAND hyprcapture-aec-delay-test)
+  add_executable(hyprcapture-aec-policy-test tests/aec_policy_test.cpp src/audio/aec_policy.cpp src/ui/remembered_settings.cpp src/shared/config.cpp)
+  target_include_directories(hyprcapture-aec-policy-test PRIVATE src)
+  target_link_libraries(hyprcapture-aec-policy-test PRIVATE Qt6::Core)
+  add_test(NAME aec-policy COMMAND hyprcapture-aec-policy-test)
+  find_package(Qt6 REQUIRED COMPONENTS Test)
+  add_executable(hyprcapture-session-lock-guard-test tests/session_lock_guard_test.cpp src/ui/session_lock_guard.cpp)
+  target_include_directories(hyprcapture-session-lock-guard-test PRIVATE src)
+  target_link_libraries(hyprcapture-session-lock-guard-test PRIVATE Qt6::Widgets LayerShellQt::Interface)
+  add_test(NAME session-lock-guard COMMAND hyprcapture-session-lock-guard-test)
+  set_tests_properties(session-lock-guard PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_PLATFORMTHEME=;QT_LINUX_ACCESSIBILITY_ALWAYS_ON=0;DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/hyprcapture-tests-no-bus" TIMEOUT 10)
+  add_executable(hyprcapture-annotation-editor-test tests/annotation_editor_test.cpp src/ui/annotation_editor.cpp)
+  target_include_directories(hyprcapture-annotation-editor-test PRIVATE src)
+  target_link_libraries(hyprcapture-annotation-editor-test PRIVATE Qt6::Widgets Qt6::Test Qt6::Svg)
+  add_test(NAME annotation-editor COMMAND hyprcapture-annotation-editor-test)
+  set_tests_properties(annotation-editor PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 20)
+  # Explicit offline benchmark, not a timing-sensitive CTest assertion.
+  add_executable(hyprcapture-hdr-editor-benchmark tests/hdr_editor_benchmark.cpp src/ui/annotation_editor.cpp)
+  target_include_directories(hyprcapture-hdr-editor-benchmark PRIVATE src)
+  target_link_libraries(hyprcapture-hdr-editor-benchmark PRIVATE Qt6::Widgets Qt6::Test Qt6::Svg)
+  add_executable(hyprcapture-hdr-export-fingerprint tests/hdr_export_fingerprint.cpp src/ui/annotation_editor.cpp)
+  target_include_directories(hyprcapture-hdr-export-fingerprint PRIVATE src)
+  target_link_libraries(hyprcapture-hdr-export-fingerprint PRIVATE Qt6::Widgets Qt6::Test Qt6::Svg)
+  add_executable(hyprcapture-i18n-test tests/i18n_test.cpp src/ui/i18n.cpp)
+  target_include_directories(hyprcapture-i18n-test PRIVATE src)
+  target_link_libraries(hyprcapture-i18n-test PRIVATE Qt6::Core)
+  add_test(NAME i18n COMMAND hyprcapture-i18n-test)
+  add_executable(hyprcapture-pinned-image-test tests/pinned_image_test.cpp src/ui/pinned_image.cpp src/ui/clipboard_utils.cpp src/shared/process_environment.cpp src/shared/trusted_path.cpp)
+  target_include_directories(hyprcapture-pinned-image-test PRIVATE src)
+  target_link_libraries(hyprcapture-pinned-image-test PRIVATE Qt6::Widgets LayerShellQt::Interface)
+  add_test(NAME pinned-image COMMAND hyprcapture-pinned-image-test)
+  set_tests_properties(pinned-image PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 20)
+  get_target_property(HYPRCAPTURE_UI_TEST_SOURCES hyprcapture-ui SOURCES)
+  list(REMOVE_ITEM HYPRCAPTURE_UI_TEST_SOURCES src/ui/main.cpp)
+  add_executable(hyprcapture-sound-ui-test tests/sound_ui_test.cpp ${HYPRCAPTURE_UI_TEST_SOURCES})
+  # Isolate UI tests from an installed AEC worker and network/model downloads.
+  set_target_properties(hyprcapture-sound-ui-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-ui")
+  target_include_directories(hyprcapture-sound-ui-test PRIVATE src ${GIO_INCLUDE_DIRS})
+  target_link_libraries(hyprcapture-sound-ui-test PRIVATE ${OpenCV_LIBS} Qt6::Test Qt6::Widgets Qt6::Svg Qt6::DBus Qt6::Network LayerShellQt::Interface nlohmann_json::nlohmann_json ${GIO_LIBRARIES} PkgConfig::PULSE PkgConfig::PIPEWIRE)
+  add_test(NAME hyprcapture-sound-ui-test COMMAND hyprcapture-sound-ui-test)
+  set_tests_properties(hyprcapture-sound-ui-test PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 20)
+  add_executable(hyprcapture-in-place-editor-test tests/in_place_editor_test.cpp ${HYPRCAPTURE_UI_TEST_SOURCES})
+  set_target_properties(hyprcapture-in-place-editor-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-ui")
+  target_include_directories(hyprcapture-in-place-editor-test PRIVATE src ${GIO_INCLUDE_DIRS})
+  target_link_libraries(hyprcapture-in-place-editor-test PRIVATE ${OpenCV_LIBS} Qt6::Test Qt6::Widgets Qt6::Svg Qt6::DBus Qt6::Network LayerShellQt::Interface nlohmann_json::nlohmann_json ${GIO_LIBRARIES} PkgConfig::PULSE PkgConfig::PIPEWIRE)
+  add_test(NAME in-place-editor COMMAND hyprcapture-in-place-editor-test)
+  set_tests_properties(in-place-editor PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+  add_executable(hyprcapture-scroll-live-test tests/scroll_capture_live_test.cpp ${HYPRCAPTURE_UI_TEST_SOURCES})
+  set_target_properties(hyprcapture-scroll-live-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-ui")
+  target_include_directories(hyprcapture-scroll-live-test PRIVATE src ${GIO_INCLUDE_DIRS})
+  target_link_libraries(hyprcapture-scroll-live-test PRIVATE ${OpenCV_LIBS} Qt6::Test Qt6::Widgets Qt6::Svg Qt6::DBus Qt6::Network LayerShellQt::Interface nlohmann_json::nlohmann_json ${GIO_LIBRARIES} PkgConfig::PULSE PkgConfig::PIPEWIRE)
+  add_test(NAME scroll-live COMMAND hyprcapture-scroll-live-test)
+  set_tests_properties(scroll-live PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+  # Optional receiver for the isolated GTK touchpad regression; not a UI runtime dependency.
+  pkg_check_modules(GTK3 QUIET IMPORTED_TARGET gtk+-3.0)
+  if(GTK3_FOUND)
+    add_executable(hyprcapture-scroll-gtk-fixture tests/scroll_gtk_fixture.cpp)
+    target_link_libraries(hyprcapture-scroll-gtk-fixture PRIVATE PkgConfig::GTK3)
+    set_target_properties(hyprcapture-scroll-gtk-fixture PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-ui")
+  endif()
+
+  add_executable(hyprcapture-audio-timeline-test tests/audio_timeline_test.cpp)
+  target_include_directories(hyprcapture-audio-timeline-test PRIVATE src)
+  target_compile_options(hyprcapture-audio-timeline-test PRIVATE -UNDEBUG)
+  add_test(NAME hyprcapture-audio-timeline-test COMMAND hyprcapture-audio-timeline-test)
+  # Ignore inherited PYTHONOPTIMIZE/PYTHONPATH: assertions are part of these tests.
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME build-dependencies COMMAND ${Python3_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/tests/build_dependencies_test.py)
+    set_tests_properties(build-dependencies PROPERTIES TIMEOUT 60)
+    add_test(NAME capture-integration COMMAND ${Python3_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/tests/capture_integration_test.py)
+    add_test(NAME aec-source-pins COMMAND ${Python3_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/tests/aec_sources_test.py)
+    set_tests_properties(aec-source-pins PROPERTIES TIMEOUT 45)
+    add_test(NAME recording-transcode COMMAND ${Python3_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/tests/recording_transcode_test.py $<TARGET_FILE:hyprcapture-ui>)
+    set_tests_properties(recording-transcode PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    add_test(NAME recording-permissions COMMAND ${Python3_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/tests/recording_permissions_test.py $<TARGET_FILE:hyprcapture-ui>)
+    set_tests_properties(recording-permissions PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    add_test(NAME omarchy-aec-setup COMMAND ${Python3_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/tests/omarchy_aec_setup_test.py)
+    set_tests_properties(omarchy-aec-setup PROPERTIES TIMEOUT 10)
+    add_test(NAME session-startup-ui COMMAND ${Python3_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/tests/session_startup_ui_test.py $<TARGET_FILE:hyprcapture-ui>)
+    set_tests_properties(session-startup-ui PROPERTIES TIMEOUT 40)
+    add_test(NAME pin-launch COMMAND ${Python3_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/tests/pin_launch_test.py $<TARGET_FILE:hyprcapture-ui>)
+    set_tests_properties(pin-launch PROPERTIES TIMEOUT 20)
+    add_test(NAME aec-ui-feedback COMMAND ${Python3_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/tests/aec_ui_feedback_test.py $<TARGET_FILE:hyprcapture-sound-ui-test>)
+    set_tests_properties(aec-ui-feedback PROPERTIES TIMEOUT 25)
+  endif()
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME hyprcapture-audio-finalize-test COMMAND ${Python3_EXECUTABLE} -E ${CMAKE_CURRENT_SOURCE_DIR}/tests/audio_finalize_test.py $<TARGET_FILE:hyprcapture-ui>)
+    set_tests_properties(hyprcapture-audio-finalize-test PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+  endif()
+  add_executable(hyprcapture-scroll-capture-test tests/scroll_capture_test.cpp src/ui/annotation_editor.cpp src/plugin/window_stream.cpp src/shared/config.cpp src/shared/protocol.cpp src/ui/scroll_capture.cpp src/ui/scroll_stitcher.cpp src/ui/clipboard_utils.cpp src/ui/i18n.cpp src/shared/process_environment.cpp src/shared/trusted_path.cpp)
+  target_include_directories(hyprcapture-scroll-capture-test PRIVATE src)
+  target_link_libraries(hyprcapture-scroll-capture-test PRIVATE ${OpenCV_LIBS} Qt6::Network Qt6::Svg Qt6::Widgets Qt6::Test LayerShellQt::Interface nlohmann_json::nlohmann_json)
+  add_test(NAME scroll-capture COMMAND hyprcapture-scroll-capture-test)
+  set_tests_properties(scroll-capture PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 20)
+
+  add_executable(hyprcapture-scroll-benchmark tests/scroll_stitcher_benchmark.cpp src/ui/scroll_stitcher.cpp)
+  target_include_directories(hyprcapture-scroll-benchmark PRIVATE src)
+  target_link_libraries(hyprcapture-scroll-benchmark PRIVATE ${OpenCV_LIBS} Qt6::Gui)
+  add_executable(hyprcapture-scroll-stitcher-test tests/scroll_stitcher_test.cpp src/ui/scroll_stitcher.cpp)
+  target_include_directories(hyprcapture-scroll-stitcher-test PRIVATE src)
+  target_link_libraries(hyprcapture-scroll-stitcher-test PRIVATE ${OpenCV_LIBS} Qt6::Gui)
+  add_test(NAME scroll-stitcher COMMAND hyprcapture-scroll-stitcher-test)
+  set_tests_properties(scroll-stitcher PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+
+  add_executable(hyprcapture-scroll-sticky-test tests/scroll_sticky_test.cpp src/ui/scroll_stitcher.cpp)
+  target_include_directories(hyprcapture-scroll-sticky-test PRIVATE src)
+  target_link_libraries(hyprcapture-scroll-sticky-test PRIVATE ${OpenCV_LIBS} Qt6::Gui)
+  add_test(NAME scroll-sticky COMMAND hyprcapture-scroll-sticky-test)
+  set_tests_properties(scroll-sticky PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+  foreach(fab_case fab fab-stall fab-sidebar fab-translucent)
+    add_test(NAME scroll-${fab_case} COMMAND hyprcapture-scroll-sticky-test ${fab_case})
+    set_tests_properties(scroll-${fab_case} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
+  endforeach()
+
+  add_executable(hyprcapture-mapped-image-test tests/mapped_image_test.cpp)
+  target_include_directories(hyprcapture-mapped-image-test PRIVATE src)
+  target_link_libraries(hyprcapture-mapped-image-test PRIVATE Qt6::Gui)
+  add_test(NAME mapped-image COMMAND hyprcapture-mapped-image-test)
+  set_tests_properties(mapped-image PROPERTIES TIMEOUT 10)
+
+  add_executable(hyprcapture-material-icon-test tests/material_icon_test.cpp)
+  target_include_directories(hyprcapture-material-icon-test PRIVATE src)
+  target_link_libraries(hyprcapture-material-icon-test PRIVATE Qt6::Gui Qt6::Svg)
+  add_test(NAME material-icon COMMAND hyprcapture-material-icon-test)
+  set_tests_properties(material-icon PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 10)
+
+  add_executable(hyprcapture-screenshot-notification-test
+    tests/screenshot_notification_test.cpp src/ui/screenshot_notification.cpp src/shared/config.cpp)
+  target_include_directories(hyprcapture-screenshot-notification-test PRIVATE src)
+  target_link_libraries(hyprcapture-screenshot-notification-test PRIVATE Qt6::Gui)
+  target_compile_options(hyprcapture-screenshot-notification-test PRIVATE -UNDEBUG)
+  add_test(NAME screenshot-notification COMMAND hyprcapture-screenshot-notification-test)
+  set_tests_properties(screenshot-notification PROPERTIES TIMEOUT 10)
+
+  add_executable(hyprcapture-session-startup-test tests/session_startup_test.cpp)
+  target_include_directories(hyprcapture-session-startup-test PRIVATE src)
+  add_test(NAME session-startup COMMAND hyprcapture-session-startup-test)
+  set_tests_properties(session-startup PROPERTIES TIMEOUT 10)
+
+  add_executable(hyprcapture-supervised-process-test
+    tests/supervised_process_test.cpp
+    src/shared/supervised_process.cpp
+  )
+  target_include_directories(hyprcapture-supervised-process-test PRIVATE src)
+  add_test(NAME hyprcapture-supervised-process-test COMMAND hyprcapture-supervised-process-test)
+  set_tests_properties(hyprcapture-supervised-process-test PROPERTIES TIMEOUT 10)
+
+  add_executable(hyprcapture-capture-options-test tests/capture_options_test.cpp src/shared/config.cpp src/shared/protocol.cpp)
+  target_include_directories(hyprcapture-capture-options-test PRIVATE src ${LUA_INCLUDE_DIRS})
+  target_link_directories(hyprcapture-capture-options-test PRIVATE ${LUA_LIBRARY_DIRS})
+  target_link_libraries(hyprcapture-capture-options-test PRIVATE ${LUA_LIBRARIES} nlohmann_json::nlohmann_json)
+  target_compile_options(hyprcapture-capture-options-test PRIVATE -UNDEBUG)
+  add_test(NAME capture-options COMMAND hyprcapture-capture-options-test)
+
+  add_executable(hyprcapture-save-action-test tests/save_action_test.cpp src/ui/capture_output.cpp
+    src/ui/result_thumbnail.cpp src/ui/screenshot_notification.cpp src/ui/i18n.cpp src/shared/config.cpp)
+  target_include_directories(hyprcapture-save-action-test PRIVATE src ${GIO_INCLUDE_DIRS})
+  target_link_libraries(hyprcapture-save-action-test PRIVATE hyprcapture-hdr hyprcapture-hdr-backdrop
+    Qt6::Widgets Qt6::Svg Qt6::DBus LayerShellQt::Interface ${GIO_LIBRARIES})
+  target_compile_options(hyprcapture-save-action-test PRIVATE -UNDEBUG)
+  add_test(NAME save-action COMMAND hyprcapture-save-action-test)
+  set_tests_properties(save-action PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
+
+  add_executable(hyprcapture-config-test
+    tests/config_test.cpp
+    src/shared/config.cpp
+    src/shared/protocol.cpp
+  )
+  target_include_directories(hyprcapture-config-test PRIVATE src)
+  target_link_libraries(hyprcapture-config-test PRIVATE nlohmann_json::nlohmann_json)
+  add_test(NAME hyprcapture-config-test COMMAND hyprcapture-config-test)
+
+  add_executable(hyprcapture-watermark-test
+    tests/watermark_test.cpp
+    src/ui/watermark.cpp
+    src/shared/config.cpp
+  )
+  target_include_directories(hyprcapture-watermark-test PRIVATE src)
+  target_link_libraries(hyprcapture-watermark-test PRIVATE Qt6::Gui Qt6::Svg)
+  add_test(NAME hyprcapture-watermark-test COMMAND hyprcapture-watermark-test)
+
+  add_executable(hyprcapture-security-test
+    tests/security_test.cpp
+    src/ui/clipboard_utils.cpp
+    src/shared/process_environment.cpp
+    src/shared/trusted_path.cpp
+  )
+  target_include_directories(hyprcapture-security-test PRIVATE src)
+  target_link_libraries(hyprcapture-security-test PRIVATE Qt6::Core Qt6::Gui)
+  add_test(NAME hyprcapture-security-test COMMAND hyprcapture-security-test)
+
+  add_executable(hyprcapture-process-environment-test
+    tests/process_environment_test.cpp
+    src/shared/process_environment.cpp
+  )
+  target_include_directories(hyprcapture-process-environment-test PRIVATE src)
+  add_test(NAME hyprcapture-process-environment-test COMMAND hyprcapture-process-environment-test)
+
+  add_executable(hyprcapture-overlay-paint-test
+    tests/overlay_paint_test.cpp
+    src/ui/overlay_paint.cpp
+  )
+  target_include_directories(hyprcapture-overlay-paint-test PRIVATE src)
+  target_link_libraries(hyprcapture-overlay-paint-test PRIVATE Qt6::Gui)
+  add_test(NAME hyprcapture-overlay-paint-test COMMAND hyprcapture-overlay-paint-test)
+
+  add_executable(hyprcapture-recording-state-test
+    tests/recording_state_test.cpp
+    src/plugin/recording_state.cpp
+  )
+  target_include_directories(hyprcapture-recording-state-test PRIVATE src)
+  target_link_libraries(hyprcapture-recording-state-test PRIVATE nlohmann_json::nlohmann_json)
+  add_test(NAME hyprcapture-recording-state-test COMMAND hyprcapture-recording-state-test)
+
+  add_executable(hyprcapture-timing-test tests/timing_test.cpp src/plugin/timing.cpp)
+  target_include_directories(hyprcapture-timing-test PRIVATE src)
+  target_link_libraries(hyprcapture-timing-test PRIVATE Threads::Threads)
+  target_compile_options(hyprcapture-timing-test PRIVATE -UNDEBUG)
+  add_test(NAME plugin-timing COMMAND hyprcapture-timing-test)
+  set_tests_properties(plugin-timing PROPERTIES TIMEOUT 15)
+
+  add_executable(hyprcapture-recording-codec-test tests/recording_codec_test.cpp)
+  target_include_directories(hyprcapture-recording-codec-test PRIVATE src)
+  target_compile_options(hyprcapture-recording-codec-test PRIVATE -UNDEBUG)
+  add_test(NAME hyprcapture-recording-codec-test COMMAND hyprcapture-recording-codec-test)
+
+  add_executable(hyprcapture-timestamped-rgba-fixture tests/timestamped_rgba_fixture.cpp src/plugin/timestamped_rgba.cpp)
+  target_include_directories(hyprcapture-timestamped-rgba-fixture PRIVATE src)
+  target_link_libraries(hyprcapture-timestamped-rgba-fixture PRIVATE PkgConfig::FFMPEG_MUX)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME hyprcapture-recording-timestamps-test COMMAND ${Python3_EXECUTABLE} -E
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/recording_timestamps_test.py
+      $<TARGET_FILE:hyprcapture-timestamped-rgba-fixture> $<TARGET_FILE:hyprcapture-ui>)
+    set_tests_properties(hyprcapture-recording-timestamps-test PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+  endif()
+
+  add_executable(hyprcapture-rgba-transform-test
+    tests/rgba_transform_test.cpp
+    src/shared/rgba_transform.cpp
+  )
+  target_include_directories(hyprcapture-rgba-transform-test PRIVATE src)
+  add_test(NAME hyprcapture-rgba-transform-test COMMAND hyprcapture-rgba-transform-test)
+
+  add_executable(hyprcapture-trusted-path-test
+    tests/trusted_path_test.cpp
+    src/shared/trusted_path.cpp
+  )
+  target_include_directories(hyprcapture-trusted-path-test PRIVATE src)
+  add_test(NAME hyprcapture-trusted-path-test COMMAND hyprcapture-trusted-path-test)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME hyprcapture-trusted-path-namespace-test COMMAND ${Python3_EXECUTABLE} -E
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/trusted_path_namespace_test.py $<TARGET_FILE:hyprcapture-trusted-path-test>)
+    set_tests_properties(hyprcapture-trusted-path-namespace-test PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+  endif()
+
+  add_executable(hyprcapture-window-stream-test
+    tests/window_stream_test.cpp
+    src/plugin/window_stream.cpp
+  )
+  target_include_directories(hyprcapture-window-stream-test PRIVATE src)
+  target_compile_options(hyprcapture-window-stream-test PRIVATE -UNDEBUG)
+  add_test(NAME hyprcapture-window-stream-test COMMAND hyprcapture-window-stream-test)
+
+  add_executable(hyprcapture-window-stream-sender-test
+    tests/window_stream_sender_test.cpp
+    src/plugin/window_stream.cpp
+    src/plugin/window_stream_sender.cpp
+  )
+  target_include_directories(hyprcapture-window-stream-sender-test PRIVATE src)
+  target_compile_options(hyprcapture-window-stream-sender-test PRIVATE -UNDEBUG)
+  add_test(NAME hyprcapture-window-stream-sender-test COMMAND hyprcapture-window-stream-sender-test)
+
+  add_executable(hyprcapture-window-stream-sender-startup-test
+    tests/window_stream_sender_startup_test.cpp
+    src/plugin/window_stream.cpp
+    src/plugin/window_stream_sender.cpp
+  )
+  target_include_directories(hyprcapture-window-stream-sender-startup-test PRIVATE src)
+  target_compile_options(hyprcapture-window-stream-sender-startup-test PRIVATE -UNDEBUG)
+  target_link_libraries(hyprcapture-window-stream-sender-startup-test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME window-stream-sender-startup COMMAND hyprcapture-window-stream-sender-startup-test)
+  set_tests_properties(window-stream-sender-startup PROPERTIES TIMEOUT 5)
+
+  add_executable(hyprcapture-window-gpu-wire-test
+    tests/window_gpu_wire_test.cpp
+    src/plugin/window_gpu_wire.cpp
+  )
+  target_include_directories(hyprcapture-window-gpu-wire-test PRIVATE src)
+  target_compile_options(hyprcapture-window-gpu-wire-test PRIVATE -UNDEBUG)
+  add_test(NAME hyprcapture-window-gpu-wire-test COMMAND hyprcapture-window-gpu-wire-test)
+
+  add_executable(hyprcapture-window-gpu-sender-test
+    tests/window_gpu_sender_test.cpp
+    src/plugin/window_gpu_wire.cpp
+    src/plugin/window_gpu_sender.cpp
+  )
+  target_include_directories(hyprcapture-window-gpu-sender-test PRIVATE src)
+  target_compile_options(hyprcapture-window-gpu-sender-test PRIVATE -UNDEBUG)
+  target_link_libraries(hyprcapture-window-gpu-sender-test PRIVATE Threads::Threads)
+  add_test(NAME hyprcapture-window-gpu-sender-test COMMAND hyprcapture-window-gpu-sender-test)
+  set_tests_properties(hyprcapture-window-gpu-sender-test PROPERTIES TIMEOUT 10)
+
+  option(HYPRCAPTURE_GPU_EXPORT_TEST "Build hardware-dependent EGL DMA-BUF export test" OFF)
+  if(HYPRCAPTURE_GPU_EXPORT_TEST)
+    pkg_check_modules(GPU_EXPORT_EGL REQUIRED IMPORTED_TARGET egl glesv2)
+    add_executable(hyprcapture-window-gpu-export-test
+      tests/window_gpu_export_test.cpp
+      src/plugin/window_gpu_export.cpp
+      src/plugin/window_gpu_wire.cpp
+      src/plugin/window_gpu_sender.cpp
+    )
+    target_include_directories(hyprcapture-window-gpu-export-test PRIVATE src)
+    target_compile_options(hyprcapture-window-gpu-export-test PRIVATE -UNDEBUG)
+    target_link_libraries(hyprcapture-window-gpu-export-test PRIVATE PkgConfig::GPU_EXPORT_EGL Threads::Threads)
+    add_test(NAME hyprcapture-window-gpu-export-test COMMAND hyprcapture-window-gpu-export-test)
+    set_tests_properties(hyprcapture-window-gpu-export-test PROPERTIES TIMEOUT 15)
+  endif()
+
+  add_executable(hyprcapture-window-stream-control-test
+    tests/window_stream_control_test.cpp
+    src/plugin/window_stream_control.cpp
+  )
+  target_include_directories(hyprcapture-window-stream-control-test PRIVATE src)
+  target_compile_options(hyprcapture-window-stream-control-test PRIVATE -UNDEBUG)
+  target_link_libraries(hyprcapture-window-stream-control-test PRIVATE nlohmann_json::nlohmann_json)
+  add_test(NAME hyprcapture-window-stream-control-test COMMAND hyprcapture-window-stream-control-test)
+
+  add_executable(hyprcapture-window-stream-extent-test tests/window_stream_extent_test.cpp)
+  target_include_directories(hyprcapture-window-stream-extent-test PRIVATE src)
+  target_compile_options(hyprcapture-window-stream-extent-test PRIVATE -UNDEBUG)
+  add_test(NAME hyprcapture-window-stream-extent-test COMMAND hyprcapture-window-stream-extent-test)
+
+  add_executable(hyprcapture-window-stream-cadence-test tests/window_stream_cadence_test.cpp)
+  target_include_directories(hyprcapture-window-stream-cadence-test PRIVATE src)
+  target_compile_options(hyprcapture-window-stream-cadence-test PRIVATE -UNDEBUG)
+  add_test(NAME hyprcapture-window-stream-cadence-test COMMAND hyprcapture-window-stream-cadence-test)
+
+endif()
+
+install(TARGETS hyprcapture LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(TARGETS hyprcapture-ui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(DIRECTORY resources/licenses/ DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/hyprcapture)
+
+get_property(hdr_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+target_link_libraries(hyprcapture-hdr-backdrop PRIVATE hyprcapture-hdr)
+if(BUILD_TESTING)
+  get_target_property(hdr_test_sources hyprcapture-hdr-backdrop SOURCES)
+  add_library(hyprcapture-hdr-backdrop-testing STATIC ${hdr_test_sources})
+  foreach(property INCLUDE_DIRECTORIES COMPILE_DEFINITIONS)
+    get_target_property(value hyprcapture-hdr-backdrop ${property})
+    if(value)
+      set_property(TARGET hyprcapture-hdr-backdrop-testing PROPERTY ${property} "${value}")
+    endif()
+  endforeach()
+  get_target_property(hdr_test_libraries hyprcapture-hdr-backdrop LINK_LIBRARIES)
+  target_link_libraries(hyprcapture-hdr-backdrop-testing PRIVATE ${hdr_test_libraries} PUBLIC Qt6::Gui Threads::Threads)
+  target_include_directories(hyprcapture-hdr-backdrop-testing PUBLIC src)
+  target_compile_definitions(hyprcapture-hdr-backdrop-testing PRIVATE HYPRCAPTURE_HDR_TESTING=1)
+  target_compile_definitions(hyprcapture-in-place-editor-test PRIVATE HYPRCAPTURE_HDR_TESTING=1)
+endif()
+foreach(hdr_target IN LISTS hdr_targets)
+  get_target_property(hdr_sources ${hdr_target} SOURCES)
+  if("src/ui/capture_overlay.cpp" IN_LIST hdr_sources)
+    target_sources(${hdr_target} PRIVATE src/ui/capture_output.cpp)
+  endif()
+  if("src/ui/annotation_editor.cpp" IN_LIST hdr_sources)
+    if(hdr_target STREQUAL "hyprcapture-in-place-editor-test")
+      target_link_libraries(${hdr_target} PRIVATE hyprcapture-hdr hyprcapture-hdr-backdrop-testing)
+    else()
+      target_link_libraries(${hdr_target} PRIVATE hyprcapture-hdr hyprcapture-hdr-backdrop)
+    endif()
+  endif()
+endforeach()
+if(BUILD_TESTING)
+  add_executable(hyprcapture-hdr-shm-test tests/hdr_shm_test.cpp)
+  target_link_libraries(hyprcapture-hdr-shm-test PRIVATE hyprcapture-hdr-backdrop)
+  target_compile_options(hyprcapture-hdr-shm-test PRIVATE -UNDEBUG)
+  add_test(NAME hdr-shm COMMAND hyprcapture-hdr-shm-test)
+  add_executable(hyprcapture-hdr-backdrop-test tests/hdr_backdrop_test.cpp)
+  target_include_directories(hyprcapture-hdr-backdrop-test PRIVATE src)
+  target_compile_definitions(hyprcapture-hdr-backdrop-test PRIVATE HYPRCAPTURE_HDR_TESTING=1)
+  target_link_libraries(hyprcapture-hdr-backdrop-test PRIVATE hyprcapture-hdr-backdrop-testing Qt6::Widgets LayerShellQt::Interface)
+  target_compile_options(hyprcapture-hdr-backdrop-test PRIVATE -UNDEBUG)
+  add_test(NAME hdr-backdrop COMMAND hyprcapture-hdr-backdrop-test)
+  set_tests_properties(hdr-backdrop PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 20)
+  add_executable(hyprcapture-hdr-test tests/hdr_test.cpp src/ui/annotation_editor.cpp src/shared/config.cpp src/shared/protocol.cpp)
+  target_include_directories(hyprcapture-hdr-test PRIVATE src)
+  target_link_libraries(hyprcapture-hdr-test PRIVATE hyprcapture-hdr hyprcapture-hdr-backdrop Qt6::Widgets Qt6::Svg nlohmann_json::nlohmann_json)
+  if(HYPRCAPTURE_GAINMAP_HEIC)
+    target_compile_definitions(hyprcapture-hdr-test PRIVATE HYPRCAPTURE_HAVE_ULTRAHDR=1)
+    target_link_libraries(hyprcapture-hdr-test PRIVATE ${HYPRCAPTURE_ULTRAHDR_TARGET})
+  endif()
+  target_compile_options(hyprcapture-hdr-test PRIVATE -UNDEBUG)
+  add_test(NAME hdr-color-export COMMAND hyprcapture-hdr-test)
+  set_tests_properties(hdr-color-export PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
+endif()
+if(BUILD_TESTING)
+  add_executable(hyprcapture-hdr-capability-test tests/hdr_capability_test.cpp src/ui/hdr_image.cpp)
+  target_include_directories(hyprcapture-hdr-capability-test PRIVATE src)
+  target_link_libraries(hyprcapture-hdr-capability-test PRIVATE Qt6::Gui)
+  target_compile_options(hyprcapture-hdr-capability-test PRIVATE -UNDEBUG)
+  add_test(NAME hdr-no-heic-capability COMMAND hyprcapture-hdr-capability-test)
+endif()
+
+if(BUILD_TESTING)
+  pkg_check_modules(EGL_GLES QUIET IMPORTED_TARGET egl glesv2)
+  if(EGL_GLES_FOUND)
+    add_executable(hyprcapture-sdr-resolve-gpu-test tests/sdr_resolve_gpu_test.cpp)
+    target_include_directories(hyprcapture-sdr-resolve-gpu-test PRIVATE src)
+    target_compile_options(hyprcapture-sdr-resolve-gpu-test PRIVATE -UNDEBUG)
+    target_link_libraries(hyprcapture-sdr-resolve-gpu-test PRIVATE PkgConfig::EGL_GLES)
+    add_test(NAME sdr-resolve-gpu COMMAND hyprcapture-sdr-resolve-gpu-test)
+    set_tests_properties(sdr-resolve-gpu PROPERTIES ENVIRONMENT "EGL_PLATFORM=surfaceless;LIBGL_ALWAYS_SOFTWARE=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
+  endif()
+endif()
+
+if(BUILD_TESTING AND HDR_GPU_FOUND)
+  add_executable(hyprcapture-hdr-gpu-test tests/hdr_gpu_test.cpp)
+  target_include_directories(hyprcapture-hdr-gpu-test PRIVATE src)
+  target_compile_definitions(hyprcapture-hdr-gpu-test PRIVATE HYPRCAPTURE_HDR_TESTING=1)
+  target_link_libraries(hyprcapture-hdr-gpu-test PRIVATE hyprcapture-hdr-backdrop-testing PkgConfig::HDR_GPU)
+  add_test(NAME hdr-gpu COMMAND hyprcapture-hdr-gpu-test)
+  set_tests_properties(hdr-gpu PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" SKIP_RETURN_CODE 77 TIMEOUT 30)
+endif()

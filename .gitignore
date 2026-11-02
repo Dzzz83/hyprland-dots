@@ -8,3 +8,24 @@ hyprland.conf.bak
 cache/
 tmp/
 *.swp
+
+# Local builds, generated machine settings and application runtime state
+/build/
+/config/local.lua
+/swaync/config.json
+/gtk-3.0/bookmarks
+**/__pycache__/
+*.pyc
+**/target/
+**/build-local/
+**/build-hyprpm/
+**/build-cmake/
+*.so
+*.o
+*.a
+**/secrets.fish
+**/fish_variables
+**/icon-theme.cache
+**/.git/
+
+/fcitx5/conf/cached_layouts

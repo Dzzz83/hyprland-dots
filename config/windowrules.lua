@@ -4,17 +4,17 @@
 hl.window_rule({
     match = { class = "com.dash.cava" },
     float = true,
-    size = { 960, 272 },   -- Reduced 20% from 1200x340
-    move = { 16, 576 },    -- Reduced 20% from 20x720
+    size = { 1010, 244 },
+    move = { 16, 640 },
     workspace = "9 silent",
 })
 
--- 2. Top-Right: Bonsai Tree
+-- 2. Top-Right: Terminal Rain
 hl.window_rule({
     match = { class = "com.dash.rain" },
     float = true,
-    size = { 736, 480 },
-    move = { 784, 36 },
+    size = { 544, 584 },
+    move = { 1040, 40 },
     workspace = "9 silent",
 })
 
@@ -22,7 +22,7 @@ hl.window_rule({
 hl.window_rule({
     match = { class = "com.dash.clock" },
     float = true,
-    size = { 480, 224 },   -- Reduced 20% from 600x280
-    move = { 1040, 624 },  -- Reduced 20% from 1300x780
+    size = { 544, 244 },
+    move = { 1040, 640 },
     workspace = "9 silent",
 })

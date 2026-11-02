@@ -1,0 +1,1267 @@
+#include "shared/session_startup.hpp"
+#include "shared/protocol.hpp"
+#include "ui/timing.hpp"
+#include "ui/desktop_theme.hpp"
+#include <QStyleHints>
+#include "audio/helper.hpp"
+#include "shared/config.hpp"
+#include "ui/capture_overlay.hpp"
+#include "ui/clipboard_utils.hpp"
+#include "ui/result_thumbnail.hpp"
+#include "ui/capture_output.hpp"
+#include "ui/hdr_thumbnail.hpp"
+#include "ui/i18n.hpp"
+#include "ui/pinned_image.hpp"
+#include "ui/hdr_backdrop.hpp"
+#include "ui/session_lock_guard.hpp"
+#include "ui/screenshot_notification.hpp"
+
+#include <LayerShellQt/Shell>
+#include <LayerShellQt/Window>
+
+#include <QApplication>
+#include <QSocketNotifier>
+#include <QCommandLineParser>
+#include <QCursor>
+#include <QDir>
+#include <QDebug>
+#include <QElapsedTimer>
+#include <QDBusConnection>
+#include <QDBusMessage>
+#include <QDBusVirtualObject>
+#include <QEventLoop>
+#include <QFile>
+#include <QFileInfo>
+#include <QFont>
+#include <QImageReader>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLocalSocket>
+#include <functional>
+#include <QPaintEvent>
+#include <QPainter>
+#include <QPixmap>
+#include <QProcess>
+#include <QScreen>
+#include <QTimer>
+#include <QWidget>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <memory>
+#include <utility>
+#include <vector>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace {
+
+std::vector<QScreen*> thumbnailScreens(QString selector) {
+    selector = selector.trimmed();
+    if (selector.compare(QStringLiteral("all"), Qt::CaseInsensitive) == 0) {
+        const auto screens = QGuiApplication::screens();
+        return {screens.begin(), screens.end()};
+    }
+    if (selector.compare(QStringLiteral("primary"), Qt::CaseInsensitive) == 0) {
+        if (QScreen* primary = QGuiApplication::primaryScreen())
+            return {primary};
+        return {nullptr};
+    }
+    if (!selector.isEmpty() && selector.compare(QStringLiteral("active"), Qt::CaseInsensitive) != 0) {
+        for (QScreen* screen : QGuiApplication::screens()) {
+            if (screen && screen->name().compare(selector, Qt::CaseInsensitive) == 0)
+                return {screen};
+        }
+    }
+    if (QScreen* active = QGuiApplication::screenAt(QCursor::pos()))
+        return {active};
+    return {QGuiApplication::primaryScreen()};
+}
+
+constexpr qint64 MAX_SESSION_JSON_BYTES = 8LL * 1024LL * 1024LL;
+constexpr qint64 MAX_THUMBNAIL_SOURCE_BYTES = 128LL * 1024LL * 1024LL;
+constexpr int    MAX_THUMBNAIL_DIMENSION = 32768;
+constexpr int    THUMBNAIL_DECODE_MAX_WIDTH = 720;
+constexpr int    THUMBNAIL_DECODE_MAX_HEIGHT = 480;
+constexpr int    MAX_THUMBNAIL_TIMEOUT_MS = 60 * 60 * 1000;
+constexpr int    MAX_RECORD_COUNTDOWN_SECONDS = 60;
+constexpr qint64 MAX_RECORD_REQUEST_BYTES = 64LL * 1024LL;
+constexpr int    APNG_TRANSCODE_FPS = 60;
+
+bool flagValue(const QCommandLineParser& parser, const QString& name, bool fallback) {
+    const auto value = parser.value(name);
+    if (value.isEmpty())
+        return fallback;
+    return value != "0" && value != "false";
+}
+
+bool hasArgument(int argc, char** argv, const char* name) {
+    for (int i = 1; i < argc; ++i) {
+        if (QString::fromLocal8Bit(argv[i]) == QLatin1String(name))
+            return true;
+    }
+    return false;
+}
+
+int boundedInt(QString value, int fallback, int minimum, int maximum) {
+    bool ok = false;
+    const int parsed = value.toInt(&ok);
+    if (!ok)
+        return fallback;
+    return std::clamp(parsed, minimum, maximum);
+}
+
+QPixmap loadThumbnailPixmap(const QString& path) {
+    const QFileInfo info(path);
+    if (path.isEmpty() || !info.exists() || !info.isFile() || !info.isReadable() || info.size() < 0 || info.size() > MAX_THUMBNAIL_SOURCE_BYTES)
+        return {};
+
+    QImageReader reader(path);
+    reader.setAutoTransform(true);
+    const QSize sourceSize = reader.size();
+    if (sourceSize.isEmpty() || sourceSize.width() <= 0 || sourceSize.height() <= 0 || sourceSize.width() > MAX_THUMBNAIL_DIMENSION ||
+        sourceSize.height() > MAX_THUMBNAIL_DIMENSION)
+        return {};
+
+    reader.setScaledSize(sourceSize.scaled(THUMBNAIL_DECODE_MAX_WIDTH, THUMBNAIL_DECODE_MAX_HEIGHT, Qt::KeepAspectRatio));
+    const QImage image = reader.read();
+    if (image.isNull())
+        return {};
+    return QPixmap::fromImage(image);
+}
+
+bool pathIsUnderDirectory(const QString& path, const QString& root) {
+    const QString pathCanonical = QFileInfo(path).canonicalFilePath();
+    const QString rootCanonical = QFileInfo(root).canonicalFilePath();
+    return !pathCanonical.isEmpty() && !rootCanonical.isEmpty() && pathCanonical.startsWith(rootCanonical + QLatin1Char('/'));
+}
+
+bool trustedDirectory(const QString& path) {
+    const QByteArray native = QFile::encodeName(QFileInfo(path).canonicalFilePath());
+    struct stat      st {};
+    return !native.isEmpty() && stat(native.constData(), &st) == 0 && S_ISDIR(st.st_mode) && (st.st_uid == 0 || st.st_uid == geteuid()) &&
+        (st.st_mode & 0022) == 0;
+}
+
+struct DispatchCommandResult {
+    bool    success = false;
+    QString error;
+};
+
+QString compactProcessErrorText(const QByteArray& stderrData, const QByteArray& stdoutData, const QString& fallback) {
+    QString error = QString::fromUtf8(stderrData).trimmed();
+    if (error.isEmpty())
+        error = QString::fromUtf8(stdoutData).trimmed();
+    if (error.startsWith(QStringLiteral("[hyprcapture] ")))
+        error = error.mid(QStringLiteral("[hyprcapture] ").size()).trimmed();
+    if (error.isEmpty())
+        error = fallback;
+    return error.left(160);
+}
+
+bool hyprctlOutputHasError(const QByteArray& stderrData, const QByteArray& stdoutData) {
+    const QString stderrText = QString::fromUtf8(stderrData).trimmed();
+    const QString stdoutText = QString::fromUtf8(stdoutData).trimmed();
+    return stderrText.startsWith(QStringLiteral("error:"), Qt::CaseInsensitive) ||
+        stdoutText.startsWith(QStringLiteral("error:"), Qt::CaseInsensitive);
+}
+
+DispatchCommandResult runHyprctl(const QStringList& args, const QString& fallbackError) {
+    const QString hyprctl = hyprcapture::ui::trustedSystemProgram(QStringLiteral("hyprctl"));
+    if (hyprctl.isEmpty())
+        return {.success = false, .error = QStringLiteral("hyprctl unavailable")};
+
+    QProcess process;
+    process.setProgram(hyprctl);
+    process.setArguments(args);
+    process.setProcessEnvironment(hyprcapture::ui::trustedProcessEnvironment());
+    process.start();
+    if (!process.waitForStarted(1000))
+        return {.success = false, .error = QStringLiteral("hyprctl start failed")};
+    if (!process.waitForFinished(5000)) {
+        process.kill();
+        process.waitForFinished(500);
+        return {.success = false, .error = QStringLiteral("hyprctl timeout")};
+    }
+    const QByteArray stderrData = process.readAllStandardError();
+    const QByteArray stdoutData = process.readAllStandardOutput();
+    if (process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0 && !hyprctlOutputHasError(stderrData, stdoutData))
+        return {.success = true};
+    return {.success = false, .error = compactProcessErrorText(stderrData, stdoutData, fallbackError)};
+}
+
+QString luaStringLiteral(const QString& value) {
+    const QJsonArray array{value};
+    const QString json = QString::fromUtf8(QJsonDocument(array).toJson(QJsonDocument::Compact));
+    return json.size() >= 2 ? json.mid(1, json.size() - 2) : QStringLiteral("\"\"");
+}
+
+DispatchCommandResult evalHyprcaptureLuaFunction(const QString& function, const QString& argument = {}) {
+    if (function.isEmpty())
+        return {.success = false, .error = QStringLiteral("lua function missing")};
+
+    QString expression = QStringLiteral("hl.plugin.hyprcapture.%1(").arg(function);
+    if (!argument.isEmpty())
+        expression += luaStringLiteral(argument);
+    expression += QStringLiteral(")");
+    return runHyprctl(QStringList{QStringLiteral("eval"), expression}, QStringLiteral("eval failed"));
+}
+
+DispatchCommandResult dispatchRecordingStart(const QString& requestPath) {
+    if (requestPath.isEmpty())
+        return {.success = false, .error = QStringLiteral("record request missing")};
+    if (!hyprcapture::ui::isPrivateRuntimeFile(requestPath, MAX_RECORD_REQUEST_BYTES))
+        return {.success = false, .error = QStringLiteral("invalid record request")};
+
+    return evalHyprcaptureLuaFunction(QStringLiteral("record_start"), requestPath);
+}
+
+class RecordingCountdownDisplay final : public QWidget {
+  public:
+    explicit RecordingCountdownDisplay(QScreen* screen) : QWidget(nullptr) {
+        setWindowTitle(QStringLiteral("HyprCapture Countdown"));
+        setWindowFlags(Qt::FramelessWindowHint | Qt::Tool | Qt::WindowStaysOnTopHint | Qt::WindowDoesNotAcceptFocus | Qt::WindowTransparentForInput);
+        setAttribute(Qt::WA_TranslucentBackground);
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_ShowWithoutActivating);
+        setFocusPolicy(Qt::NoFocus);
+
+        setGeometry(screen ? screen->geometry() : QRect(0, 0, 1280, 720));
+
+        winId();
+        if (screen && windowHandle())
+            windowHandle()->setScreen(screen);
+        if (auto* layerWindow = LayerShellQt::Window::get(windowHandle())) {
+            if (screen)
+                layerWindow->setScreen(screen);
+            layerWindow->setScope("hyprcapture-countdown");
+            layerWindow->setLayer(LayerShellQt::Window::LayerOverlay);
+            layerWindow->setAnchors(LayerShellQt::Window::Anchors{LayerShellQt::Window::AnchorTop} | LayerShellQt::Window::AnchorBottom |
+                                    LayerShellQt::Window::AnchorLeft | LayerShellQt::Window::AnchorRight);
+            layerWindow->setExclusiveZone(-1);
+            layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
+            layerWindow->setDesiredSize(QSize(0, 0));
+        }
+
+    }
+
+    void setRemaining(int remaining) {
+        m_remaining = remaining;
+        update();
+    }
+
+  protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setCompositionMode(QPainter::CompositionMode_Source);
+        painter.fillRect(rect(), Qt::transparent);
+        painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+
+        const int minDim = std::max(1, std::min(width(), height()));
+        const int maxDiameter = std::max(64, std::min(280, minDim - 32));
+        const int diameter = std::clamp(minDim / 5, 64, maxDiameter);
+        const QPoint center = rect().center();
+        const QRectF badge(center.x() - diameter / 2.0, center.y() - diameter / 2.0, diameter, diameter);
+        const QString text = QString::number(m_remaining);
+
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(0, 0, 0, 150));
+        painter.drawEllipse(badge);
+
+        QFont font = painter.font();
+        font.setBold(true);
+        font.setPointSize(std::clamp(diameter * 52 / 100, 42, 128));
+        painter.setFont(font);
+        painter.setPen(QColor(0, 0, 0, 180));
+        painter.drawText(badge.translated(0, diameter * 0.04), Qt::AlignCenter, text);
+        painter.setPen(QColor(255, 255, 255, 245));
+        painter.drawText(badge, Qt::AlignCenter, text);
+    }
+
+  private:
+    int m_remaining = 0;
+};
+
+constexpr auto COUNTDOWN_SERVICE = "org.hyprcapture.RecordingCountdown";
+constexpr auto COUNTDOWN_PATH = "/org/hyprcapture/RecordingCountdown";
+constexpr auto COUNTDOWN_INTERFACE = "org.hyprcapture.RecordingCountdown";
+
+void cancelRecordingCountdown() {
+    const auto message = QDBusMessage::createMethodCall(QString::fromLatin1(COUNTDOWN_SERVICE), QString::fromLatin1(COUNTDOWN_PATH),
+                                                       QString::fromLatin1(COUNTDOWN_INTERFACE), QStringLiteral("Cancel"));
+    QDBusConnection::sessionBus().call(message, QDBus::Block, 1000);
+}
+
+class RecordingCountdownController final : public QDBusVirtualObject {
+  public:
+    RecordingCountdownController(QString requestPath, int seconds)
+        : m_requestPath(std::move(requestPath)), m_remaining(std::clamp(seconds, 1, MAX_RECORD_COUNTDOWN_SECONDS)) {
+        for (QScreen* screen : QGuiApplication::screens()) {
+            if (screen)
+                m_displays.push_back(std::make_unique<RecordingCountdownDisplay>(screen));
+        }
+        if (m_displays.empty())
+            m_displays.push_back(std::make_unique<RecordingCountdownDisplay>(QGuiApplication::primaryScreen()));
+        connect(&m_timer, &QTimer::timeout, this, [this] { advance(); });
+        m_timer.setInterval(1000);
+    }
+
+    QString introspect(const QString&) const override {
+        return QStringLiteral("<interface name=\"org.hyprcapture.RecordingCountdown\"><method name=\"Cancel\"/></interface>");
+    }
+
+    bool handleMessage(const QDBusMessage& message, const QDBusConnection& connection) override {
+        if (message.interface() != QLatin1String(COUNTDOWN_INTERFACE) || message.member() != QStringLiteral("Cancel"))
+            return false;
+        m_cancelled = true;
+        m_timer.stop();
+        QFile::remove(m_requestPath);
+        for (auto& display : m_displays)
+            display->hide();
+        connection.send(message.createReply());
+        qApp->quit();
+        return true;
+    }
+
+    bool start() {
+        auto bus = QDBusConnection::sessionBus();
+        if (!bus.registerVirtualObject(QString::fromLatin1(COUNTDOWN_PATH), this) ||
+            !bus.registerService(QString::fromLatin1(COUNTDOWN_SERVICE))) {
+            QFile::remove(m_requestPath);
+            return false;
+        }
+        for (auto& display : m_displays) {
+            display->setRemaining(m_remaining);
+            display->show();
+            display->raise();
+        }
+        m_timer.start();
+        return true;
+    }
+
+  private:
+    void advance() {
+        --m_remaining;
+        if (m_remaining <= 0) {
+            startRecording();
+            return;
+        }
+        for (auto& display : m_displays)
+            display->setRemaining(m_remaining);
+    }
+
+    void startRecording() {
+        m_timer.stop();
+        for (auto& display : m_displays)
+            display->hide();
+        qApp->processEvents(QEventLoop::ExcludeUserInputEvents);
+        QTimer::singleShot(120, this, [this] {
+            if (m_cancelled)
+                return;
+            const auto result = dispatchRecordingStart(m_requestPath);
+            if (!result.success)
+                QFile::remove(m_requestPath);
+            qApp->quit();
+        });
+    }
+
+    QString m_requestPath;
+    bool    m_cancelled = false;
+    int     m_remaining = 0;
+    QTimer  m_timer;
+    std::vector<std::unique_ptr<RecordingCountdownDisplay>> m_displays;
+};
+
+bool isTrustedRecordingResultPath(const QString& path, const hyprcapture::CaptureDefaults& defaults) {
+    const QFileInfo info(path);
+    if (path.isEmpty() || !info.exists() || !info.isFile() || !info.isReadable() || info.ownerId() != geteuid())
+        return false;
+
+    const QByteArray native = QFile::encodeName(info.canonicalFilePath());
+    struct stat      st {};
+    if (native.isEmpty() || stat(native.constData(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0022) != 0)
+        return false;
+
+    const QString recordRoot = QString::fromStdString(hyprcapture::expandUserPath(defaults.recordSaveDir).string());
+    return trustedDirectory(recordRoot) && pathIsUnderDirectory(path, recordRoot);
+}
+
+bool isTrustedRecordingOutputPath(const QString& path, const hyprcapture::CaptureDefaults& defaults) {
+    const QFileInfo info(path);
+    if (path.isEmpty() || !info.isAbsolute() || info.fileName().isEmpty() || info.fileName() == QLatin1String(".") || info.fileName() == QLatin1String(".."))
+        return false;
+    if (info.exists())
+        return false;
+
+    const QString recordRoot = QString::fromStdString(hyprcapture::expandUserPath(defaults.recordSaveDir).string());
+    if (!trustedDirectory(recordRoot))
+        return false;
+
+    const QString rootCanonical = QFileInfo(recordRoot).canonicalFilePath();
+    const QString parentCanonical = QFileInfo(info.absolutePath()).canonicalFilePath();
+    return !rootCanonical.isEmpty() && !parentCanonical.isEmpty() &&
+        (parentCanonical == rootCanonical || parentCanonical.startsWith(rootCanonical + QLatin1Char('/')));
+}
+
+void setOwnerOnlyPermissions(const QString& path) {
+    const QByteArray native = QFile::encodeName(path);
+    if (!native.isEmpty())
+        chmod(native.constData(), 0600);
+}
+
+QPixmap recordingThumbnailPixmap(bool showPlayButton) {
+    constexpr QSize logicalSize(180, 120);
+    qreal dpr = 1.0;
+    for (const QScreen* screen : QGuiApplication::screens()) {
+        if (screen)
+            dpr = std::max(dpr, screen->devicePixelRatio());
+    }
+    dpr = std::clamp(dpr, qreal{1.0}, qreal{4.0});
+    QPixmap pixmap(QSize(static_cast<int>(std::ceil(logicalSize.width() * dpr)), static_cast<int>(std::ceil(logicalSize.height() * dpr))));
+    pixmap.setDevicePixelRatio(dpr);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+
+    const QRectF rect(0.5, 0.5, logicalSize.width() - 1.0, logicalSize.height() - 1.0);
+    painter.setPen(QPen(QColor(235, 238, 242, 95), 1.0));
+    painter.setBrush(QColor(28, 31, 36, 238));
+    painter.drawRoundedRect(rect, 8.0, 8.0);
+
+    if (showPlayButton) {
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(235, 238, 242, 235));
+        const QPointF center(logicalSize.width() / 2.0, logicalSize.height() / 2.0);
+        QPolygonF play;
+        play << QPointF(center.x() - 13.0, center.y() - 18.0) << QPointF(center.x() - 13.0, center.y() + 18.0) << QPointF(center.x() + 20.0, center.y());
+        painter.drawPolygon(play);
+    }
+    return pixmap;
+}
+
+class ResultThumbnailCollection {
+  public:
+    ResultThumbnailCollection(const QPixmap& pixmap,
+                              const QString& path,
+                              const QString& restoreClipboardPath,
+                              const QString& deleteRoot,
+                              int timeoutMs,
+                              bool copyFile,
+                              const std::vector<QScreen*>& screens) {
+        for (QScreen* screen : screens) {
+            m_thumbnails.push_back(std::make_unique<ResultThumbnail>(
+                pixmap, path, restoreClipboardPath, deleteRoot, timeoutMs, copyFile, screen));
+        }
+        if (m_thumbnails.empty())
+            m_thumbnails.push_back(std::make_unique<ResultThumbnail>(
+                pixmap, path, restoreClipboardPath, deleteRoot, timeoutMs, copyFile, nullptr));
+        connectSwipeSynchronization();
+    }
+
+    void setSaveCapture(const std::shared_ptr<hyprcapture::ui::CaptureSave>& capture) {
+        for (const auto& thumbnail : m_thumbnails) {
+            thumbnail->setSaveCapture(capture);
+            QObject::connect(thumbnail.get(), &ResultThumbnail::captureSaved, thumbnail.get(), [this] {
+                for (const auto& other : m_thumbnails) other->refreshSaveActions();
+            });
+        }
+    }
+
+    void setHdrImage(const QImage& image) {
+        for (const auto& thumbnail : m_thumbnails) thumbnail->setHdrImage(image);
+    }
+
+    void setDragPath(const QString& path) {
+        for (const auto& thumbnail : m_thumbnails) thumbnail->setDragPath(path);
+    }
+
+    void show() {
+        for (const auto& thumbnail : m_thumbnails)
+            thumbnail->show();
+    }
+
+    void setImagePixmap(const QPixmap& pixmap) {
+        for (const auto& thumbnail : m_thumbnails)
+            thumbnail->setImagePixmap(pixmap);
+    }
+
+    void setTranscodeProgress(double progress) {
+        for (const auto& thumbnail : m_thumbnails)
+            thumbnail->setTranscodeProgress(progress);
+    }
+
+    void finishTranscodeProgress(bool success, int timeoutMs) {
+        for (const auto& thumbnail : m_thumbnails)
+            thumbnail->finishTranscodeProgress(success, timeoutMs);
+    }
+
+  private:
+    void connectSwipeSynchronization() {
+        if (m_thumbnails.size() < 2)
+            return;
+
+        for (const auto& sourceOwner : m_thumbnails) {
+            ResultThumbnail* source = sourceOwner.get();
+            QObject::connect(source, &ResultThumbnail::swipeOffsetChanged, source, [this, source](const QPointF& offset) {
+                for (const auto& thumbnail : m_thumbnails) {
+                    if (thumbnail.get() != source)
+                        thumbnail->applySynchronizedSwipeOffset(offset);
+                }
+            });
+            QObject::connect(source, &ResultThumbnail::swipeResetStarted, source, [this, source] {
+                for (const auto& thumbnail : m_thumbnails) {
+                    if (thumbnail.get() != source)
+                        thumbnail->resetSynchronizedSwipe();
+                }
+            });
+            QObject::connect(source, &ResultThumbnail::swipeActionStarted, source, [this, source](bool deleteRequested) {
+                for (const auto& thumbnail : m_thumbnails) {
+                    if (thumbnail.get() != source)
+                        thumbnail->animateSynchronizedSwipeOut(deleteRequested);
+                }
+            });
+        }
+    }
+
+    std::vector<std::unique_ptr<ResultThumbnail>> m_thumbnails;
+};
+
+// Decode exactly the first video frame without blocking the UI event loop.
+void loadRecordingFirstFrame(const QString& path, QObject* context, std::function<void(const QPixmap&)> ready) {
+    const QString ffmpeg = hyprcapture::ui::trustedSystemProgram(QStringLiteral("ffmpeg"));
+    if (ffmpeg.isEmpty()) {
+        ready({});
+        return;
+    }
+    auto* process = new QProcess(context);
+    auto* timeout = new QTimer(process);
+    timeout->setSingleShot(true);
+    QObject::connect(timeout, &QTimer::timeout, process, [process] { process->kill(); });
+    process->setProcessEnvironment(hyprcapture::ui::trustedProcessEnvironment());
+    process->setProgram(ffmpeg);
+    process->setArguments({"-hide_banner", "-loglevel", "error", "-nostdin", "-i", path,
+                           "-map", "0:v:0", "-frames:v", "1", "-vf",
+                           "scale=720:480:force_original_aspect_ratio=decrease", "-f", "image2pipe", "-c:v", "png", "pipe:1"});
+    auto complete = [process, ready](bool success) {
+        QPixmap frame;
+        if (success)
+            frame.loadFromData(process->readAllStandardOutput(), "PNG");
+        if (!frame.isNull()) {
+            QPixmap canvas = recordingThumbnailPixmap(false);
+            QPainter painter(&canvas);
+            painter.setRenderHint(QPainter::SmoothPixmapTransform);
+            const QSizeF bounds = canvas.deviceIndependentSize();
+            const QSizeF size = QSizeF(frame.size()).scaled(bounds, Qt::KeepAspectRatio);
+            painter.drawPixmap(QRectF(QPointF((bounds.width() - size.width()) / 2, (bounds.height() - size.height()) / 2), size), frame, frame.rect());
+            painter.end();
+            frame = canvas;
+        }
+        ready(frame);
+        process->deleteLater();
+    };
+    QObject::connect(process, &QProcess::finished, context, [complete](int code, QProcess::ExitStatus status) {
+        complete(code == 0 && status == QProcess::NormalExit);
+    });
+    QObject::connect(process, &QProcess::errorOccurred, context, [complete](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart)
+            complete(false);
+    });
+    process->start();
+    timeout->start(15000);
+}
+
+int showRecordingPending(const hyprcapture::CaptureDefaults& defaults, const QString& path, const QString& socketPath) {
+    const QByteArray nativeSocket = QFile::encodeName(socketPath);
+    struct stat socketStat {};
+    if (!defaults.showThumbnail || !QFileInfo(socketPath).isAbsolute() ||
+        !trustedDirectory(QFileInfo(socketPath).absolutePath()) ||
+        lstat(nativeSocket.constData(), &socketStat) != 0 || !S_ISSOCK(socketStat.st_mode) || socketStat.st_uid != geteuid())
+        return 1;
+    ResultThumbnailCollection thumbnails(recordingThumbnailPixmap(false), path, {}, {}, 0, true,
+                                         thumbnailScreens(QString::fromStdString(defaults.thumbnailMonitor)));
+    thumbnails.setTranscodeProgress(-1.0);
+    QLocalSocket socket;
+    QTimer poll;
+    QTimer watchdog;
+    watchdog.setSingleShot(true);
+    QByteArray response;
+    QObject::connect(&watchdog, &QTimer::timeout, qApp, &QApplication::quit);
+    QObject::connect(&socket, &QLocalSocket::errorOccurred, qApp, [](QLocalSocket::LocalSocketError error) {
+        if (error != QLocalSocket::PeerClosedError)
+            qApp->quit();
+    });
+    QObject::connect(&socket, &QLocalSocket::readyRead, qApp, [&] {
+        response += socket.readAll();
+        if (!response.contains('\n'))
+            return;
+        const auto state = QJsonDocument::fromJson(response).object();
+        if (state.value("phase").toString() != "finalizing" || state.value("output").toString() != path) {
+            qApp->quit();
+            return;
+        }
+        thumbnails.show();
+        watchdog.start(3000);
+    });
+    QObject::connect(&poll, &QTimer::timeout, qApp, [&] {
+        if (socket.state() != QLocalSocket::UnconnectedState)
+            return;
+        response.clear();
+        socket.connectToServer(socketPath, QIODevice::ReadOnly);
+    });
+    poll.start(100);
+    watchdog.start(3000);
+    socket.connectToServer(socketPath, QIODevice::ReadOnly);
+    return qApp->exec();
+}
+
+int showRecordingResult(const hyprcapture::CaptureDefaults& defaults, const QString& path) {
+    if (!isTrustedRecordingResultPath(path, defaults))
+        return 1;
+
+    const QString canonicalPath = QFileInfo(path).canonicalFilePath();
+    QString       restoreClipboardPath;
+    if (defaults.clipboard && defaults.showThumbnail)
+        restoreClipboardPath = hyprcapture::ui::saveClipboardSnapshot();
+
+    if (defaults.clipboard)
+        hyprcapture::ui::copyFileUrlToClipboard(canonicalPath);
+
+    if (!defaults.showThumbnail) {
+        hyprcapture::ui::discardClipboardSnapshot(restoreClipboardPath);
+        return 0;
+    }
+
+    const QString deleteRoot = QString::fromStdString(hyprcapture::expandUserPath(defaults.recordSaveDir).string());
+    ResultThumbnailCollection thumbnails(recordingThumbnailPixmap(true),
+                                         canonicalPath,
+                                         restoreClipboardPath,
+                                         deleteRoot,
+                                         static_cast<int>(defaults.thumbnailTimeoutMs),
+                                         true,
+                                         thumbnailScreens(QString::fromStdString(defaults.thumbnailMonitor)));
+    thumbnails.setTranscodeProgress(-1.0);
+    thumbnails.show();
+    QObject decoderContext;
+    loadRecordingFirstFrame(canonicalPath, &decoderContext, [&](const QPixmap& frame) {
+        if (!frame.isNull())
+            thumbnails.setImagePixmap(frame);
+        thumbnails.finishTranscodeProgress(true, static_cast<int>(defaults.thumbnailTimeoutMs));
+    });
+    return qApp->exec();
+}
+
+void reportTranscodeFailure(const hyprcapture::CaptureDefaults& defaults, const QString& inputPath, const QString& reason) {
+    const QString message = QStringLiteral("APNG conversion failed: %1. Recording retained at: %2").arg(reason, inputPath);
+    qWarning().noquote() << message;
+    hyprcapture::ui::showNotification(defaults.notificationBackend, QStringLiteral("APNG conversion failed"), message, {}, 1000);
+}
+
+struct TranscodeState {
+    QProcess* process = nullptr;
+    std::unique_ptr<ResultThumbnailCollection> thumbnails;
+    QByteArray stdoutBuffer;
+    QByteArray stderrBuffer;
+    QString inputPath;
+    QString outputPath;
+    QString restoreClipboardPath;
+    hyprcapture::CaptureDefaults defaults;
+    int durationMs = 1;
+};
+
+void updateTranscodeProgress(const std::shared_ptr<TranscodeState>& state) {
+    if (!state || !state->process)
+        return;
+
+    state->stdoutBuffer += state->process->readAllStandardOutput();
+    while (true) {
+        const int newline = state->stdoutBuffer.indexOf('\n');
+        if (newline < 0)
+            break;
+
+        const QByteArray line = state->stdoutBuffer.left(newline).trimmed();
+        state->stdoutBuffer.remove(0, newline + 1);
+        const int separator = line.indexOf('=');
+        if (separator <= 0)
+            continue;
+
+        const QByteArray key = line.left(separator);
+        const QByteArray value = line.mid(separator + 1);
+        double progress = -1.0;
+        if (key == "out_time_us" || key == "out_time_ms") {
+            bool ok = false;
+            const qlonglong micros = value.toLongLong(&ok);
+            if (ok && state->durationMs > 0)
+                progress = static_cast<double>(micros) / (static_cast<double>(state->durationMs) * 1000.0);
+        } else if (key == "progress" && value == "end") {
+            progress = 1.0;
+        }
+
+        if (progress >= 0.0 && state->thumbnails)
+            state->thumbnails->setTranscodeProgress(std::clamp(progress, 0.0, 1.0));
+    }
+}
+
+int showRecordingTranscode(const hyprcapture::CaptureDefaults& defaults, const QString& inputPath, const QString& outputPath, bool preserveAlpha, int durationMs) {
+    if (!isTrustedRecordingResultPath(inputPath, defaults) || !isTrustedRecordingOutputPath(outputPath, defaults))
+        return 1;
+
+    const QString ffmpeg = hyprcapture::ui::trustedSystemProgram(QStringLiteral("ffmpeg"));
+    if (ffmpeg.isEmpty()) {
+        reportTranscodeFailure(defaults, inputPath, QStringLiteral("ffmpeg is unavailable"));
+        return 1;
+    }
+
+    const QString canonicalInput = QFileInfo(inputPath).canonicalFilePath();
+    const QString cleanOutput = QDir::cleanPath(outputPath);
+    const QString deleteRoot = QString::fromStdString(hyprcapture::expandUserPath(defaults.recordSaveDir).string());
+
+    auto state = std::make_shared<TranscodeState>();
+    state->inputPath = canonicalInput;
+    state->outputPath = cleanOutput;
+    state->defaults = defaults;
+    state->durationMs = std::max(1, durationMs);
+
+    if (defaults.clipboard && defaults.showThumbnail)
+        state->restoreClipboardPath = hyprcapture::ui::saveClipboardSnapshot();
+
+    if (defaults.showThumbnail) {
+        state->thumbnails = std::make_unique<ResultThumbnailCollection>(
+            recordingThumbnailPixmap(false),
+            cleanOutput,
+            state->restoreClipboardPath,
+            deleteRoot,
+            0,
+            true,
+            thumbnailScreens(QString::fromStdString(defaults.thumbnailMonitor)));
+        state->thumbnails->setTranscodeProgress(0.0);
+        state->thumbnails->show();
+    }
+
+    state->process = new QProcess(qApp);
+    state->process->setProgram(ffmpeg);
+    state->process->setArguments({QStringLiteral("-hide_banner"),
+                                  QStringLiteral("-loglevel"),
+                                  QStringLiteral("error"),
+                                  QStringLiteral("-nostdin"),
+                                  QStringLiteral("-y"),
+                                  QStringLiteral("-progress"),
+                                  QStringLiteral("pipe:1"),
+                                  QStringLiteral("-i"),
+                                  canonicalInput,
+                                  QStringLiteral("-an"),
+                                  QStringLiteral("-c:v"),
+                                  QStringLiteral("apng"),
+                                  QStringLiteral("-pix_fmt"),
+                                  preserveAlpha ? QStringLiteral("rgba") : QStringLiteral("rgb24"),
+                                  QStringLiteral("-pred"),
+                                  QStringLiteral("none"),
+                                  QStringLiteral("-plays"),
+                                  QStringLiteral("0"),
+                                  QStringLiteral("-r"),
+                                  QString::number(APNG_TRANSCODE_FPS),
+                                  cleanOutput});
+    state->process->setProcessEnvironment(hyprcapture::ui::trustedProcessEnvironment());
+    state->process->setProcessChannelMode(QProcess::SeparateChannels);
+
+    QObject::connect(state->process, &QProcess::readyReadStandardOutput, qApp, [state] {
+        updateTranscodeProgress(state);
+    });
+    QObject::connect(state->process, &QProcess::readyReadStandardError, qApp, [state] {
+        state->stderrBuffer += state->process->readAllStandardError();
+        constexpr qsizetype maxErrorBytes = 16 * 1024;
+        if (state->stderrBuffer.size() > maxErrorBytes)
+            state->stderrBuffer = state->stderrBuffer.right(maxErrorBytes);
+    });
+    QObject::connect(state->process, &QProcess::finished, qApp, [state](int exitCode, QProcess::ExitStatus exitStatus) {
+        updateTranscodeProgress(state);
+        const QFileInfo output(state->outputPath);
+        const bool success = exitStatus == QProcess::NormalExit && exitCode == 0 && output.isFile() && output.size() > 0;
+
+        if (success) {
+            QFile::remove(state->inputPath);
+            setOwnerOnlyPermissions(state->outputPath);
+            if (state->defaults.clipboard)
+                hyprcapture::ui::copyFileUrlToClipboard(state->outputPath);
+            if (state->thumbnails) {
+                state->thumbnails->setTranscodeProgress(1.0);
+                loadRecordingFirstFrame(state->outputPath, qApp, [state](const QPixmap& frame) {
+                    state->thumbnails->setImagePixmap(frame.isNull() ? recordingThumbnailPixmap(true) : frame);
+                    state->thumbnails->finishTranscodeProgress(true, static_cast<int>(state->defaults.thumbnailTimeoutMs));
+                });
+            } else {
+                qApp->quit();
+            }
+            return;
+        }
+
+        QFile::remove(state->outputPath);
+        reportTranscodeFailure(state->defaults, state->inputPath, QStringLiteral("ffmpeg did not produce a complete output"));
+        if (state->thumbnails) {
+            state->thumbnails->finishTranscodeProgress(false, state->defaults.thumbnailTimeoutMs > 0 ? static_cast<int>(state->defaults.thumbnailTimeoutMs) : 5000);
+        } else {
+            hyprcapture::ui::discardClipboardSnapshot(state->restoreClipboardPath);
+            qApp->exit(1);
+        }
+    });
+
+    state->process->start();
+    if (!state->process->waitForStarted(1000)) {
+        QFile::remove(cleanOutput);
+        reportTranscodeFailure(defaults, canonicalInput, state->process->errorString());
+        hyprcapture::ui::discardClipboardSnapshot(state->restoreClipboardPath);
+        if (state->thumbnails)
+            state->thumbnails->finishTranscodeProgress(false, 5000);
+        else
+            return 1;
+    }
+
+    return qApp->exec();
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    // This standalone helper owns its process policy, before Qt starts threads.
+    // FFmpeg transcodes and every temporary/thumbnail writer inherit it.
+    umask(0077);
+    if (argc > 1 && (std::string_view(argv[1]) == "--sound-meter" || std::string_view(argv[1]) == "--sound-list" || std::string_view(argv[1]) == "--sound-capture" || std::string_view(argv[1]) == "--sound-finalize"))
+        return hyprcapture::audio::runHelper(argc, argv);
+    qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
+#if LAYERSHELLQTINTERFACE_ENABLE_DEPRECATED_SINCE(6, 6)
+    LayerShellQt::Shell::useLayerShell();
+#endif
+
+    hyprcapture::ui::traceTiming(QStringLiteral("ui.entry"));
+    hyprcapture::ui::SessionLockApplication app(argc, argv);
+    QApplication::setApplicationName("hyprcapture-ui");
+    // Keep the capture UI consistent with this desktop without retheming other Qt apps.
+    app.setStyle("Fusion");
+    app.styleHints()->setColorScheme(Qt::ColorScheme::Dark);
+    app.setPalette(hyprcapture::ui::theme::palette());
+    hyprcapture::ui::traceTiming(QStringLiteral("ui.app_ready"));
+
+    QCommandLineParser parser;
+    parser.addHelpOption();
+    parser.addOptions({
+        {{"m", "mode"}, "Capture mode.", "mode", "region"},
+        {"fullscreen-scope", "Fullscreen scope.", "scope", "all"},
+        {"overlay-scope", "Overlay monitor scope.", "scope", "fix"},
+        {"window-background", "Window background.", "background", "follow-system"},
+        {"window-border", "Window border policy.", "policy", "keep"},
+        {"window-shadow", "Window shadow policy.", "policy", "keep"},
+        {"notification-backend", "Notification backend: hyprland or system.", "backend", "system"},
+        {"save", "Save output.", "0|1", "1"},
+        {"clipboard", "Copy output.", "0|1", "1"},
+        {"thumbnail", "Show thumbnail.", "0|1", "1"},
+        {"screenshot-notification", "Show a notification after a successful screenshot.", "0|1", "1"},
+        {"include-cursor", "Include cursor.", "0|1", "0"},
+        {"remember-settings", "Restore previous interactive settings.", "0|1", "0"},
+        {"confirm-before-capture", "Require explicit confirmation after target selection for normal open captures.", "0|1", "0"},
+        {"in-place-edit-toolbar", "Edit the captured image in the overlay before output.", "0|1", "0"},
+        {"language", "Interface language, or auto for environment/system language.", "locale", "auto"},
+        {"pin-image", "Show an image as a desktop pin.", "path"},
+        {"pin-monitor", "Initial output for a desktop pin.", "name"},
+        {"pin-geometry", "Initial desktop logical rectangle for a desktop pin.", "x,y,width,height"},
+        {"pin-consume-source", "Consume a validated private runtime image after loading a pin."},
+        {"pin-ready-socket", "Private socket for acknowledging a desktop pin launch.", "path"},
+        {{"fushion-mode", "fusion-mode"}, "Enable fushion toolbar behavior.", "0|1", "0"},
+        {"capture-fullscreen-clients-as-monitor", "Capture fullscreen clients as their monitor in window/fusion mode.", "0|1", "0"},
+        {"dynamic-window-metadata", "Use capture-aware window metadata in screenshot filename templates.", "0|1", "1"},
+        {"window-wheel-scroll", "Enable wheel-based window selection.", "0|1", "1"},
+        {"window-wheel-scope", "Window wheel selection scope: workspace or under-cursor.", "scope", "workspace"},
+        {"fullscreen-preview-rounding", "Fullscreen preview rounding: auto, 0, or logical pixels.", "rounding", "auto"},
+        {"save-dir", "Save directory.", "path", "$XDG_PICTURES_DIR/Screenshots"},
+        {"screenshot-format", "Legacy screenshot format: png or heic.", "format", "png"},
+        {"screenshot-mode", "Default screenshot mode: sdr or hdr.", "mode"},
+        {"show-hdr-control", "Show the SDR/HDR segmented control.", "bool", "1"},
+        {"hdr-save-sdr", "Also save SDR PNG alongside HDR HEIC.", "bool", "0"},
+        {"hdr-drag-format", "HDR drag format: heic or sdr.", "format", "heic"},
+        {"hdr-clipboard-format", "HDR clipboard format: heic or sdr.", "format", "heic"},
+        {"filename-template", "Filename strftime template with {window_class}/{window_title}.", "template", "Screenshot-%Y-%m-%d-%H%M%S.png"},
+        {"notification-title-template", "Screenshot notification title template.", "template", "Screenshot captured"},
+        {"notification-body-template", "Screenshot notification body template.", "template", "Saved {filename} ({window_title})"},
+        {"record-save-dir", "Recording save directory.", "path", "$XDG_VIDEOS_DIR/Screenrecords"},
+        {"record-filename-template", "Recording filename strftime template.", "template", "Recording-%Y-%m-%d-%H%M%S.mp4"},
+        {"record-format", "Recording format.", "format", "mp4"},
+        {"record-transparent-format", "Transparent window recording container format.", "format", "webm"},
+        {"record-audio-echo-cancellation", "Microphone AEC: -1 auto, 0 off, 1 on.", "policy", "-1"},
+        {"record-audio-echo-backend", "AEC backend: cpu or experimental npu.", "backend", "cpu"},
+        {"record-audio-mix", "Audio mixing preset.", "preset", "voice-priority"},
+        {"record-audio-system-gain", "System gain in dB.", "dB", "0"},
+        {"record-audio-mic-gain", "Mic gain in dB.", "dB", "0"},
+        {"record-audio", "Recording sound: off, system, microphone, mix.", "mode", "off"},
+        {"record-audio-output", "Sound source: auto, default, output device, or window:<address>.", "source", "auto"},
+        {"record-audio-input", "Microphone source.", "device", "default"},
+        {"record-codec", "Recording codec.", "codec", "auto"},
+        {"record-transparent-codec", "Transparent window recording codec.", "codec", "auto"},
+        {"record-solid-alpha", "Keep alpha outside follow-system/white/black window recording content when supported.", "0|1", "0"},
+        {"record-preset", "Recording preset.", "preset", "veryfast"},
+        {"record-gsr-flags", "Extra gpu-screen-recorder flags.", "flags", ""},
+        {"record-window-backend", "Window recording backend.", "backend", "compositor"},
+        {"record-fps", "Recording FPS.", "fps", "30"},
+        {"record-fps-options", "Recording FPS choices.", "fps-list", "15 24 30 60"},
+        {"record-window-fps-limit", "Window recording FPS cap.", "fps", "12"},
+        {"record-window-real-bg-fps-limit", "Real background window recording FPS cap.", "fps", "8"},
+        {"record-max-seconds", "Recording max seconds.", "seconds", "0"},
+        {"record-countdown-seconds", "Recording start countdown seconds.", "seconds", "0"},
+        {"thumbnail-timeout-ms", "Thumbnail timeout.", "ms", "5000"},
+        {"thumbnail-monitor", "Thumbnail monitor: active, primary, all, or output name.", "monitor", "active"},
+        {"watermark", "Watermark image path or built-in id.", "path|id", ""},
+        {"watermark-position", "Watermark position.", "position", "central"},
+        {"watermark-width", "Watermark width in pixels or screenshot-width percent.", "width", "20%"},
+        {"watermark-offset", "Watermark x/y offset in pixels or percent.", "vec2", "0 0"},
+        {"session-json", "Compositor session metadata.", "json", "{}"},
+        {"session-json-file", "Private compositor session metadata file.", "path"},
+        {"session-json-stdin", "Receive a private session filename from the compositor startup socket."},
+        {"thumbnail-save-session", "Private capture settings for manual save.", "path"},
+        {"thumbnail-save-sdr", "Full resolution SDR capture for manual save.", "path"},
+        {"thumbnail-save-hdr", "Full resolution HDR capture for manual save.", "path"},
+        {"thumbnail-hdr-preview", "Private HDR thumbnail pixels.", "path"},
+        {"thumbnail-window", "Show a normal thumbnail window for an image path.", "path"},
+        {"thumbnail-target", "Path opened or deleted by a thumbnail preview.", "path"},
+        {"thumbnail-drag-target", "File representation used for dragging.", "path"},
+        {"record-countdown-request", "Show an input-transparent recording countdown for a private request file.", "path"},
+        {"recording-result", "Handle a completed recording result.", "path"},
+        {"recording-pending-socket", "Watch recording finalization state.", "path"},
+        {"recording-transcode-input", "Transcode an intermediate recording input.", "path"},
+        {"recording-transcode-output", "Transcode output path.", "path"},
+        {"recording-transcode-alpha", "Preserve alpha while transcoding.", "0|1", "0"},
+        {"recording-transcode-duration-ms", "Expected transcode duration.", "ms", "1"},
+        {"thumbnail-delete-root", "Directory where thumbnail files may be deleted.", "path"},
+        {"restore-clipboard", "Clipboard snapshot to restore when deleting the thumbnail image.", "path"},
+        {"quick", "Capture immediately."},
+        {"record", "Use the overlay to start a compositor-side recording."},
+        {"record-active", "Show recording controls as active."},
+    });
+    parser.process(app);
+    hyprcapture::ui::SessionLockGuard sessionLock(hyprcapture::ui::SessionLockGuard::connectToCompositor());
+    if (sessionLock.cancelled()) {
+        qWarning("HyprCapture: unlocked compositor connection required");
+        return 1;
+    }
+    hyprcapture::ui::installUiTranslations(parser.value("language"));
+
+    if (parser.isSet("pin-image")) {
+        QLocalSocket readySocket;
+        const QString readyPath = parser.value("pin-ready-socket");
+        if (!readyPath.isEmpty()) {
+            if (!hyprcapture::ui::isPrivateRuntimePath(readyPath))
+                return 1;
+            readySocket.connectToServer(readyPath);
+            if (!readySocket.waitForConnected(1500))
+                return 1;
+        }
+        QRect pinGeometry;
+        if (parser.isSet("pin-geometry")) {
+            const auto fields = parser.value("pin-geometry").split(',');
+            int values[4]{};
+            bool valid = fields.size() == 4;
+            for (int i = 0; valid && i < 4; ++i)
+                values[i] = fields[i].toInt(&valid);
+            if (!valid || values[2] <= 0 || values[3] <= 0) {
+                qWarning("HyprCapture: invalid pin geometry");
+                return 1;
+            }
+            pinGeometry = QRect(values[0], values[1], values[2], values[3]);
+        }
+        QString error;
+        QScreen* pinScreen = nullptr;
+        for (QScreen* screen : QGuiApplication::screens())
+            if (screen->name() == parser.value("pin-monitor"))
+                pinScreen = screen;
+        std::unique_ptr<QWidget> pin(createPinnedImage(parser.value("pin-image"), parser.isSet("pin-consume-source"), &error, pinScreen, pinGeometry));
+        if (!pin) {
+            if (!readyPath.isEmpty()) {
+                readySocket.write("error:" + error.toUtf8().replace('\n', ' ').left(1000) + '\n');
+                readySocket.flush();
+                if (readySocket.bytesToWrite() != 0)
+                    readySocket.waitForBytesWritten(500);
+            }
+            qWarning("HyprCapture: %s", qPrintable(error));
+            return 1;
+        }
+        if (!readyPath.isEmpty()) {
+            readySocket.write("ready\n");
+            readySocket.flush();
+            if (readySocket.bytesToWrite() != 0 && !readySocket.waitForBytesWritten(500))
+                return 1;
+            QByteArray accepted;
+            QElapsedTimer responseTimer;
+            responseTimer.start();
+            while (!accepted.contains('\n') && responseTimer.elapsed() < 1500) {
+                accepted += readySocket.readAll();
+                if (accepted.contains('\n'))
+                    break;
+                if (!readySocket.waitForReadyRead(std::max(1, 1500 - int(responseTimer.elapsed()))))
+                    break;
+            }
+            if (accepted != "accepted\n")
+                return 1;
+        }
+        return app.exec();
+    }
+
+    if (hasArgument(argc, argv, "--thumbnail-window")) {
+        const QString thumbnailPath = parser.value("thumbnail-window");
+        const QString thumbnailTarget = parser.value("thumbnail-target").isEmpty() ? thumbnailPath : parser.value("thumbnail-target");
+        const QPixmap pixmap = loadThumbnailPixmap(thumbnailPath);
+        if (pixmap.isNull())
+            return 1;
+        ResultThumbnailCollection thumbnails(pixmap,
+                                             thumbnailTarget,
+                                             parser.value("restore-clipboard"),
+                                             parser.value("thumbnail-delete-root"),
+                                             boundedInt(parser.value("thumbnail-timeout-ms"), 5000, 0, MAX_THUMBNAIL_TIMEOUT_MS),
+                                             false,
+                                             thumbnailScreens(parser.value("thumbnail-monitor")));
+        thumbnails.setHdrImage(hyprcapture::ui::takeHdrThumbnail(parser.value("thumbnail-hdr-preview")));
+        thumbnails.setDragPath(parser.value("thumbnail-drag-target"));
+        const auto saveRequest = parser.value("thumbnail-save-session");
+        if (hyprcapture::ui::isPrivateRuntimeFile(saveRequest, 8 * 1024 * 1024)) {
+            QFile file(saveRequest);
+            if (file.open(QIODevice::ReadOnly) && file.size() <= 8 * 1024 * 1024) {
+                const auto session = hyprcapture::decodeSessionJson(file.readAll().toStdString());
+                file.close();
+                QFile::remove(saveRequest);
+                if (session) {
+                    auto capture = std::make_shared<hyprcapture::ui::CaptureSave>();
+                    capture->defaults = session->defaults;
+                    if (session->filenameMetadata) capture->metadata = *session->filenameMetadata;
+                    if (capture->defaults.save) capture->savedPath = thumbnailTarget;
+                    else {
+                        const auto sdr = parser.value("thumbnail-save-sdr");
+                        capture->image = hyprcapture::ui::isPrivateRuntimeFile(sdr, 512LL * 1024 * 1024) ? QImage(sdr) : QImage(thumbnailTarget);
+                        if (hyprcapture::ui::isPrivateRuntimePath(sdr)) QFile::remove(sdr);
+                        capture->hdrImage = hyprcapture::ui::takeHdrThumbnail(parser.value("thumbnail-save-hdr"), true);
+                    }
+                    thumbnails.setSaveCapture(capture);
+                }
+            }
+        }
+        thumbnails.show();
+        return app.exec();
+    }
+
+    hyprcapture::CaptureDefaults defaults;
+    defaults.mode = hyprcapture::parseCaptureMode(parser.value("mode").toStdString(), defaults.mode);
+    defaults.fullscreenScope = hyprcapture::parseFullscreenScope(parser.value("fullscreen-scope").toStdString(), defaults.fullscreenScope);
+    defaults.overlayScope = hyprcapture::parseOverlayScope(parser.value("overlay-scope").toStdString(), defaults.overlayScope);
+    defaults.windowBackground = hyprcapture::parseWindowBackground(parser.value("window-background").toStdString(), defaults.windowBackground);
+    defaults.windowBorder = hyprcapture::parseDecorationPolicy(parser.value("window-border").toStdString(), defaults.windowBorder);
+    defaults.windowShadow = hyprcapture::parseDecorationPolicy(parser.value("window-shadow").toStdString(), defaults.windowShadow);
+    defaults.notificationBackend =
+        hyprcapture::parseNotificationBackend(parser.value("notification-backend").toStdString(), defaults.notificationBackend);
+    defaults.save = flagValue(parser, "save", defaults.save);
+    defaults.clipboard = flagValue(parser, "clipboard", defaults.clipboard);
+    defaults.showThumbnail = flagValue(parser, "thumbnail", defaults.showThumbnail);
+    defaults.screenshotNotification = flagValue(parser, "screenshot-notification", defaults.screenshotNotification);
+    defaults.includeCursor = flagValue(parser, "include-cursor", defaults.includeCursor);
+    defaults.rememberSettings = flagValue(parser, "remember-settings", defaults.rememberSettings);
+    defaults.confirmBeforeCapture = flagValue(parser, "confirm-before-capture", defaults.confirmBeforeCapture);
+    defaults.inPlaceEditToolbar = flagValue(parser, "in-place-edit-toolbar", defaults.inPlaceEditToolbar);
+    defaults.language = parser.value("language").toStdString();
+    defaults.fushionMode = flagValue(parser, "fushion-mode", defaults.fushionMode);
+    defaults.captureFullscreenClientsAsMonitor =
+        flagValue(parser, "capture-fullscreen-clients-as-monitor", defaults.captureFullscreenClientsAsMonitor);
+    defaults.dynamicWindowMetadata = flagValue(parser, "dynamic-window-metadata", defaults.dynamicWindowMetadata);
+    defaults.windowWheelScroll = flagValue(parser, "window-wheel-scroll", defaults.windowWheelScroll);
+    defaults.windowWheelScope =
+        hyprcapture::parseWindowWheelScope(parser.value("window-wheel-scope").toStdString(), defaults.windowWheelScope);
+    defaults.fullscreenPreviewRounding = parser.value("fullscreen-preview-rounding").toStdString();
+    defaults.saveDir = parser.value("save-dir").toStdString();
+    defaults.screenshotFormat = parser.value("screenshot-format").toStdString();
+    if (defaults.screenshotFormat != "png" && defaults.screenshotFormat != "heic") parser.showHelp(1);
+    if (parser.isSet("screenshot-mode")) {
+        const auto mode = parser.value("screenshot-mode");
+        if (mode != "sdr" && mode != "hdr") parser.showHelp(1);
+        defaults.screenshotFormat = mode == "hdr" ? "heic" : "png";
+    }
+    defaults.showHdrControl = flagValue(parser, "show-hdr-control", defaults.showHdrControl);
+    defaults.hdrSaveSdr = flagValue(parser, "hdr-save-sdr", defaults.hdrSaveSdr);
+    defaults.hdrDragFormat = parser.value("hdr-drag-format").toStdString();
+    defaults.hdrClipboardFormat = parser.value("hdr-clipboard-format").toStdString();
+    if ((defaults.hdrDragFormat != "heic" && defaults.hdrDragFormat != "sdr") ||
+        (defaults.hdrClipboardFormat != "heic" && defaults.hdrClipboardFormat != "sdr")) parser.showHelp(1);
+    defaults.filenameTemplate = parser.value("filename-template").toStdString();
+    defaults.notificationTitleTemplate = parser.value("notification-title-template").toStdString();
+    defaults.notificationBodyTemplate = parser.value("notification-body-template").toStdString();
+    defaults.recordSaveDir = parser.value("record-save-dir").toStdString();
+    defaults.recordFilenameTemplate = parser.value("record-filename-template").toStdString();
+    defaults.recordFormat = parser.value("record-format").toStdString();
+    defaults.recordTransparentFormat = parser.value("record-transparent-format").toStdString();
+    defaults.recordAudioEchoCancellation = std::clamp(parser.value("record-audio-echo-cancellation").toInt(), -1, 1);
+    defaults.recordAudioEchoBackend = parser.value("record-audio-echo-backend") == "npu" ? "npu" : "cpu";
+    defaults.recordAudioMix = parser.value("record-audio-mix").toStdString();
+    if (defaults.recordAudioMix != "manual" && defaults.recordAudioMix != "auto-balance" && defaults.recordAudioMix != "voice-priority") defaults.recordAudioMix = "voice-priority";
+    defaults.recordAudioSystemGain = std::clamp(parser.value("record-audio-system-gain").toInt(), -61, 24);
+    defaults.recordAudioMicGain = std::clamp(parser.value("record-audio-mic-gain").toInt(), -61, 24);
+    defaults.recordAudio = hyprcapture::parseRecordAudio(parser.value("record-audio").toStdString());
+    defaults.recordAudioOutput = parser.value("record-audio-output").toStdString();
+    defaults.recordAudioInput = parser.value("record-audio-input").toStdString();
+    defaults.recordCodec = parser.value("record-codec").toStdString();
+    defaults.recordTransparentCodec = parser.value("record-transparent-codec").toStdString();
+    defaults.recordSolidAlpha = flagValue(parser, "record-solid-alpha", defaults.recordSolidAlpha);
+    defaults.recordPreset = parser.value("record-preset").toStdString();
+    defaults.recordGsrFlags = parser.value("record-gsr-flags").toStdString();
+    defaults.recordWindowBackend = hyprcapture::parseRecordWindowBackend(parser.value("record-window-backend").toStdString(), defaults.recordWindowBackend);
+    defaults.recordFps = boundedInt(parser.value("record-fps"), defaults.recordFps, 1, 240);
+    defaults.recordFpsOptions = parser.value("record-fps-options").toStdString();
+    defaults.recordWindowFpsLimit = boundedInt(parser.value("record-window-fps-limit"), defaults.recordWindowFpsLimit, 0, 240);
+    defaults.recordWindowRealBgFpsLimit = boundedInt(parser.value("record-window-real-bg-fps-limit"), defaults.recordWindowRealBgFpsLimit, 0, 240);
+    defaults.recordMaxSeconds = boundedInt(parser.value("record-max-seconds"), defaults.recordMaxSeconds, 0, 24 * 60 * 60);
+    defaults.recordCountdownSeconds = boundedInt(parser.value("record-countdown-seconds"), defaults.recordCountdownSeconds, 0, MAX_RECORD_COUNTDOWN_SECONDS);
+    defaults.thumbnailTimeoutMs = boundedInt(parser.value("thumbnail-timeout-ms"), defaults.thumbnailTimeoutMs, 0, MAX_THUMBNAIL_TIMEOUT_MS);
+    defaults.thumbnailMonitor = parser.value("thumbnail-monitor").toStdString();
+    defaults.watermark = parser.value("watermark").toStdString();
+    defaults.watermarkPosition = hyprcapture::parseWatermarkPosition(parser.value("watermark-position").toStdString(), defaults.watermarkPosition);
+    defaults.watermarkWidth = parser.value("watermark-width").toStdString();
+    defaults.watermarkOffset = parser.value("watermark-offset").toStdString();
+
+    if (hasArgument(argc, argv, "--record-countdown-request")) {
+        const QString requestPath = parser.value("record-countdown-request");
+        if (!hyprcapture::ui::isPrivateRuntimeFile(requestPath, MAX_RECORD_REQUEST_BYTES))
+            return 1;
+        RecordingCountdownController countdown(requestPath, defaults.recordCountdownSeconds);
+        if (!countdown.start())
+            return 1;
+        return app.exec();
+    }
+
+    if (hasArgument(argc, argv, "--recording-transcode-input"))
+        return showRecordingTranscode(defaults,
+                                      parser.value("recording-transcode-input"),
+                                      parser.value("recording-transcode-output"),
+                                      flagValue(parser, "recording-transcode-alpha", false),
+                                      boundedInt(parser.value("recording-transcode-duration-ms"), 1, 1, 24 * 60 * 60 * 1000));
+
+    if (hasArgument(argc, argv, "--recording-pending-socket"))
+        return showRecordingPending(defaults, parser.value("recording-result"), parser.value("recording-pending-socket"));
+
+    if (hasArgument(argc, argv, "--recording-result"))
+        return showRecordingResult(defaults, parser.value("recording-result"));
+
+    QString sessionJson = parser.value("session-json");
+    QString sessionPath = parser.value("session-json-file");
+    if (parser.isSet("session-json-stdin")) {
+        hyprcapture::ui::ScopedUiTiming waitTiming(QStringLiteral("ui.session_wait"));
+        const auto received = hyprcapture::receiveStartupPath(STDIN_FILENO);
+        if (!received) {
+            qWarning("HyprCapture: compositor session startup failed or timed out");
+            return 1;
+        }
+        sessionPath = QString::fromStdString(*received);
+        sessionLock.setStartupControl(STDIN_FILENO);
+        if (sessionLock.cancelled()) return 0;
+    }
+    // The snapshot must already be frozen before dismissing any countdown.
+    cancelRecordingCountdown();
+    if (!sessionPath.isEmpty()) {
+        QFile file(sessionPath);
+        const bool loaded = hyprcapture::ui::isPrivateRuntimeFile(sessionPath, MAX_SESSION_JSON_BYTES) && file.open(QIODevice::ReadOnly);
+        if (loaded)
+            sessionJson = QString::fromUtf8(file.readAll());
+        if (hyprcapture::ui::isPrivateRuntimePath(sessionPath))
+            QFile::remove(sessionPath);
+        // An interrupted prelaunch must never fall through to a live grim
+        // capture: that would lose the original frozen snapshot semantics.
+        if (parser.isSet("session-json-stdin") && (!loaded || !hyprcapture::decodeSessionJson(sessionJson.toStdString()))) {
+            qWarning("HyprCapture: invalid compositor startup session");
+            return 1;
+        }
+    }
+    hyprcapture::ui::traceTiming(QStringLiteral("ui.session_loaded"));
+
+    const bool quick = parser.isSet("quick");
+    CaptureOverlay overlay(defaults, quick, parser.isSet("record"), parser.isSet("record-active"), sessionJson);
+    const auto     overlayScope = overlay.overlayScope();
+
+    std::vector<std::unique_ptr<CaptureOverlay>> extraOverlays;
+    std::vector<CaptureOverlay*>                 overlays{&overlay};
+    if (!quick && overlayScope != hyprcapture::OverlayScope::Fix) {
+        QScreen* launchScreen = overlay.overlayScreen();
+        for (QScreen* screen : QGuiApplication::screens()) {
+            if (!screen || screen == launchScreen)
+                continue;
+            const bool active = overlayScope == hyprcapture::OverlayScope::All;
+            auto       extra = std::make_unique<CaptureOverlay>(overlay, screen->geometry(), active);
+            overlays.push_back(extra.get());
+            extraOverlays.push_back(std::move(extra));
+        }
+    }
+
+    CaptureOverlay* activeOverlay = &overlay;
+    if (overlayScope == hyprcapture::OverlayScope::Focus) {
+        for (CaptureOverlay* candidate : overlays) {
+            QObject::connect(candidate, &CaptureOverlay::activationRequested, &app, [&, candidate] {
+                if (activeOverlay->isEditing())
+                    return;
+                if (activeOverlay == candidate)
+                    return;
+                candidate->adoptInteractionState(*activeOverlay);
+                activeOverlay->setOverlayActive(false);
+                candidate->setOverlayActive(true);
+                activeOverlay = candidate;
+            });
+        }
+    }
+    if (overlays.size() > 1) {
+        for (CaptureOverlay* candidate : overlays) {
+            QObject::connect(candidate, &CaptureOverlay::editingChanged, &app, [&, candidate](bool editing) {
+                if (editing)
+                    activeOverlay = candidate;
+                for (CaptureOverlay* peer : overlays) {
+                    if (peer != candidate)
+                        peer->setOverlayActive(!editing && overlayScope == hyprcapture::OverlayScope::All);
+                }
+            });
+            QObject::connect(candidate, &CaptureOverlay::finishingStarted, &app, [&, candidate] {
+                for (CaptureOverlay* peer : overlays)
+                    if (peer != candidate)
+                        peer->setOverlayActive(false);
+            });
+        }
+    }
+
+    for (CaptureOverlay* candidate : overlays) {
+        QObject::connect(candidate, &CaptureOverlay::scrollingChanged, &app, [&, candidate](bool scrolling) {
+            activeOverlay = candidate;
+            for (CaptureOverlay* peer : overlays) {
+                if (scrolling && peer != candidate)
+                    peer->hide();
+                else
+                    peer->show();
+            }
+            if (!scrolling) {
+                candidate->raise();
+                candidate->activateWindow();
+            }
+        });
+    }
+
+    hyprcapture::ui::traceTiming(QStringLiteral("ui.show_begin"));
+    for (CaptureOverlay* candidate : overlays) {
+        candidate->show();
+        candidate->raise();
+    }
+    overlay.activateWindow();
+    overlay.raise();
+    hyprcapture::ui::traceTiming(QStringLiteral("ui.show_end"));
+
+    std::unique_ptr<QSocketNotifier> captureControl;
+    if (parser.isSet("session-json-stdin")) {
+        captureControl = std::make_unique<QSocketNotifier>(STDIN_FILENO, QSocketNotifier::Read, &app);
+        QObject::connect(captureControl.get(), &QSocketNotifier::activated, &app, [&] {
+            char command[8];
+            const auto size = recv(STDIN_FILENO, command, sizeof(command), MSG_DONTWAIT | MSG_TRUNC);
+            if (size == 6 && std::memcmp(command, "cancel", 6) == 0) app.quit();
+            if (size == 0) captureControl->setEnabled(false);
+        });
+    }
+
+    return app.exec();
+}

@@ -3,16 +3,16 @@
 
 @keyframes glowing {
     0% {
-        box-shadow: 0 0 30px @pink;
+        box-shadow: 0 0 30px @green;
     }
     20% {
-        box-shadow: 0 0 30px @pink;
+        box-shadow: 0 0 30px @green;
     }
     80% {
-        box-shadow: 0 0 30px @foreground;
+        box-shadow: 0 0 30px @green;
     }
     100% {
-        box-shadow: 0 0 30px @blue;
+        box-shadow: 0 0 30px @green;
     }
 }
 
@@ -48,21 +48,21 @@ button:hover {
 }
 
 #lock {
-    background-image: image(url("./icons/lock.png"));
+    background-image: image(url("./icons/lock-green.svg"));
 }
 
 #suspend {
-    background-image: image(url("./icons/suspend.png"));
+    background-image: image(url("./icons/suspend-green.svg"));
 }
 
 #shutdown {
-    background-image: image(url("./icons/shutdown.png"));
+    background-image: image(url("./icons/shutdown-green.svg"));
 }
 
 #reboot {
-    background-image: image(url("./icons/reboot.png"));
+    background-image: image(url("./icons/reboot-green.svg"));
 }
 
 #logout {
-    background-image: image(url("./icons/logout.png"));
+    background-image: image(url("./icons/logout-green.svg"));
 }

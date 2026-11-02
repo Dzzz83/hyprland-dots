@@ -1,0 +1,765 @@
+# HyprCapture
+
+> [!IMPORTANT]
+> `master` targets the latest official Hyprland release, currently v0.57.0 (`hyprwm/Hyprland` `0aa6745f`); `flake.lock` pins that release.
+> For Hyprland's development `main`, use the `hyprland-master` branch.
+> The compositor and plugin must come from the same Hyprland revision; the plugin refuses to load when its headers do not match the running compositor.
+
+HyprCapture is a Hyprland-only screenshot tool split into a compositor plugin and a Qt layer-shell helper. The plugin captures frozen compositor artifacts and launches the helper; the helper provides the selection overlay, output rendering, clipboard integration, and result thumbnail.
+
+All Hyprland configuration examples in this document use the Lua config API available in Hyprland 0.56 and later.
+
+See the [changelog](https://gfhdhytghd.github.io/HyprCapture/) for release history and unreleased changes.
+
+> [!IMPORTANT]
+> `hyprpm` builds the compositor plugin and installs the helper to `~/.local/bin/hyprcapture-ui`. Set `plugin.hyprcapture.helper` with `hl.config` only when you want to override that default helper path.
+
+> [!WARNING]
+> Hyprland plugins run inside the compositor process and with high permission. Install plugins only from sources you trust.
+
+> [!WARNING]
+> This software is vibe coded: 2% human, 20% Claude, 78% OpenAI Codex. It has been manually audited; warning in case you mind it.
+
+## Open-source acknowledgements
+
+The screenshot annotation interface is inspired by [Omarchy Screenshot](https://github.com/manateelazycat/omarchy-screenshot) by [Andy Stewart](https://github.com/manateelazycat), particularly its compact grouped toolbar, color palette, and light/dark appearance. Thank you for sharing the project with the open-source community. Omarchy Screenshot is licensed under [GPL-3.0-only](https://github.com/manateelazycat/omarchy-screenshot/blob/main/LICENSE).
+
+## Features
+
+- Fullscreen, region, and window capture modes
+- Fullscreen, region, and window recording as video or fixed-duration GIF/APNG/WebP animations
+- Immediate frozen desktop image behind the overlay
+- [HDR support](#hdr-support): native HDR overlay and editing, SDR-compatible gain-map HEIC screenshots, and HDR-to-SDR conversion for recording
+- Display-resolution output for fullscreen and region captures
+- Compositor-side window artifacts, including windows that are occluded or partly off-screen
+- Window output backgrounds: follow system, white, black, real background, or transparent
+- Optional window border and shadow removal
+- Optional image watermarks from PNG, JPG/JPEG, or built-in presets
+- Optional in-place screenshot editing with annotations and desktop pinning
+- UI translations for English, Simplified and Traditional Chinese, Japanese, German, French, Spanish, and Korean
+- Save-to-file and clipboard output
+- Stable Wayland clipboard writes through `wl-copy` when available, with Qt clipboard fallback
+- macOS-style result thumbnail with open, copy, show in folder, delete, and close actions
+- Thumbnail swipe gestures: swipe right to close, swipe down to delete and restore the previous clipboard snapshot
+- Recording does not use `wf-recorder`, `grim`, screencopy, PipeWire portals, or Hyprland managed screenshare sessions
+
+
+https://github.com/user-attachments/assets/03a642d3-569d-4b77-8ccf-17934620bc20
+
+
+## Installation
+
+### Install on Omarchy
+
+HyprCapture ships as an [Omarchy](https://omarchy.org/) shell plugin. Add and enable it with:
+
+```sh
+omarchy plugin add https://github.com/gfhdhytghd/HyprCapture.git --enable
+```
+
+On first enable a terminal opens, installs any missing build dependencies with `pacman` (it asks for your password), and compiles the plugin and its helper against the Hyprland you are running. The build lives in `~/.cache/io.github.gfhdhytghd.hyprcapture/`; nothing is installed system-wide. The build includes [HDR support](#hdr-support): native HDR preview and editing, and gain-map HEIC export built from checksum-verified libultrahdr/libheif sources. Optional AEC runtime/model installation runs in the background and does not block capture when offline or unsupported. Its progress is logged to `~/.cache/io.github.gfhdhytghd.hyprcapture/aec-install.log`; rerun setup to retry. The same terminal asks whether HyprCapture should handle the **Screenshot** and **Screenrecord** entries of the Omarchy menu. If you agree, a clearly marked block is added to `~/.config/omarchy/extensions/omarchy-menu.jsonc`; it is removed again when the plugin is disabled or removed. Change your answer later with `~/.config/omarchy/plugins/io.github.gfhdhytghd.hyprcapture/omarchy/plugin menu on` (or `off`).
+
+When the build finishes the plugin loads and these bindings are registered at runtime:
+
+| Input | Action | Replaces Omarchy default |
+| --- | --- | --- |
+| `Print` | Select a target, then annotate | Screenshot |
+| `Shift + Print` | Capture the full screen | — |
+| `Alt + Print` | Open the overlay in recording mode, or stop the active recording | Screenrecording |
+| Menu › Capture › Screenshot | Select a target, then annotate | omarchy-capture-screenshot |
+| Menu › Capture › Screenrecord | Open the overlay in recording mode, or stop the active recording | Screenrecord submenu |
+
+A key you bound yourself is never taken over; it is skipped and logged instead. If HyprCapture is not loaded, for example right after a Hyprland update, the menu entries fall back to Omarchy's own tools. To choose your own bindings and settings, copy [`omarchy/defaults.lua`](omarchy/defaults.lua) to `~/.config/hyprcapture/omarchy.lua` and edit it. When that file exists it replaces the defaults, and it is applied after every config reload. Configure `plugin.hyprcapture` there rather than in `hyprland.lua`: the plugin is not loaded yet when your main config first runs.
+
+After a Hyprland update, a notification offers to rebuild. `omarchy plugin update` pulls new versions and asks for a rebuild only when the native code changed. If you previously installed HyprCapture with `hyprpm`, run `hyprpm disable hyprcapture` first so only one copy is loaded. The optional DTLN echo canceller is prepared in the background; failure leaves normal capture available.
+
+`omarchy plugin disable io.github.gfhdhytghd.hyprcapture` unloads the plugin and restores Omarchy's bindings and menu. `omarchy plugin remove io.github.gfhdhytghd.hyprcapture` does the same and deletes the checkout; remove `~/.cache/io.github.gfhdhytghd.hyprcapture` as well to reclaim the build space.
+
+### Dependencies
+
+- Hyprland development headers for the exact Hyprland build you are running
+- `cmake`
+- `pkg-config`
+- a C++23-capable compiler
+- nlohmann-json
+- Qt 6 Core, Gui, Widgets, Svg, DBus, and Network
+- LayerShellQt `layer-shell-qt`
+- OpenCV `core` and `imgproc` (CPU image registration; no neural-network runtime)
+- libpipewire-0.3 development headers (`libpipewire` on Arch, `libpipewire-0.3-dev` on Debian/Ubuntu)
+- PipeWire development files, FFTW3 and FFmpeg libswresample/libavutil for the native DTLN-AEC candidate
+- Optional TensorFlow Lite 2.14.0 runtime (installed by `hyprcapture-install-aec`); OpenVINO is only needed for experimental NPU
+- libpulse development headers (`libpulse` on Arch, `libpulse-dev` on Debian/Ubuntu)
+- FFmpeg (including `ffprobe`, AAC and Opus encoders) for recording output
+- FFmpeg development libraries `libavformat`, `libavcodec`, and `libavutil` for timestamped RGBA transport (`ffmpeg` on Arch; `libavformat-dev libavcodec-dev libavutil-dev` on Debian/Ubuntu)
+- PulseAudio or PipeWire with its PulseAudio compatibility service for sound recording
+- HEIC gain-map encoding needs an HEVC encoder and decoder (`x265` and `libde265` development packages), patch and system libjpeg-turbo development files (`libjpeg-turbo` on Arch, `libjpeg-turbo8-dev` on Debian/Ubuntu). CMake builds SHA256-pinned private libultrahdr 2.0.2 / libheif dependencies on the first build; system libraries are not replaced. Set `-DHYPRCAPTURE_GAINMAP_HEIC=OFF` for an offline PNG-only build. Nix fetches and patches these dependencies separately.
+- `wl-clipboard` for persistent Wayland clipboard ownership
+
+### Install with `hyprpm`
+
+Install the [dependencies](#dependencies) before running `hyprpm`; it builds the plugin but does not install missing system packages. On Arch Linux, start with [Install on Arch Linux](#install-on-arch-linux), including its dependency command.
+
+Use `hyprpm` for the compositor plugin:
+
+```sh
+hyprpm update
+hyprpm add https://github.com/gfhdhytghd/HyprCapture
+hyprpm enable hyprcapture
+hyprpm reload
+```
+
+If you use Hyprland's permission system, allow `hyprpm` in your config:
+
+```lua
+hl.permission("/usr/(bin|local/bin)/hyprpm", "plugin", "allow")
+```
+
+Do not also manually `hyprctl plugin load` the same `.so` if you manage it through `hyprpm`.
+
+### Install on Arch Linux
+
+These steps target Hyprland v0.57.0. Build against the headers of the Hyprland you actually run; `hyprpm` does this for you.
+
+#### 1. Install dependencies
+
+Perform a full system upgrade while installing the build tools and libraries:
+
+```sh
+sudo pacman -Syu --needed base-devel cmake git cpio \
+    hyprland nlohmann-json lua glib2 \
+    qt6-base qt6-svg qt6-wayland layer-shell-qt opencv vtk hdf5 \
+    pipewire libpipewire fftw libpulse ffmpeg wl-clipboard
+```
+
+`base-devel` supplies GCC, Make, and `pkgconf` (the `pkg-config` command), but not CMake. [Qt SVG](https://archlinux.org/packages/extra/x86_64/qt6-svg/) is a separate package; `qt6-wayland` supplies the helper's native Wayland support. `libpipewire` supplies the PipeWire development files, and `ffmpeg` supplies both the recording tools and the required FFmpeg libraries. `git` and `cpio` are used by `hyprpm` when preparing sources and headers.
+
+`opencv` supplies the OpenCV headers, libraries, and CMake package configuration required by the build. [Arch lists `vtk` and `hdf5` as optional OpenCV dependencies](https://archlinux.org/packages/extra/x86_64/opencv/); the command includes them because installing this package set resolved the build failure reported in [issue #42](https://github.com/gfhdhytghd/HyprCapture/issues/42#issuecomment-6526089875). HyprCapture itself requests only OpenCV's `core` and `imgproc` components, not VTK or HDF5 directly.
+
+For sound recording, use a running PulseAudio server or PipeWire's PulseAudio compatibility service. If your desktop uses PipeWire, install the service and session manager if missing:
+
+```sh
+sudo pacman -S --needed pipewire-pulse wireplumber
+```
+
+Keep your existing PulseAudio setup if you use it; `pipewire-pulse` replaces the PulseAudio server. If the upgrade changed Hyprland or you changed audio services, log out and back in before continuing so the running session matches the installed packages.
+
+#### 2. Build and enable the plugin
+
+Run these commands as your normal desktop user, inside the Hyprland session:
+
+```sh
+hyprpm update
+hyprpm add https://github.com/gfhdhytghd/HyprCapture
+hyprpm enable hyprcapture
+hyprpm reload
+```
+
+If you use Hyprland's permission system, first add the `hyprpm` permission shown in [Install with `hyprpm`](#install-with-hyprpm). The manifest builds the plugin and installs `hyprcapture-ui` to `~/.local/bin`; no separate manual helper installation is needed.
+
+The installer also attempts to prepare the optional DTLN-AEC runtime. If it reports that AEC is pending, normal capture remains available; retry later with `~/.local/bin/hyprcapture-install-aec`.
+
+#### 3. Configure and check capture
+
+Add the Lua shortcuts from [Lua actions and key bindings](#lua-actions-and-key-bindings) to your Hyprland Lua configuration and reload the config. The examples bind **Super + Shift + S** to the overlay, **Super + Shift + W** to window capture, and **Super + Shift + F** to fullscreen capture.
+
+Check that the plugin is loaded and the helper was installed:
+
+```sh
+hyprctl plugin list
+test -x "$HOME/.local/bin/hyprcapture-ui" && echo "HyprCapture helper installed"
+```
+
+Press **Super + Shift + S**, take a screenshot, and verify saving or copying it. If the build reports missing `Qt6Svg`, install `qt6-svg`; if it reports missing `libpipewire-0.3`, install `libpipewire`. For a Hyprland version/header mismatch after an upgrade, restart into the updated Hyprland session, run `hyprpm update`, then `hyprpm reload`.
+
+### Troubleshoot `hyprpm` build failures
+
+Run this when no capture overlay or recording is active:
+
+```sh
+hyprctl version
+hyprpm update -v
+```
+
+Read the first CMake or compiler error after `Building hyprcapture`. The summary `Plugin hyprcapture failed to build` does not identify the cause. The later `Hyprland's ABI changed` warning can appear when a missing dependency prevents rebuilding; it does not by itself prove that HyprCapture is incompatible with your Hyprland version.
+
+CMake checks required system libraries before downloading the private HEIC dependencies. If any are missing, it prints a `HyprCapture: missing required build dependencies` summary with the missing names and an Arch Linux installation command. Installers on other distributions should install the matching development packages. `hyprpm` hides build output unless `-v` is enabled, so use `hyprpm update -v` to see this summary. Optional HDR and inference capabilities are checked separately.
+
+For example, the verbose logs in [issue #42](https://github.com/gfhdhytghd/HyprCapture/issues/42) stopped at `find_package(OpenCV)` because CMake could not find `OpenCVConfig.cmake` or `opencv-config.cmake`. On Arch Linux, install the packages above, including `opencv vtk hdf5`, then retry `hyprpm update -v`. Missing `Makefile`, helper binaries, or plugin output after a failed CMake configuration are follow-on errors; fix the configuration error first.
+
+After the rebuild succeeds, run `hyprpm reload`. If it still fails, include `hyprctl version` and the first CMake or compiler error, with the surrounding lines, in your report.
+
+### Install on NixOS
+
+The example below pins the supported Hyprland release. Add HyprCapture to the same flake as Hyprland and make its Hyprland input follow yours. Keeping both inputs on the same revision is required because Hyprland plugins are ABI-sensitive:
+
+```nix
+{
+  inputs = {
+    hyprland.url = "github:hyprwm/Hyprland/v0.57.0";
+    hyprcapture = {
+      url = "github:gfhdhytghd/HyprCapture";
+      inputs.hyprland.follows = "hyprland";
+    };
+  };
+}
+```
+
+After changing the release tag, run `nix flake update hyprland hyprcapture` from your configuration's flake directory and rebuild. Ensure the system's Hyprland package also uses this same input; setting Home Manager's `package = null` does not automatically make the plugin build against the system compositor. Log out and back in after upgrading Hyprland so the running compositor matches the rebuilt plugin.
+
+With the Home Manager Hyprland module:
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  wayland.windowManager.hyprland.plugins = [
+    inputs.hyprcapture.packages.${pkgs.stdenv.hostPlatform.system}.hyprcapture
+  ];
+}
+```
+
+The Nix package contains both `lib/libhyprcapture.so` and `bin/hyprcapture-ui`. It embeds the matching helper path and trusted Nix store paths for its runtime tools, so no manual helper setting is needed.
+
+Install the optional runtime tools you use (`ffmpeg`, `gpu-screen-recorder`, `wl-clipboard`, `grim`, `libnotify`, and `xdg-utils`) in your NixOS or Home Manager profile. HyprCapture accepts executables from the standard system and per-user Nix profiles after applying the same ownership and permission checks as other trusted paths.
+
+You can also build it directly:
+
+```sh
+nix build github:gfhdhytghd/HyprCapture
+```
+
+### Helper install path
+
+The `hyprpm` manifest installs the helper automatically:
+
+```toml
+build = [
+    "cmake -S . -B build-hyprpm -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF",
+    "cmake --build build-hyprpm",
+    "install -Dm755 build-hyprpm/hyprcapture-ui \"$HOME/.local/bin/hyprcapture-ui\""
+]
+```
+
+The plugin default helper lookup is:
+
+1. `HYPRCAPTURE_HELPER`
+2. `$HOME/.local/bin/hyprcapture-ui`
+3. `/usr/local/bin/hyprcapture-ui`
+4. `/usr/bin/hyprcapture-ui`
+
+Helper paths must resolve to trusted regular executables owned by the current user or root, without group/other write permission, and with trusted parent directory permissions.
+
+Only configure `plugin.hyprcapture.helper` if you want to use a custom helper path:
+
+```lua
+hl.config({
+    plugin = {
+        hyprcapture = {
+            helper = "/home/you/.local/bin/hyprcapture-ui",
+        },
+    },
+})
+```
+
+### HDR support
+
+HyprCapture supports HDR screenshots with native HDR preview and editing. Choose SDR PNG or HDR HEIC from the **SDR / HDR** segmented control. HDR HEIC includes an SDR base image and an ISO 21496-1 gain map, so compatible HDR viewers retain the highlights and wide-gamut colors while ordinary viewers display the SDR base. Recording converts HDR desktop content to SDR.
+
+On a color-managed HDR output, screenshots retain the compositor's half-float linear sRGB/scRGB pixels (1.0 = 80 cd/m²) until export. The overlay and in-place editor present the frozen HDR image through a separate Wayland color-managed BT.2020 surface beneath the transparent Qt controls: FP16 linear when supported, otherwise 10-bit PQ. The linear encoding declares 80 cd/m² at 1.0; PQ retains its fixed 10000 cd/m² encoding span. Both carry the captured output's reference white and a separate mastering peak, so content brightness does not become an extra encoding multiplier or trigger unnecessary tone mapping. Native presentation requires mastering-luminance support; FP16 also requires extended target volume support. Thumbnails and SDR PNG output use an sRGB rendition normalized to the output's SDR reference white, with a smooth highlight shoulder and gamut compression. SDR monitor captures stay on the sRGB path.
+
+Ordinary annotations are drawn in a transparent Qt layer over an immutable HDR background, so drawing does not reconvert or upload the HDR image. HDR gain and Mosaic use an exact HDR composite with release-aware incremental buffers; Spotlight uses an alpha-only Qt mask. See [HDR annotation layers](docs/hdr-annotation-layers.md) for preview/reference-white semantics, validation and timing.
+
+Choose **HDR** in the **SDR / HDR** segmented control to preserve HDR highlights, or set:
+
+```lua
+hl.config({
+    plugin = { hyprcapture = { screenshot_mode = "hdr", show_hdr_control = true } },
+})
+```
+
+The control is shown whenever at least one connected display has HDR output enabled, including when the current capture is on an SDR display. HDR capability alone does not show the control. The control is enabled when the HDR encoder is also available. Without active HDR output or an encoder, capture falls back to SDR. Set `screenshot_mode = "sdr"` or `"hdr"` for the default, and `show_hdr_control = false` to hide the control while retaining that default. The mode starts from configuration on each capture, independently of `remember_settings`. The helper also accepts `--screenshot-mode hdr --show-hdr-control 0`. HEIC output uses a normal sRGB SDR primary image with an ICC profile and matching NCLX, plus a full-resolution RGB ISO 21496-1 gain map (`tmap`). Viewers that ignore gain maps display the SDR image; gain-map-aware HDR viewers can reconstruct HDR brightness and BT.2020/P3 colors. Straight alpha is retained as a HEIF auxiliary image when needed. Its suffix becomes `.heic`; the clipboard defaults to HEIC (`image/heic`). Set `hdr_clipboard_format = "sdr"` to copy SDR PNG instead. `hdr_drag_format = "heic"` (default) or `"sdr"` selects the file dragged from the thumbnail, independently of the file opened by clicking it. `hdr_save_sdr = true` saves both the HEIC and a same-name SDR PNG; its default is `false`. SDR transport copies are private temporary PNGs when simultaneous saving is disabled. These options only affect HDR screenshots; SDR screenshots continue to use PNG. The SDR base uses exactly the screenshot's PNG conversion, including each monitor's reference white and annotations. Screenshots spanning HDR and SDR monitors combine the HDR pixels with the SDR monitor images promoted to a 203 cd/m² diffuse white. Builds without the gain-map encoder still capture and export SDR PNG; unavailable HDR pixels/encoders produce an error rather than an SDR file mislabeled as HDR. The compositor plugin and helper must both support the float transport.
+
+HDR export covers region, fullscreen, window and scrolling screenshots on outputs with a linear HDR work buffer. Scrolling capture matches SDR frames while retaining and stitching paired half-float HDR pixels, so the completed editor can preview and export the full HDR HEIC. Native HDR preview requires Wayland color-management-v1 parametric PQ support, viewporter, 10-bit shared-memory buffers, and Qt GUI private development headers plus wayland-client, wayland-protocols and wayland-scanner at build time. Unsupported environments explicitly fall back to an SDR preview. HDR presentation in external applications requires ISO HEIF gain-map support as well as HDR display output. General HDR/PQ support alone is insufficient. Ordinary viewers still get the SDR base instead of uninterpreted PQ values.
+
+For Arch Linux, the repository includes an [HDRView PKGBUILD](packaging/hdrview/README.md) with ISO HEIC gain-map decoding and Wayland HDR display fixes for viewing these screenshots.
+
+Video output stays SDR. Captures touching HDR, wide-gamut or ICC-managed outputs use the compositor backend, including when `record_window_backend` requests the external recorder. Capture first renders in Hyprland's actual monitor work space, retaining a floating-point buffer on HDR outputs. An explicit GPU resolve converts that buffer to SDR sRGB before RGBA readback or GPU export, normalizing to the output's SDR white and preserving its black level. Merely tagging the framebuffer as sRGB is insufficient on Hyprland 0.56. Encoders use an explicit BT.709 YCbCr matrix and limited range, tagged with sRGB transfer/BT.709 primaries; RGB-preserving and animation formats keep their appropriate RGB path. No HDR recording option is introduced.
+
+### Manual helper install
+
+Install the Dependencies
+
+Build and install the helper:
+
+```sh
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
+install -Dm755 build-release/hyprcapture-ui "$HOME/.local/bin/hyprcapture-ui"
+```
+
+To build against a Hyprland source checkout, point CMake at the matching tree so the plugin uses the same Lua-config-capable headers:
+
+```sh
+cmake -S . -B build-local -DCMAKE_BUILD_TYPE=RelWithDebInfo -DHYPRLAND_SOURCE_DIR="$HOME/data/Hyprland"
+cmake --build build-local
+```
+
+For development without installing, point `helper` at the build-tree executable or launch Hyprland with:
+
+```sh
+HYPRCAPTURE_HELPER=/path/to/hyprcapture-ui Hyprland
+```
+
+### Manual build and reload
+
+For local development, the plugin output is `build-cmake/libhyprcapture.so`.
+
+```sh
+cmake -S . -B build-cmake -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+cmake --build build-cmake
+ctest --test-dir build-cmake --output-on-failure
+```
+
+Safe reload shape:
+
+```sh
+hyprctl plugin unload "$(pwd)/build-cmake/libhyprcapture.so"
+hyprctl plugin unload "$(pwd)/build-hyprpm/libhyprcapture.so"
+hyprctl plugin load "$(pwd)/build-cmake/libhyprcapture.so"
+hyprctl plugin list
+```
+
+`plugin not loaded` is expected when the unloaded path is not the active copy.
+
+Build outputs:
+
+- Plugin: `build-cmake/libhyprcapture.so`
+- Helper: `build-cmake/hyprcapture-ui`
+- Config test: `build-cmake/hyprcapture-config-test`
+
+## Usage
+
+### Lua actions and key bindings
+
+```lua
+hl.bind("SUPER + SHIFT + s", hl.plugin.hyprcapture.open)
+hl.bind("SUPER + CTRL + s", hl.plugin.hyprcapture.open_editor)
+
+hl.bind("SUPER + SHIFT + w", function()
+    hl.plugin.hyprcapture.open("window")
+end)
+
+hl.bind("SUPER + SHIFT + f", function()
+    hl.plugin.hyprcapture.open("fullscreen")
+end)
+```
+
+| Lua action | Description |
+| --- | --- |
+| `hl.plugin.hyprcapture.open()` | Select a screenshot target using `default_mode`, then capture without the annotation toolbar. |
+| `hl.plugin.hyprcapture.open(mode)` | Select a target in `region`, `fullscreen`, or `window` mode, then capture without the annotation toolbar. |
+| `hl.plugin.hyprcapture.open_editor()` | Select a screenshot target using `default_mode`, then open the annotation toolbar before output. |
+| `hl.plugin.hyprcapture.open_editor(mode)` | Select a target in `region`, `fullscreen`, or `window` mode, then open the annotation toolbar before output. |
+| `hl.plugin.hyprcapture.quick()` | Capture immediately using `default_mode`; disabled unless `allow_quick = true`. |
+| `hl.plugin.hyprcapture.quick(mode)` | Capture immediately in `region`, `fullscreen`, or `window` mode; disabled unless `allow_quick = true`. |
+| `hl.plugin.hyprcapture.export_pipe(fifo)` | Export fullscreen compositor RGBA frames to a trusted private FIFO client. Intended for tools such as screenland. |
+| `hl.plugin.hyprcapture.cancel()` | Reserved action; currently returns successfully without changing an active helper. |
+
+Available Lua functions are `open`, `open_editor`, `quick`, `record`, `record_toggle`, `record_stop`, `record_start`, `window_capture`, `export_pipe`, `cancel`, and `dispatch`.
+`dispatch` accepts the dispatcher name plus an optional argument, for example `hl.plugin.hyprcapture.dispatch("open", "fullscreen")`.
+Use `hl.plugin.hyprcapture.dispatch("open_editor", "fullscreen")` for the editor flow.
+
+Use lowercase `s` for `SUPER + s`. In Lua config key strings, uppercase `S` means Shift is part of the binding.
+
+### Overlay
+
+- Region mode: drag a rectangle, then release or press Enter.
+- Fullscreen mode: captures according to `fullscreen_scope`.
+- Window mode: hover a window and press Enter or click it. With `window_wheel_scroll` enabled, scroll down to select a lower window or scroll up to move back toward the top; selection stops at each end of the stack. `window_wheel_scope` chooses between every window on the pointer's current workspace/output and only windows directly under the pointer.
+- Fusion mode: the toolbar keeps the fullscreen action and configuration controls; drag anywhere to capture a region, single-click a window to capture that window, or use the same wheel selection before clicking. A region drag still takes precedence over a wheel-selected window.
+- Esc cancels the helper.
+- The toolbar is anchored near the bottom of the screen and only shows controls relevant to the active mode.
+
+### Scrolling screenshots
+
+After selecting a region or window in `open_editor()` (or an `open()` confirmation session), scroll inside it to start a long screenshot. Ordinary `open()` and `quick()` retain their direct-output behavior. Use **Ctrl + wheel** to zoom while editing. The separate scrolling-mode button is no longer needed.
+
+Scroll in either direction, including back over captured content. A live preview appears at the bottom right; click it or **Finish** to move the image smoothly into the central editor. Pausing does not finish the session. **Cancel** restores the original selection, annotations and undo history; the source application stays at its current scroll position.
+
+Scrolling capture supports HDR HEIC on linear HDR outputs. SDR frames determine alignment; paired scRGB half-float frames use the same accepted positions, clipping, fixed headers/footers and sidebar seams. The completed editor retains the SDR/HDR choice, HDR annotations, simultaneous HDR/SDR saving, drag format and clipboard format settings. Cancelling preserves the original choice. HDR capture requires scroll-session version 2 in both plugin and helper; an older plugin or a target without HDR pixels produces SDR PNG. HDR long screenshots are limited to 16 megapixels (SDR: 64 megapixels), with a 128 MiB limit for each paired frame; the row, frame-count and time limits below still apply.
+
+On touchscreens, one finger draws with the current tool and two fingers scroll the source application. A second finger cancels the unfinished stroke; lift all fingers before drawing again. During scrolling, annotations move slightly and fade out. Once the page is stable and aligned, they reappear at their measured content positions and drawing resumes. In the completed editor, two fingers pan the long image.
+
+The plugin captures native, cursor-free frames while excluding this helper's layers. A window uses its own native render; a region stays within one monitor. Fixed headers and footers are retained once. Fixed sidebars expand at a quiet pixel band near the bottom, outside the footer: a linear gradient fills the added space without stretching text or icons. Dense stationary backgrounds can repeat captured pixel blocks while moving foreground anchors determine alignment. If there is no safe insertion band or alignment is ambiguous, capture retains confirmed content and asks you to recover overlap.
+
+Image matching uses a bounded CPU worker and preserves source pixels; it does not infer displacement from wheel distances. The limits are 200 accepted frames, 64 megapixels, 32,768 output rows and five minutes. Closing the target or changing its geometry/scale stops new capture and leaves confirmed content available. Both plugin and helper must support scroll-session version 1; older plugins retain ordinary capture and editing.
+
+### In-place screenshot editing
+
+Use `hl.plugin.hyprcapture.open_editor()` or `open_editor(mode)` to keep the capture overlay open after selecting a screenshot target. Bind it to a separate shortcut from `open()` to choose the editor or direct-output flow for each capture. The editor shows the rendered screenshot with the configured window background, border, shadow, cursor, and watermark options. Annotations use native image coordinates, so exported edits retain their position at the original capture resolution.
+
+The `in_place_edit_toolbar` configuration option has been removed: delete it from existing configs and use `open_editor()` for shortcuts that need editing. `open()` keeps the existing `confirm_before_capture` behavior, while `open_editor()` uses the editor's confirmation instead. `quick()` captures without entering the editor. Full-desktop captures that extend outside the active output are fitted into the editor. Window captures remain at their original desktop position, including windows that cross an output edge; Ctrl + 0 fits them on demand.
+
+The annotation toolbar provides selection and movement, outlined or filled rectangles (including rounded corners) and ellipses, straight/curved/double-headed arrows, lines, pen, highlighter, multiline text, numbered markers, opaque mosaic, and elliptical spotlight. It also includes undo/redo, preset or custom colors, stroke width, and light/dark toolbar themes. Text entry stays in a visible box inside the capture overlay. Drag empty space inside the text box or its border to move it; drag a corner or the short handle at the center of each edge to resize; text wraps to the box width. A separate floating toolbar follows the text box, with controls for a scalable system font, pixel size with +/− buttons, and color. The color input sits beside the palette button on the second row. Its color picker provides a visual saturation/value palette and hue strip, presets, and hexadecimal input. Enter inserts a new line, Ctrl + Enter confirms, and Esc cancels the text edit. Font, color, size, and box geometry survive confirmation, undo/redo, and reopening. Click existing text with the selection or text tool to edit it, or press Delete to remove a selected annotation.
+
+The compact toolbar follows the screenshot edge, moving above it when there is no room below. Annotation tools sit above the background and capture controls. In region mode, drag any edge or corner handle to resize the capture while keeping annotations anchored to the desktop. Related tools share variant popups. Changing the background of the same target preserves annotations; choosing another target or capture mode starts a new edit. **✓** or **Enter** continues the normal capture flow using the configured save and clipboard settings; **×** cancels without output. **Esc** closes an open toolbar popup first, otherwise cancels. **Pin** is available in the overflow menu. Once the pinned image confirms that it loaded successfully, it continues through the same configured save, clipboard, and thumbnail flow as **✓**. A failed save or pin launch keeps the editor open. Recording continues to use its existing capture flow.
+
+Use the wheel to zoom around the cursor, Space + left drag or middle drag to pan, and Ctrl + 0 to fit the image. Ctrl + Z undoes; Ctrl + Shift + Z or Ctrl + Y redoes. Q opens the color palette; Z and X also undo and redo. P or Ctrl + P invokes Pin. The checkerboard behind transparent pixels is a preview aid and is not exported.
+
+Tool shortcuts: V selection, R rectangle, E ellipse, A arrow, W line, D pen, H highlighter, T text, B numbered marker, G mosaic, Shift + B spotlight, and Shift + D filled rectangle. Color, stroke width, and toolbar theme are remembered in `~/.config/hyprcapture/editor.ini`.
+
+Pins stay above normal windows, support dragging across outputs and wheel zoom, and close with their × button or Esc after focusing the pin. Each pin has its own helper process, so later captures can create additional pins. Pinning also follows the configured screenshot saving, clipboard, and thumbnail settings; disabled outputs remain disabled.
+
+### Hymission Stage window capture
+
+With a matching Hymission build, window mode and fusion-mode clicks can select
+individual windows inside the Stage sidebar. The highlight follows the actual
+preview and its card clipping; the screenshot renders the original window at
+native resolution, including windows on inactive workspaces, without activating
+them. Pinned floating windows retain priority above the sidebar.
+
+`open_editor()` opens a Stage-selected image centered and fitted into the editor;
+zoom and pan affect only its display, not the saved resolution. Desktop window
+captures retain their normal position. A fullscreen window selected inside Stage
+is captured as a window rather than redirecting to the current monitor. If the
+window closes before capture, no thumbnail or unrelated desktop crop is used as
+a substitute.
+
+This integration requires Hymission's `hymission-stage-state` response to expose
+`captureVersion: 1` and `captureWindows`. Older Hymission builds keep ordinary
+window/overview capture but do not expose Stage targets. Update both plugins.
+
+### UI language
+
+The `language` setting defaults to `auto`. Supported values are `en`, `zh_CN`, `zh_TW`, `ja`, `de`, `fr`, `es`, and `ko`; missing translations and unsupported languages fall back to English. An explicit configured language, or `--language zh_CN` when launching the helper directly, takes precedence. With `auto`, `HYPRCAPTURE_LANGUAGE` takes precedence over the system locale. Regional locale names such as `de_DE.UTF-8` are accepted.
+
+### External FIFO capture backend
+
+HyprCapture can act as a fullscreen compositor capture backend for another local tool. The client creates a private request FIFO and response FIFO under the per-user HyprCapture runtime root, writes a newline-terminated JSON request to the request FIFO, then calls:
+
+```sh
+hyprctl eval "hl.plugin.hyprcapture.export_pipe('/dev/shm/hyprcapture-$UID/<client>/request.fifo')"
+```
+
+Request JSON v1:
+
+```json
+{"version":1,"responseFifo":"/dev/shm/hyprcapture-1000/<client>/response.fifo","mode":"fullscreen","fullscreenScope":"all"}
+```
+
+The response FIFO starts with `HYPRCAP_PIPE_V1`, a decimal JSON header length, the JSON header, and then the raw `rgba8888` monitor payloads in header order. FIFO paths must be absolute, owned by the current user, not group/other writable, and inside the private `hyprcapture-$UID` runtime root. Large payload writes happen from a managed writer thread so the compositor dispatcher does not block on FIFO backpressure.
+
+### Recording
+
+Recording is toggled from the normal screenshot overlay toolbar. Click the record icon, choose an output format and backend, then choose fullscreen, drag a region, or choose a window exactly like a screenshot. The default `auto` backend uses HyprCapture's compositor renderer for windows and `gpu-screen-recorder` for fullscreen or region video. Virtual-output targets always use the compositor because GPU Screen Recorder cannot address them.
+
+To stop an active recording, open the same overlay and click the checked record icon.
+
+Current recording output is a single file under `record_save_dir`. With `record_window_backend = "auto"`, normal fullscreen and region video use `gpu-screen-recorder`, while windows, virtual outputs, GIF, APNG, and WebP use compositor RGBA readback. Codec limits are checked against the scaled physical capture size: H.264 is used through 4096 pixels per axis, HEVC through 8192, and larger fullscreen canvases go directly to compositor recording. If the preferred backend fails during startup, HyprCapture tries the compatible alternate backend; a GSR process that exits without producing data also falls back to compositor recording. Transparent recordings and virtual outputs stay on compositor because GSR is not an equivalent fallback. Compositor FFmpeg exit status and output size are validated, and failed encodes are removed instead of being reported as completed zero-byte recordings. APNG records a hidden 60 fps MKV intermediate first, then the helper transcodes it to APNG while showing the thumbnail with progress when thumbnails are enabled. Animation formats require a fixed duration of 3, 5, 10, 15, or 30 seconds and default to 5 seconds. `gsr-visible` records a selected on-screen window rectangle with lower overhead, without portal or managed screenshare sessions, but captures what is visibly present in that region. Finished recordings use the same `clipboard` and `show_thumbnail` settings as screenshots; clipboard output is a local file URI.
+
+#### Recording state socket
+
+Local status bars and other integrations can read recording state from a Unix stream socket. The primary path is:
+
+```text
+$XDG_RUNTIME_DIR/hyprcapture/recording.sock
+```
+
+If `XDG_RUNTIME_DIR` is unavailable or unsafe, HyprCapture falls back to `/dev/shm/hyprcapture-$UID/recording.sock`, then `/tmp/hyprcapture-$UID/recording.sock`. The runtime directory is owner-only and the socket mode is `0600`. The socket is removed on a clean plugin unload; a user-owned stale socket is replaced on the next load.
+
+Connect once to receive one newline-terminated JSON object, after which HyprCapture closes the connection. No request body is needed and the socket does not accept commands:
+
+```sh
+socat - UNIX-CONNECT:"${XDG_RUNTIME_DIR}/hyprcapture/recording.sock"
+```
+
+Protocol v1 example:
+
+```json
+{"version":1,"active":true,"phase":"recording","backend":"gpu-screen-recorder","output":"/home/user/Videos/Screenrecords/Recording.mp4","elapsed":12.345,"elapsedMs":12345,"startedAt":"2026-07-23T12:34:56Z","mode":"fullscreen","format":"mp4"}
+```
+
+`phase` is `inactive`, `recording`, or `finalizing`. `active` is true only while frames are being captured. During `finalizing`, the encoder is draining and `elapsed`/`elapsedMs` remain frozen at the captured duration; `output` remains available until finalization completes. `backend` is `gpu-screen-recorder` or `compositor`. Inactive string fields are empty and elapsed values are zero. Clients should ignore unknown fields so later protocol versions can add metadata without breaking existing integrations.
+
+### Thumbnail
+
+The thumbnail appears after a completed capture when `show_thumbnail = true`. HDR screenshot thumbnails and HDR scrolling previews retain the linear HDR pixels and display them through a native PQ/BT.2020 child surface; they do not use the SDR PNG as the HDR display source. A bounded half-float preview is passed privately to the thumbnail helper and consumed on startup. Unsupported color-management environments retain the SDR preview. With in-place editing enabled, target selection opens the editor first.
+
+- Left click opens the saved image.
+- Drag starts a file drag for targets that accept image files.
+- Right click opens the thumbnail menu.
+- Swipe right with a touchpad or two-dimensional wheel to close.
+- Swipe down to delete the file and restore the clipboard snapshot captured before the screenshot.
+
+## Configuration
+
+All user-facing settings live under `plugin.hyprcapture` in `hl.config`.
+
+Example:
+
+```lua
+hl.config({
+    plugin = {
+        hyprcapture = {
+            default_mode = "region",
+            fullscreen_scope = "all",
+            overlay_scope = "fix",
+            window_background = "follow-system",
+            window_border = "keep",
+            window_shadow = "keep",
+            notification_backend = "system",
+            screenshot_notification = true,
+            notification_title_template = "Screenshot captured",
+            notification_body_template = "Saved {filename} ({window_title})",
+            save = true,
+            clipboard = true,
+            show_thumbnail = true,
+            language = "auto",
+            remember_settings = false,
+            allow_quick = false,
+            confirm_before_capture = false,
+            fusion_mode = true,
+            capture_fullscreen_clients_as_monitor = false,
+            dynamic_window_metadata = true,
+            window_wheel_scroll = true,
+            window_wheel_scope = "workspace",
+            fullscreen_preview_rounding = "auto",
+            save_dir = "$XDG_PICTURES_DIR/Screenshots",
+            filename_template = "Screenshot-%Y-%m-%d-%H%M%S.png",
+            record_save_dir = "$XDG_VIDEOS_DIR/Screenrecords",
+            record_filename_template = "Recording-%Y-%m-%d-%H%M%S.mp4",
+            record_format = "mp4",
+            record_transparent_format = "webm",
+            record_fps = 30,
+            record_fps_options = "15 24 30 60",
+            record_window_fps_limit = 12,
+            record_window_real_bg_fps_limit = 8,
+            record_audio = "off",
+            record_audio_output = "auto",
+            record_audio_input = "default",
+            record_codec = "auto",
+            record_transparent_codec = "auto",
+            record_solid_alpha = false,
+            record_preset = "veryfast",
+            record_gsr_flags = "",
+            record_window_backend = "auto",
+            record_max_seconds = 0,
+            record_countdown_seconds = 0,
+            include_cursor = false,
+            thumbnail_timeout_ms = 5000,
+            thumbnail_monitor = "active",
+            watermark = "",
+            watermark_position = "central",
+            watermark_width = "20%",
+            watermark_offset = "0 0",
+        },
+    },
+})
+```
+
+### Lua API notes
+
+Use `hl.config` for settings and `hl.plugin.hyprcapture` for actions:
+
+```lua
+hl.bind("SUPER + s", hl.plugin.hyprcapture.open)
+
+hl.bind("SUPER + SHIFT + s", function()
+    hl.plugin.hyprcapture.open("window")
+end)
+
+hl.bind("SUPER + CTRL + s", hl.plugin.hyprcapture.record_toggle)
+```
+
+Do not use `hyprctl dispatch hyprcapture:open` as a Lua fallback. Hyprland's Lua config dispatcher parser treats `hyprcapture:open` as Lua syntax. Use `hl.plugin.hyprcapture.open()` once the plugin is loaded, or bind a direct helper command during development while testing an older loaded plugin.
+
+`open`, `open_editor`, and `quick` accept an optional second table with boolean
+`save` and `clipboard` overrides. Omitted fields retain their global defaults;
+these choices apply only to that capture. Pass `nil` as the mode to keep
+`default_mode`. Unknown keys and non-boolean values raise a Lua error.
+
+```lua
+-- Copy only; keep the thumbnail available for saving later.
+hl.bind("SUPER + ALT + c", function()
+    hl.plugin.hyprcapture.open("region", { save = false, clipboard = true })
+end)
+-- Save and copy this capture, regardless of the global save setting.
+hl.bind("SUPER + ALT + s", function()
+    hl.plugin.hyprcapture.open("region", { save = true, clipboard = true })
+end)
+```
+
+The equivalent generic Lua entry is
+`hl.plugin.hyprcapture.dispatch("open", "region", { save = false, clipboard = true })`.
+Its string form also accepts `"region save=false clipboard=true"` (`1`/`0` are
+accepted). HyprCapture does not register legacy `hyprcapture:*` dispatchers;
+use the Lua functions above.
+
+The thumbnail and its action menu have **Save** beside **Copy image**. With `save = false`,
+Save writes the complete capture to `save_dir` using `filename_template` and the
+same SDR PNG / HDR HEIC encoder as automatic saving, including `hdr_save_sdr`.
+Open, Show in folder and Delete become available after saving. Save is disabled
+for an already saved capture, including thumbnails shown on multiple monitors.
+Private temporary files used for clipboard, drag and preview are not persistent
+screenshots in `save_dir`.
+
+The editor toolbar's **Save** exports the current annotations and finishes the
+capture, even with `save = false`; clipboard behavior follows this capture's
+setting. Like the existing confirmation path, a new edited capture receives a
+unique filename instead of overwriting an earlier screenshot. Failed saving
+keeps the editor open for retry.
+
+The old misspelled `fushion_mode` key is still accepted as a compatibility alias, but new configs should use `fusion_mode`.
+
+### Capture options
+
+A window in compositor/output fullscreen is always captured at its content
+bounds, without compositor borders, shadows, rounded padding or hyprbars, even with
+`window_border = "keep"` and `window_shadow = "keep"`. This also applies to
+window recording and window streams. Hyprland's internal `FSMODE_FULLSCREEN`
+selects this behavior; maximized windows and client-only fake fullscreen keep
+the normal decoration policies. Transparent pixels belonging to the client
+remain subject to `window_background`; no margin is added around its content.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `default_mode` | string | `region` | Default mode for `hl.plugin.hyprcapture.open()`, `open_editor()`, and `quick()`. Supports `region`, `fullscreen`, and `window`. |
+| `fullscreen_scope` | string | `all` | Fullscreen capture scope. Supports `all`, `current`, and `per-monitor`. |
+| `overlay_scope` | string | `fix` | Overlay monitor behavior. `fix` keeps it on the monitor where capture starts, `focus` moves it to the monitor under the pointer while it is open, and `all` shows it on every monitor. The legacy typo `forcus` is accepted as `focus`. |
+| `window_background` | string | `follow-system` | Background behind transparent window pixels. Supports `follow-system`, `white`, `black`, `real`, and `transparent`. |
+| `window_border` | string | `keep` | Window border policy. Supports `keep` and `remove`. |
+| `window_shadow` | string | `keep` | Window shadow policy. Supports `keep` and `remove`. Transparent window recordings keep shadows and normalize the alpha falloff so the shadow fades out instead of encoding as a hard border. |
+| `notification_backend` | string | `system` | Backend for screenshot notifications plus non-error recording status and warnings. `hyprland` uses Hyprland's overlay; `system` uses the desktop notification service through `notify-send` (libnotify), includes the saved screenshot as its image/icon hint, and falls back to the Hyprland overlay when the command cannot be launched. Errors always use the Hyprland overlay so missing external notification infrastructure cannot hide failures. |
+| `include_cursor` | bool | `false` | Include the cursor visible when the capture session starts in fullscreen, region, and window screenshots. The interactive overlay cursor is not baked into the output. |
+| `language` | string | `auto` | UI language: `auto`, `en`, `zh_CN`, `zh_TW`, `ja`, `de`, `fr`, `es`, or `ko`. `auto` uses `HYPRCAPTURE_LANGUAGE` when set, then the system locale. Explicit language values take precedence; missing translations fall back to English. |
+| `remember_settings` | bool | `false` | Restore only dropdown choices: fullscreen scope, window background, recording format/codec/FPS/duration/backend and sound mode/devices/mix preset. Capture mode and volume sliders are not saved or restored. Saves on capture or cancel (including Esc) to `$XDG_CONFIG_HOME/hyprcapture/last-settings.ini` (default `~/.config/hyprcapture/last-settings.ini`). Quick capture and the stop-recording UI bypass this state. The open/record dispatcher still determines screenshot versus recording. Saved choices override configured defaults while enabled; disabling this option uses the configured defaults again. |
+| `allow_quick` | bool | `false` | Enable no-confirmation `hl.plugin.hyprcapture.quick()` calls. Leave disabled unless your Hyprland IPC policy already restricts untrusted same-user clients. |
+| `confirm_before_capture` | bool | `false` | For `hl.plugin.hyprcapture.open()`, require an explicit confirmation after choosing a fullscreen, region, or window target. Region targets can be moved or resized; window targets can be switched before confirming. `quick()` and direct `record()` calls keep their existing no-extra-confirmation behavior. |
+| `fusion_mode` | bool | `true` | Fuse region and window interactions in one overlay: drag anywhere, including from the desktop background, to capture a region; single-click a window to capture that window; or single-click the background to capture the clicked monitor. The toolbar keeps the fullscreen action and configuration controls; fullscreen multi-monitor scope is shown only when multiple monitors are present. |
+| `fushion_mode` | bool | `false` | Legacy compatibility alias for `fusion_mode`. New configs should use `fusion_mode`. |
+| `capture_fullscreen_clients_as_monitor` | bool | `false` | In window and fusion modes, capture the fullscreen client's entire monitor instead of the isolated client. Disabled by default for compatibility. |
+| `dynamic_window_metadata` | bool | `true` | Resolve `{window_class}` and `{window_title}` from the final screenshot mode. Region captures use `region`; window captures use the selected window; fullscreen captures use the only window in the captured workspace scope, or `fullscreen` when there are zero or multiple windows. Set to `false` to restore the focused-window fallback. |
+| `window_wheel_scroll` | bool | `true` | Enable mouse-wheel and touchpad-scroll window cycling in window and fusion modes. Set to `false` to leave wheel events unused by window selection. |
+| `window_wheel_scope` | string | `workspace` | Controls wheel-based window cycling in window and fusion modes. `workspace` cycles every selectable window on the pointer's current workspace/output; `under-cursor` cycles only windows whose selectable geometry contains the pointer. Both modes follow window z-order and stop at the top and bottom instead of wrapping. |
+| `fullscreen_preview_rounding` | string | `auto` | Fullscreen preview border rounding. `auto` detects opaque or near-uniform desktop corner masks from each frozen monitor image, a non-negative number forces that logical-pixel radius, and `0` keeps square corners. Low-confidence auto detection falls back to square corners and never crops the captured image. |
+
+### Output options
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `save` | bool | `true` | Save the output image to `save_dir` as an owner-only file. |
+| `clipboard` | bool | `true` | Copy the output image to the clipboard. Uses `wl-copy` when available so the clipboard survives helper exit. |
+| `show_thumbnail` | bool | `true` | Show the result thumbnail after capture. |
+| `screenshot_notification` | bool | `true` | Show a notification after a screenshot is successfully saved. Disable this independently of recording status notifications. |
+| `save_dir` | string | `$XDG_PICTURES_DIR/Screenshots` | Output directory. `~` is expanded against `HOME`; `$XDG_PICTURES_DIR` is read from XDG user-dirs with `~/Pictures` as fallback. |
+| `screenshot_mode` | string | `sdr` | Default screenshot dynamic range: `sdr` or `hdr`. When unset, the legacy `screenshot_format` is used. |
+| `show_hdr_control` | bool | `true` | Show the SDR / HDR segmented control when a display has HDR output enabled; hiding it retains the configured default. Recording hides it automatically. |
+| `hdr_save_sdr` | bool | `false` | Also save a same-name SDR PNG for HDR screenshots. |
+| `hdr_drag_format` | string | `heic` | Drag HDR HEIC or SDR PNG (`sdr`) from the result thumbnail. |
+| `hdr_clipboard_format` | string | `heic` | Copy HDR HEIC (`image/heic`) or SDR PNG (`sdr`) to the clipboard. |
+| `screenshot_format` | string | `png` | Legacy alias; `screenshot_mode` takes precedence when set. `png` saves SDR sRGB; `heic` saves an SDR-compatible base plus an HDR ISO gain map. The toolbar offers HEIC when the gain-map encoder is available. |
+| `filename_template` | string | `Screenshot-%Y-%m-%d-%H%M%S.png` | `strftime` template for saved screenshot filenames. `{window_class}` and `{window_title}` follow `dynamic_window_metadata`; values are filename-sanitized and missing metadata expands to `unknown`. Existing `strftime` directives, including `%w`, keep their original meaning. |
+| `notification_title_template` | string | `Screenshot captured` | Screenshot notification title. Supports `strftime` directives and `{mode}`, `{window_class}`, `{window_title}`, `{filename}`, and `{path}`. Window metadata is not filename-sanitized. |
+| `notification_body_template` | string | `Saved {filename} ({window_title})` | Screenshot notification body. Supports the same placeholders and `strftime` directives as `notification_title_template`. |
+| `record_save_dir` | string | `$XDG_VIDEOS_DIR/Screenrecords` | Output directory for recordings. `$XDG_VIDEOS_DIR` is read from XDG user-dirs with `~/Videos` as fallback. Finished recordings can be copied to the clipboard as local file URIs and shown in the thumbnail when those global output settings are enabled. |
+| `record_filename_template` | string | `Recording-%Y-%m-%d-%H%M%S.mp4` | `strftime` template for saved recording filenames. |
+| `record_format` | string | `mp4` | Default recording format shown in the overlay for non-transparent window backgrounds, fullscreen recording, and region recording. Supports `mp4`, `mov`, `webm`, `mkv`, `gif`, `apng`, and `webp`; the selected value replaces the filename extension. |
+| `record_transparent_format` | string | `webm` | Default recording container shown when `window_background = "transparent"`. |
+| `record_fps` | int | `30` | Recording frame rate. Higher values increase compositor readback and encoder load. |
+| `record_fps_options` | string | `15 24 30 60` | Whitespace, comma, or semicolon separated FPS choices shown in the overlay. The current `record_fps` value is added if it is not already listed. |
+| `record_window_fps_limit` | int | `12` | Safety cap for window recording with the current compositor-readback backend. Use `0` to disable the cap. |
+| `record_window_real_bg_fps_limit` | int | `8` | Additional safety cap for window recording with `window_background = "real"`. Use `0` to disable the cap. |
+| `record_audio` | string | `off` | Sound mode: `off`, `system`, `microphone`, or `mix`. Mix produces one audio track containing both sources. |
+| `record_audio_echo_cancellation` | int | `-1` | DTLN-AEC policy: `-1` automatic, `0` always off, `1` always on after correctness validation. Runtime overload protection applies to all modes. |
+| `record_audio_echo_backend` | string | `cpu` | `cpu` (default) or experimental `npu`, explicitly selected and independently validated. |
+| `record_audio_mix` | string | `voice-priority` | `manual`, `auto-balance`, or `voice-priority`. |
+| `record_audio_system_gain` | int | `0` | System gain in dB, −60 to +24; −61 mutes. |
+| `record_audio_mic_gain` | int | `0` | Microphone gain in dB, −60 to +24; −61 mutes. |
+| `record_audio_output` | string | `auto` | Auto follows the recording target: system default for fullscreen/region, target application for window recording. Also accepts `default`, a stable output name, or `window:<address>`. |
+| `record_audio_input` | string | `default` | Microphone source name or `default`. Monitor sources are excluded from the microphone picker. |
+| `record_codec` | string | `auto` | Default recording codec shown in the overlay for normal video formats. The UI exposes codec families only: `auto`, `h264`, `h265`, `av1`, `vp9`, and `ffv1`. For compositor recording, HyprCapture probes NVENC and VAAPI at the actual encoded resolution. `auto` prefers H.264 up to 4096 pixels per dimension and HEVC above that, trying both hardware codec families before falling back to software H.264. Explicit families retain their corresponding software fallback. Legacy implementation-specific values remain accepted and are folded into their codec family. GIF, APNG, and WebP use fixed FFmpeg image-animation encoders. |
+| `record_transparent_codec` | string | `auto` | Default recording codec shown when `window_background = "transparent"`. `auto` probes a tiny FFmpeg encode/decode sample and uses a hardware alpha encoder only when it actually preserves alpha; otherwise it falls back to CPU VP9/FFV1 and shows a warning. |
+| `record_solid_alpha` | bool | `false` | For window recordings with `window_background` set to `"follow-system"`, `"white"`, or `"black"`, keep alpha outside the window content when the selected format/codec supports transparency. This uses the same edge behavior as screenshot output and falls back to opaque recording when unsupported. |
+| `record_preset` | string | `veryfast` | FFmpeg preset used with `libx264`/`libx264rgb`. |
+| `record_gsr_flags` | string | empty | Extra default flags passed to `gpu-screen-recorder` for fullscreen and region recordings. `-w` and `-o` are rejected because HyprCapture owns the capture target and output path. If defaults conflict with overlay-controlled format, codec, FPS, cursor, target, or output settings, the overlay settings are appended later and take precedence. |
+| `record_window_backend` | string | `auto` | Recording backend. `auto` uses compositor for windows and GSR for ordinary fullscreen/region video. `compositor` prefers compositor for every mode; `gsr-visible` prefers GSR, including a visible window region. Compatible startup failures try the other backend. Virtual outputs, transparent recordings, GIF, APNG, and WebP always use compositor. |
+| `record_max_seconds` | int | `0` | Optional automatic stop in seconds. `0` means no duration limit for normal video formats. GIF, APNG, and WebP require one of `3`, `5`, `10`, `15`, or `30` seconds in the overlay and fall back to `5` when configured otherwise. |
+| `record_countdown_seconds` | int | `0` | Optional countdown before recording starts. `0` disables it; values are clamped to 60 seconds. When enabled, HyprCapture closes the capture overlay, shows an input-transparent countdown window centered on the active screen, then starts recording. |
+| `thumbnail_timeout_ms` | int | `5000` | Thumbnail auto-close timeout in milliseconds. Use `0` to keep it open until user action. |
+| `thumbnail_monitor` | string | `active` | Monitor used for result thumbnails. Supports `active`, `primary`, `all`, or a case-insensitive output name such as `DP-2`. `active` is resolved from Hyprland's pointer position before the helper starts. `all` shows one synchronized thumbnail per monitor; swipe progress and swipe-to-close/delete animations are shared, while right-click menus remain independent. Unknown names fall back to the active monitor. |
+| `helper` | string | empty | Optional absolute helper override. By default the plugin tries `HYPRCAPTURE_HELPER`, then `$HOME/.local/bin/hyprcapture-ui`, then trusted system install paths. |
+
+### Recording sound
+
+The recording toolbar has a third **Sound** row. Choose **Off**, **System**, **Microphone**, or **Mix**, then select the sound source and/or microphone. The **Source** menu includes **Auto** (default), **System default**, output devices, and current windows. Auto captures the system default output for fullscreen/region recording and the target window application for window recording. Device menus refresh when opened and include **System default**. Defaults are resolved when recording starts and remain fixed for that recording. GIF, APNG, and WebP do not carry audio; their Sound controls are disabled without forgetting your video settings.
+
+Both recording backends use a separate headless helper process for sound. Mix outputs a single stereo track. Choose **Manual**, **Auto balance**, or **Voice priority** (default) in the Sound row. Auto balance applies a microphone high-pass filter, gentle noise gate and bounded speech normalization, plus system-sound compression and attenuation. Voice priority also ducks system sound when the processed microphone level rises; this is level-based ducking, not speech recognition.
+
+Manual shows a fourth row with separate **Sound** and **Mic** gain sliders (−60 to +24 dB, plus Mute), post-gain sample-peak/RMS meters in dBFS, a 1.2-second peak hold and clipping indication. The preview always samples both selected sources independently of the recording Sound mode (including Off), without playback or PCM storage, and stops when the manual panel closes. Sound mode controls only which channels are included in the recording. Gain changes affect the recording, not desktop playback volume. Each meter represents its channel before summing and the final limiter; the sum can exceed 0 dBFS even when the individual channels do not. Both channels feed a final limiter. Settings are chosen before recording; the panel is not a live recording mixer. Gain settings also apply after processing in automatic presets.
+
+The **AEC** row is available in all mixing presets. This candidate uses **Auto / Always on / Always off**, a **CPU / NPU*** selector, a result label and **Retest**. Automatic mode selects 512 before 256 only when both ten-second complete-chain trials achieve at least 3× real time and P99 ≤ 4 ms. Unavailable, busy or untested machines use the raw microphone while testing remains pending. Always on still requires valid output and retains overload protection; it may use a correctly validated 256 model that missed the automatic speed threshold. No 128 model is offered.
+
+An independent native C++ worker runs TensorFlow Lite 2.14.0 / XNNPACK on one CPU thread. The optional OpenVINO module explicitly targets NPU and validates its recurrent states against fixed references. PipeWire's echo-cancel module supplies the playback reference, synchronization and clock compensation through the custom DTLN SPA adapter. The microphone is processed as 16 kHz mono and restored to 48 kHz (approximately 8 kHz microphone bandwidth). System sound is untouched by the model. Preview and recording use the same worker path. Worker failure or a queue over 100 ms for one second restores the original microphone and reports that state. A recording does not change models or retry AEC after fallback.
+
+`hyprpm` installs the native components and runs the optional AEC installer after normal tests. Standard installs provide `hyprcapture-install-aec /path/to/bin`; this downloads checksum-pinned sources and builds the CPU runtime when missing, then downloads and verifies models and checks the machine. Initial source compilation can take several minutes and needs a C/C++ compiler, Ninja, curl, tar and flock. All 15 nested CPU dependencies use the SHA256 manifest in `nix/aec-sources.json`; they are pre-seeded before configuring with `FETCHCONTENT_FULLY_DISCONNECTED=ON`. No pip or model conversion is run. `hyprcapture-aec --install` retries model installation and testing; `--check --force` retests without downloading. Add `--npu` only for the experimental backend. Failure does not disable ordinary capture. Nix uses fixed source/model hashes and checks the actual machine on first UI launch.
+
+Performance results live in the user cache, bound to hashed machine identity, CPU features, available cores, backend/driver and component hashes. Explicit choices live separately in `hyprcapture/aec.ini` under the user config directory; they survive machine migration. Old ambiguous remembered booleans become Auto; explicit `0`/`1` configuration keeps its meaning. Test input is a redistributable synthetic signal and never opens the microphone or speakers. See [AEC assets](resources/aec/README.md). This remains a release candidate until the real recording, speech-quality and long-duration acceptance gates pass.
+
+If a device is missing or disconnects, HyprCapture reports the error and keeps recording video; the failed source becomes silent while another source continues. Output devices and microphones are not automatically switched or reconnected during a recording. Window sources follow playback streams from the selected application process and its children, including streams created after recording starts; unrelated applications on the same output are excluded. Window capture waits silently when that application is not playing audio and never falls back to desktop audio. Applications that share one process/audio service across multiple windows (for example, browsers) cannot always be isolated per window. Matching uses process identity, not window title or application name. The source menu refreshes when opened; a closed window selection remains marked unavailable.
+
+Stopping displays **Merging sound** while FFmpeg copies the video stream and adds AAC (MP4/MOV) or Opus (WebM/MKV). The video is not reencoded. Temporary float PCM files are stored with private permissions in a `.hyprcapture-sound-*` directory next to the video (about 23 MB per minute per source). Successful merging removes these files. A failed merge preserves the original video and recoverable audio, and the error gives the recovery directory. Do not remove it until you have recovered any sound you need.
+
+GSR sound synchronization requires `gpu-screen-recorder` with `-write-first-frame-ts` support. Sound-enabled requests reject conflicting `record_gsr_flags` options (`-a`, `-ac`, `-ab`, `-ffmpeg-audio-opts`, `-ffmpeg-opts`, `-write-first-frame-ts`); use the Sound row instead. With Sound off, existing custom audio flags retain their behavior.
+
+For 60 fps, prefer hardware encoding:
+
+```lua
+hl.config({
+    plugin = {
+        hyprcapture = {
+            record_fps = 60,
+            record_codec = "auto",
+        },
+    },
+})
+```
+
+`auto` prefers H.264 for canvases up to 4096 pixels in both dimensions and HEVC for larger compositor recordings. For example, a 5204×3356 window tries HEVC NVENC/VAAPI first. All hardware candidates are probed at the actual output dimensions; if the preferred family fails, the other hardware family is tried before software H.264. Selecting `h264` or `h265` explicitly keeps that codec family, including its software fallback. For alpha-preserving window recordings, use `webm`/VP9, `mkv`/FFV1, APNG, or WebP; `mp4` is blocked by the overlay when `window_background = "transparent"`. MOV/HEVC alpha exists in Apple's ecosystem, but this Linux FFmpeg path does not currently encode that alpha profile, so transparent MOV is also blocked. WebP animation uses `libwebp_anim` in lossy mode at quality 75.
+
+Normal compositor video recordings carry the captured frame’s monotonic timestamp through a NUT RGBA stream to FFmpeg. A slow encoder skips capture opportunities instead of accumulating repeated frames; elapsed time remains correct and audio uses the same first-frame clock. At stop, at most one terminal sample holds the last picture through the recording end. GIF, APNG intermediates, and WebP retain their existing animation timing.
+
+The compositor recording path uses synchronous compositor readback. To avoid making Hyprland sluggish, window recordings are capped by `record_window_fps_limit` until the GPU-only encoder path lands. GIF, APNG, and WebP use the same compositor path for fullscreen and region captures, so keep area and FPS modest. For visible on-screen windows where 60 fps matters more than offscreen/occlusion-safe capture, set `record_window_backend = "gsr-visible"` and use a normal video format.
+
+### Watermark options
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `watermark` | string | empty | Disabled when empty. Set to a PNG or JPG/JPEG path, or use built-in `activate-linux`, `hypercam2`, or `hyprcam2`. External SVG files are ignored; transparency is preserved for PNG. |
+| `watermark_position` | string | `central` | Supports `up-left`, `up-middle`, `up-right`, `left-middle`, `central`, `right-middle`, `down-left`, `down-middle`, and `down-right`. Common aliases like `center`, `top-center`, and `right-meddle` are accepted. |
+| `watermark_width` | string | `20%` | Watermark width. Use pixels like `320` / `320px`, or screenshot-width percent like `18%`. |
+| `watermark_offset` | string | `0 0` | X/Y offset from the selected position. Vec2-like values such as `12 -8`, `2% -4%`, or `12px, -8px` are accepted. Percent X is relative to screenshot width; percent Y is relative to screenshot height. |
+
+## Development
+
+Tests are retained but disabled by default. Hyprpm and Nix builds explicitly disable them and do not run CTest. Enable them with `-DBUILD_TESTING=ON` when running the suite manually.
+
+Useful commands:
+
+```sh
+cmake -S . -B build-cmake -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+cmake --build build-cmake
+ctest --test-dir build-cmake --output-on-failure
+./build-cmake/hyprcapture-ui --help
+```
+
+Temporary compositor artifacts and thumbnail/clipboard scratch files are written under a per-user private runtime directory such as `/dev/shm/hyprcapture-$UID` when available, with `/tmp/hyprcapture-$UID` as fallback. The directory is forced to `0700`, scratch files are written as owner-only files, and compositor artifact files are removed by the helper after loading.
+
+## Notes
+
+- The repository includes a root [`hyprpm.toml`](hyprpm.toml) manifest, which is expected by `hyprpm`.
+- `window_background = "real"` uses compositor-captured real background data when available and falls back to reconstructing from the frozen desktop snapshot. When the compositor cannot provide an independent blurred background, a notification identifies the fallback. Window recordings use a solid background in that case.
+- Recording applies window decoration cropping and solid/follow-system backgrounds in the compositor-side path. Since plugin-side recording cannot query the helper's Qt palette, `window_background = "follow-system"` uses the same light fallback color as the screenshot helper. `record_solid_alpha = true` lets follow-system/white/black window recordings keep transparent pixels outside the window content when the selected format/codec supports alpha. `window_background = "real"` uses live compositor background data for window recordings and is treated as opaque for recording-format validation. Transparent output requires an alpha-capable format such as `webm`/VP9 or `mkv`/FFV1; MP4/MOV H.264/H.265 output is intentionally rejected for transparent recordings.
+- Do not run `hyprpm update` or reload the plugin while an active screenshot overlay is being used.
+
+To verify application audio isolation against a running PipeWire server, run `python3 tests/audio_application_live_test.py build-codex/hyprcapture-ui`. This creates private test outputs without changing the default output, and checks multiple streams, subprocess matching, late playback and live metering.
+
+AEC integration test: `python3 tests/audio_echo_live_test.py build-codex/hyprcapture-ui` uses private synthetic playback/microphone nodes to check echo suppression, double talk, unmodified defaults and node cleanup.

@@ -1,0 +1,99 @@
+#pragma once
+#include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
+#include <hyprland/src/workspace/AbstractWorkspace.hpp>
+#include <hyprland/src/desktop/reserved/ReservedArea.hpp>
+#include <hyprutils/animation/AnimationConfig.hpp>
+#include <optional>
+#include <string_view>
+
+namespace Render {
+    class CRenderContext;
+}
+
+// One tile in the overview strip. Numbered workspaces use `numbered` (from 1).
+// 0.57 special workspaces are a type, not a negative id.
+struct SOverviewWorkspace {
+    bool                            special  = false;
+    Workspace::WorkspaceIDContainer numbered = 0;
+};
+
+class CHyprspaceWidget {
+
+    bool active = false;
+
+    int64_t ownerID;
+
+    // animation override stuff
+    Hyprutils::Animation::SAnimationPropertyConfig curAnimationConfig;
+    Hyprutils::Animation::SAnimationPropertyConfig curAnimation;
+
+    // for checking mouse hover for workspace drag and move
+    // modified on draw call, accessed on mouse click and release
+    std::vector<std::tuple<SOverviewWorkspace, CBox>> workspaceBoxes;
+
+    // for storing the fullscreen state of windows prior to overview activation (which unfullscreens all windows)
+    std::vector<std::tuple<PHLWINDOWREF, Fullscreen::eFullscreenMode>> prevFullscreen;
+
+    // for storing the layer alpha values prior to overview activation (which sets all panel to transparent when configured)
+    std::vector<std::tuple<PHLLS, float>> oLayerAlpha;
+
+    // for click-to-exit
+    std::chrono::system_clock::time_point lastPressedTime = std::chrono::high_resolution_clock::now();
+
+    bool swiping = false;
+    // whether if the panel is active before the current swiping event
+    bool activeBeforeSwipe = false;
+    double avgSwipeSpeed = 0.;
+    // number of swiping speed frames recorded
+    int swipePoints = 0;
+    // on second thought, this seems redundant as we could just write to curYOffset while swiping
+    double curSwipeOffset = 10.;
+
+    PHLANIMVAR<float> workspaceScrollOffset;
+
+    bool isKeyboardPreview = false;
+    std::optional<Workspace::WorkspaceIDContainer> selectedWorkspaceID;
+    std::optional<Desktop::CReservedArea> originalReservedArea;
+
+    std::vector<Workspace::WorkspaceIDContainer> selectionWorkspaces();
+    std::vector<SOverviewWorkspace> workspaceTiles();
+    CBox panelBox(size_t workspaceCount);
+    double panelTravelDistance();
+
+public:
+
+    // for slide-in animation and swiping
+    PHLANIMVAR<float> curYOffset;
+
+    CHyprspaceWidget(uint64_t);
+    ~CHyprspaceWidget();
+
+    PHLMONITOR getOwner();
+    bool isActive();
+    bool hasKeyboardPreview() const { return isKeyboardPreview; }
+    bool beginSelection();
+    bool moveSelection(std::string_view direction);
+    std::optional<Workspace::WorkspaceIDContainer> finishSelection(bool commit);
+
+    void show();
+    void hide();
+
+    void updateConfig();
+
+    // should be called active or not
+    void draw(Render::CRenderContext& ctx);
+
+    // reserves area on owner monitor
+    void updateLayout();
+
+    bool buttonEvent(bool, Vector2D coords);
+    bool axisEvent(double, wl_pointer_axis axis, Vector2D coords);
+
+    bool isSwiping();
+
+    bool beginSwipe(IPointer::SSwipeBeginEvent);
+    bool updateSwipe(IPointer::SSwipeUpdateEvent);
+    bool endSwipe(IPointer::SSwipeEndEvent);
+
+};

@@ -1,0 +1,6 @@
+[Unit]
+Description=Weekly System Update Desktop Reminder
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/notify-send -u normal -i system-software-update "Weekly Update Ready" "Packages pre-downloaded! Run sudo pacman -Syu when ready."

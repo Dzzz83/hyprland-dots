@@ -1,5 +1,7 @@
 -- config/binds.lua
 local mainMod = "SUPER"
+local workspace_preview = require("config.workspace_preview")
+local capture = require("config.capture")
 
 hl.bind(mainMod .. " + Return", hl.dsp.exec_cmd("ghostty"))
 
@@ -14,11 +16,12 @@ hl.bind(mainMod .. " + J", hl.dsp.layout("togglesplit"))
 hl.bind(mainMod .. " + Space", hl.dsp.exec_cmd("rofi -show drun"))
 hl.bind(mainMod .. " + E", hl.dsp.exec_cmd("nemo"))
 hl.bind(mainMod .. " + B", hl.dsp.exec_cmd("brave"))
-hl.bind(mainMod .. " + V", hl.dsp.exec_cmd("~/.config/viegphunt/clipboard_launcher.sh"))
-hl.bind(mainMod .. " + Period", hl.dsp.exec_cmd("~/.config/viegphunt/emoji_launcher.sh"))
-hl.bind(mainMod .. " + SHIFT + W", hl.dsp.exec_cmd("~/.config/viegphunt/wallpaper_random.sh"))
-hl.bind(mainMod .. " + SHIFT + S", hl.dsp.exec_cmd("hyprshot -m region -o $HOME/Pictures/Screenshots"))
-hl.bind(mainMod .. " + H", hl.dsp.exec_cmd("~/.config/viegphunt/key_hints.sh"))
+hl.bind(mainMod .. " + V", hl.dsp.exec_cmd("~/.config/hypr/scripts/clipboard_launcher.sh"))
+hl.bind(mainMod .. " + Period", hl.dsp.exec_cmd("~/.config/hypr/scripts/emoji_launcher.sh"))
+hl.bind(mainMod .. " + SHIFT + W", hl.dsp.exec_cmd("~/.config/hypr/scripts/wallpaper_random.sh"))
+hl.bind(mainMod .. " + SHIFT + S", capture.open)
+hl.bind(mainMod .. " + SHIFT + R", hl.dsp.exec_cmd("~/.local/bin/screen-record"))
+hl.bind(mainMod .. " + H", hl.dsp.exec_cmd("~/.config/hypr/scripts/key_hints.sh"))
 hl.bind(mainMod .. " + L", hl.dsp.exec_cmd("loginctl lock-session"))
 hl.bind(mainMod .. " + N", hl.dsp.exec_cmd("swaync-client -t -sw"))
 hl.bind(mainMod .. " + SHIFT + Q", hl.dsp.exec_cmd("hyprctl activewindow | grep pid | tr -d 'pid:' | xargs kill"))
@@ -28,9 +31,16 @@ hl.bind("CTRL + SHIFT + Escape", hl.dsp.exec_cmd("ghostty --class=floating_btop 
 -- 2D Workspace Navigation (Native & Dynamic)
 -- ==========================================
 
--- Super + Left/Right: Cycle previous/next workspace
-hl.bind(mainMod .. " + left",  hl.dsp.focus({ workspace = "-1" }))
-hl.bind(mainMod .. " + right", hl.dsp.focus({ workspace = "+1" }))
+-- Super arrows always switch workspaces; Alt arrows select an open preview.
+for _, direction in ipairs({ "left", "right", "up", "down" }) do
+    hl.bind(mainMod .. " + " .. direction, function()
+        workspace_preview.move_workspace(direction)
+    end, { repeating = true })
+    hl.bind("ALT + " .. direction, function()
+        workspace_preview.move(direction)
+    end, { repeating = true })
+end
+hl.bind("ALT + Escape", hl.dsp.no_op())
 
 -- Super + Shift + Left/Right: Move active window to next/prev workspace and follow it
 hl.bind(mainMod .. " + SHIFT + left", function()
@@ -41,20 +51,7 @@ hl.bind(mainMod .. " + SHIFT + right", function()
     hl.dispatch(hl.dsp.window.move({ workspace = "+1" }))
 end)
 
--- Super + Up/Down: Jump 10 workspaces by triggering +1 ten times instantly
-hl.bind(mainMod .. " + up", function()
-    for _ = 1, 10 do
-        hl.dispatch(hl.dsp.focus({ workspace = "+1" }))
-    end
-end)
-
-hl.bind(mainMod .. " + down", function()
-    for _ = 1, 10 do
-        hl.dispatch(hl.dsp.focus({ workspace = "-1" }))
-    end
-end)
-
--- Alt+Tab: Go to previous workspace
+-- Alt+Tab: Toggle the two most recently focused workspaces.
 hl.bind("ALT + Tab", hl.dsp.focus({ workspace = "previous" }))
 
 -- Super + [0-9]: Switch to workspaces 1-10

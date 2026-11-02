@@ -1,11 +1,15 @@
 {
     "modules-left": ["custom/power", "ext/workspaces"],
     // "modules-center": [],
-    "modules-right": ["tray", "bluetooth", "network", "battery", "pulseaudio", "clock"],
+    "modules-right": ["tray", "custom/network", "custom/battery", "pulseaudio", "clock"],
 
     "custom/power": {
-        "format" : "⭘ ",
-        "tooltip": false,
+        "exec": "python3 $HOME/.config/hypr/scripts/waybar-power-mode.py",
+        "return-type": "json",
+        "format": "{} ",
+        "restart-interval": 5,
+        "exec-on-event": false,
+        "tooltip": true,
         "on-click": "wlogout -b 5",
     },
 
@@ -25,31 +29,27 @@
         "format": " 󰂯 ",
         "format-disabled": " 󰂲 ",
         "format-connected": " 󰂱 ",
-        "on-click": "blueman-manager",
+        "on-click": "$HOME/.local/bin/wifi-manager --toggle",
     },
 
-    "network": {
-        "format-wifi": "  {essid}",
-        "format-ethernet": "  Ethernet",
-        "format-linked": "  Linked (No IP)",
-        "format-disconnected": "  Disconnected",
-        "tooltip": false,
+    "custom/network": {
+        "exec": "python3 $HOME/.config/hypr/scripts/waybar-network.py",
+        "return-type": "json",
+        "format": "{}",
+        "restart-interval": 5,
+        "exec-on-event": false,
+        "on-click": "$HOME/.local/bin/wifi-manager --toggle",
+        "tooltip": true,
     },
 
-    "battery": {
-        "states": {
-            "good": 85,
-            "warning": 30,
-            "critical": 15
-        },
-        "format": "{icon} {capacity}%",
-        "format-full": "{icon} {capacity}%",
-        "format-plugged": " {capacity}%",
-        "format-charging": " {capacity}%",
-        "format-alt": "{icon} {capacity}%",
-        "format-icons": [" ", " ", " ", " ", " "],
-        "tooltip-format": "{time}",
-        "cursor": false,
+    "custom/battery": {
+        "exec": "python3 -B $HOME/.config/hypr/scripts/waybar-battery.py",
+        "return-type": "json",
+        "format": "{}",
+        "restart-interval": 5,
+        "exec-on-event": false,
+        "tooltip": true,
+        "on-click": "python3 -B $HOME/.config/hypr/scripts/battery-panel.py --toggle",
     },
 
     "pulseaudio": {
@@ -62,7 +62,7 @@
             "headset": " ",
             "default": [" "],
         },
-        "on-click": "pavucontrol",
+        "on-click": "$HOME/.local/bin/audio-panel --toggle",
     },
 
     "clock": {

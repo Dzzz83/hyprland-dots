@@ -1,0 +1,92 @@
+#pragma once
+
+#include <QImage>
+#include <QRect>
+#include <QRegion>
+#include <QWidget>
+#include <memory>
+#include <functional>
+#include "ui/scroll_stitcher.hpp"
+
+struct AnnotationSnapshot;
+struct HdrAnnotationPreview {
+    QImage pixels;
+    QRegion damage;
+    float peakNits = 0;
+};
+
+// An image editor embedded in the capture overlay. Annotation coordinates are
+// native image pixels, independent of display scale, zoom and the export path.
+class AnnotationEditor final : public QWidget {
+    Q_OBJECT
+
+  public:
+    explicit AnnotationEditor(QWidget* parent = nullptr);
+    ~AnnotationEditor() override;
+
+    // Existing edits and history survive background changes of the same size.
+    void setImage(const QImage& image, bool preserveAnnotations = false);
+    QImage resultImage() const;
+    QImage resultImageOn(const QImage& hdrBase) const;
+    QImage previewImageOn(const QImage& hdrBase) const;
+    std::function<QImage()> previewRendererOn(const QImage& hdrBase) const;
+    // Native-resolution PQ preview: cache unchanged pixels, compose only damaged
+    // annotation bounds on a worker. Export uses resultImageOn independently.
+    std::function<QImage(float*)> pqPreviewRendererOn(const QImage& hdrBase, float referenceNits) const;
+    std::function<HdrAnnotationPreview()> pqPreviewFrameRendererOn(const QImage& hdrBase, float referenceNits, bool baseOnly = false) const;
+    bool needsHdrAnnotationComposition() const;
+    void setHdrEnabled(bool enabled);
+    // Save is redundant when confirming already writes the capture.
+    void setSaveActionVisible(bool visible);
+    bool hdrEnabled() const;
+    void setRegionResizeBounds(const QRect& bounds);
+    void replaceCaptureImage(const QImage& image, const QRect& displayRect);
+
+    std::shared_ptr<const AnnotationSnapshot> snapshot() const;
+    void restore(const std::shared_ptr<const AnnotationSnapshot>& snapshot);
+    // Original object coordinates and history remain immutable as the canvas grows.
+    void setScrollImage(const QImage& image, const hyprcapture::ui::ScrollLayout& layout, bool live);
+    void setScrollEnabled(bool enabled);
+    void setLiveScrollPresentation(bool live);
+    void setExternalImagePresentation(bool enabled, bool includesAnnotations = false);
+    bool externalImagePresentation() const;
+    bool externalAnnotationPresentation() const;
+    void setAnnotationPresentation(bool ready, qreal opacity = 1, qreal offset = 0);
+    QImage annotatedPreview(const QImage& preview, const hyprcapture::ui::ScrollLayout& layout) const;
+    QRect canvasGeometry() const;
+    QWidget* toolbarWidget() const;
+    QRect toolbarGeometry() const;
+    // The capture controls remain parented by the overlay; reserve and return
+    // their position as part of the same floating toolbar cluster.
+    void setCaptureToolbarSize(const QSize& size);
+    QRect captureToolbarGeometry() const;
+    void undo();
+    void redo();
+    void clearAnnotations();
+    void fitImage();
+    // Empty rect restores automatic fit. Coordinates are relative to this widget.
+    void setImageDisplayRect(const QRect& rect);
+
+  signals:
+    void imageDisplayGeometryChanged();
+    void scrollRequested(const QPointF& globalPosition, double delta, int discrete, bool finger, bool inverted);
+    void confirmRequested();
+    void saveRequested();
+    void cancelRequested();
+    void pinRequested();
+    void reselectRequested();
+    void annotationsChanged();
+    void previewChanged();
+    void captureRectChangeRequested(const QRect& rect);
+    void toolbarGeometryChanged(const QRect& geometry);
+
+  protected:
+    bool eventFilter(QObject* object, QEvent* event) override;
+    void changeEvent(QEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};

@@ -1,6 +1,4 @@
--- config/workspaces.lua
-
--- Create 20 persistent workspaces on your laptop monitor
+local machine = require("config.machine")
 for i = 1, 20 do
-    hl.workspace_rule({ workspace = tostring(i), monitor = "eDP-1"})
+    hl.workspace_rule({ workspace = tostring(i), monitor = machine.primary_monitor })
 end

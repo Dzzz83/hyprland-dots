@@ -1,0 +1,20 @@
+/* Darker surfaces for Thunar; keep the GTK theme for controls and icons. */
+.thunar.background,
+.thunar .standard-view .view {
+    background-color: #11111b;
+    color: #cdd6f4;
+}
+
+.thunar .sidebar .view,
+.thunar toolbar,
+.thunar menubar,
+.thunar statusbar,
+.thunar treeview.view header button {
+    background-color: #181825;
+    color: #cdd6f4;
+}
+
+.thunar .view:selected {
+    background-color: #45405b;
+    color: #cdd6f4;
+}

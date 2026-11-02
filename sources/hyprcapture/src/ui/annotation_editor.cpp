@@ -1,0 +1,2699 @@
+#include "ui/annotation_editor.hpp"
+#include "ui/hdr_image.hpp"
+#include "ui/hdr_backdrop.hpp"
+#include "ui/timing.hpp"
+#include <QColorSpace>
+#include <QWindow>
+#include <QStyleOptionSlider>
+#include <QStyle>
+#include <QtCore/qfloat16.h>
+#include "ui/material_icon.hpp"
+#include "ui/desktop_theme.hpp"
+#include "ui/touch_gesture.hpp"
+#include <QTouchEvent>
+
+#include <QApplication>
+#include <QButtonGroup>
+#include <QColorDialog>
+#include <QEvent>
+#include <QFrame>
+#include <QFontDatabase>
+#include <QListWidget>
+#include <QLineEdit>
+#include <QSlider>
+#include <QTextDocument>
+#include <QTextBlock>
+#include <QTextLayout>
+#include <QAbstractTextDocumentLayout>
+#include <QHideEvent>
+#include <QLinearGradient>
+#include <QMenu>
+#include <QHBoxLayout>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPainterPathStroker>
+#include <QPlainTextEdit>
+#include <QPointer>
+#include <QPushButton>
+#include <QResizeEvent>
+#include <QSettings>
+#include <QStandardPaths>
+#include <QShortcut>
+#include <QSpinBox>
+#include <QToolButton>
+#include <QVBoxLayout>
+#include <QWheelEvent>
+
+#include <algorithm>
+#include <cmath>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+namespace {
+enum class Tool { Select, Rectangle, Ellipse, Arrow, Line, Pen, Highlighter, Text, Number, Mosaic, Spotlight };
+enum class Variant { Outline, Filled, Rounded, RoundedFilled, Straight, Curved, DoubleHeaded, DoubleCurved };
+
+struct Annotation {
+    Tool tool = Tool::Rectangle;
+    Variant variant = Variant::Outline;
+    QColor color = QColor("#ff5252");
+    qreal width = 4.0;
+    qreal hdrGain = 1.0;
+    QVector<QPointF> points;
+    QString text;
+    QFont textFont;
+    QSizeF textBox;
+    int number = 1;
+    int documentY = 0;
+    bool scrollAnchored = false;
+    std::optional<hyprcapture::ui::ScrollLayout> anchorLayout;
+    mutable QImage mosaicCache;
+    mutable QRect mosaicBounds;
+    mutable int mosaicBlock = 0;
+    mutable qint64 mosaicSource = 0;
+
+    bool sameInk(const Annotation& other) const {
+        return tool == other.tool && variant == other.variant && color == other.color &&
+            width == other.width && hdrGain == other.hdrGain && points == other.points &&
+            text == other.text && textFont == other.textFont && textBox == other.textBox &&
+            number == other.number && documentY == other.documentY &&
+            scrollAnchored == other.scrollAnchored && anchorLayout == other.anchorLayout;
+    }
+};
+
+struct Edit {
+    enum class Kind { Add, Remove, Replace, Clear } kind = Kind::Add;
+    int index = 0;
+    Annotation before;
+    Annotation after;
+    std::vector<Annotation> all;
+};
+
+} // namespace
+struct AnnotationSnapshot {
+    std::vector<Annotation> annotations;
+    std::vector<Edit> history;
+    int position=0, selected=-1;
+    QImage base;
+    QRect display;
+    qreal zoom=1;
+    QPointF pan;
+    bool fitToViewport=false;
+};
+namespace {
+using hyprcapture::ui::ScrollLayout;
+// Map pieces, not object coordinates. Cross-chrome objects retain one identity
+// and one undo action, including when the document grows above the first frame.
+struct AnnotationPiece { QRectF clip; int dy; };
+std::vector<AnnotationPiece> annotationPieces(const Annotation& a,const ScrollLayout& l,bool live) {
+    const QRect c=l.content, initial=l.initialContent.isEmpty()?c:l.initialContent;
+    const int w=l.frameSize.width(),h=l.frameSize.height();
+    const int growth=l.maximumY-l.minimumY;
+    std::vector<AnnotationPiece> result{{QRectF(0,0,w,c.y()),0},
+        {QRectF(0,c.bottom()+1,w,h-c.bottom()-1),live?0:growth}};
+    const auto applies=[&](const ScrollLayout::Panel& panel) {
+        if(panel.active || a.documentY<=panel.maximumY) return true;
+        if(a.anchorLayout) for(const auto& old:a.anchorLayout->panels)
+            if(old.active && old.rect==panel.rect && old.documentY==panel.documentY) return true;
+        return false;
+    };
+    std::vector<QRect> body{c};
+    for(const auto& panel:l.panels) if(applies(panel)) {
+        std::vector<QRect> next;
+        for(const auto& rect:body) {
+            if(!rect.intersects(panel.rect)) {next.push_back(rect);continue;}
+            if(rect.left()<panel.rect.left()) next.push_back(QRect(rect.left(),rect.top(),panel.rect.left()-rect.left(),rect.height()));
+            if(rect.right()>panel.rect.right()) next.push_back(QRect(panel.rect.right()+1,rect.top(),rect.right()-panel.rect.right(),rect.height()));
+        }
+        body=std::move(next);
+    }
+    for(auto rect:body) {
+        if(a.anchorLayout) rect.setTop(rect.top()+a.anchorLayout->topOcclusion);
+        result.push_back({QRectF(rect),a.documentY-(live?l.viewportY:l.minimumY)});
+    }
+    const auto fixedSide=[&](int x,int width,int seam) {
+        if(live || seam<0) { result.push_back({QRectF(x,c.y(),width,c.height()),0}); return; }
+        result.push_back({QRectF(x,c.y(),width,seam-c.y()),0});
+        result.push_back({QRectF(x,seam,width,c.bottom()+1-seam),growth});
+    };
+    fixedSide(0,initial.x(),l.leftSeam);
+    fixedSide(initial.right()+1,w-initial.right()-1,l.rightSeam);
+    for(const auto& panel:l.panels) {
+        if(!applies(panel)) continue;
+        int anchor=a.documentY;
+        if(a.anchorLayout) for(const auto& old:a.anchorLayout->panels)
+            if(old.active && old.rect==panel.rect && old.documentY==panel.documentY)
+                anchor=old.documentY;
+        // Annotation coordinates remain in their creation viewport. Split at
+        // the same document/panel boundaries as the compositor's prefix and
+        // expand(), including annotations drawn before the column pinned.
+        const int first=panel.documentY+panel.sourceTop;
+        const int seam=panel.seam<0?panel.sourceHeight:panel.seam;
+        const int end=first+panel.sourceHeight;
+        const int extra=panel.maximumY-panel.documentY;
+        const int base=anchor-(live?(panel.active?panel.documentY:l.viewportY):l.minimumY);
+        const auto piece=[&](int from,int to,int shift) {
+            const int visibleTop=c.y()+(a.anchorLayout?a.anchorLayout->topOcclusion:0);
+            const int top=std::max(visibleTop,c.y()+from-anchor);
+            const int bottom=std::min(c.bottom()+1,c.y()+to-anchor);
+            if(top<bottom) result.push_back({QRectF(panel.rect.x(),top,panel.rect.width(),bottom-top),base+shift});
+        };
+        piece(l.minimumY,first,0);
+        piece(first,first+seam,0);
+        piece(first+seam,end,live?0:extra);
+    }
+    return result;
+}
+
+QRectF pointBounds(const Annotation& annotation) {
+    if (annotation.points.isEmpty())
+        return {};
+    QPointF minimum = annotation.points.front(), maximum = minimum;
+    for (const auto& point : annotation.points) {
+        minimum.setX(std::min(minimum.x(), point.x()));
+        minimum.setY(std::min(minimum.y(), point.y()));
+        maximum.setX(std::max(maximum.x(), point.x()));
+        maximum.setY(std::max(maximum.y(), point.y()));
+    }
+    return {minimum, maximum};
+}
+
+QFont annotationFont(qreal width) {
+    QFont font = QApplication::font();
+    font.setPixelSize(qRound(width * 4.0 + 12.0));
+    font.setWeight(QFont::DemiBold);
+    return font;
+}
+
+QRectF textBounds(const Annotation& annotation) {
+    if (annotation.points.isEmpty())
+        return {};
+    if (annotation.textBox.isValid()) return {annotation.points.front(), annotation.textBox};
+    const QFontMetricsF metrics(annotation.textFont.pixelSize() > 0 ? annotation.textFont : annotationFont(annotation.width));
+    const auto lines = annotation.text.split('\n');
+    qreal width = 1.0;
+    for (const auto& line : lines)
+        width = std::max(width, metrics.horizontalAdvance(line));
+    return {annotation.points.front(), QSizeF(width + 4.0, metrics.lineSpacing() * lines.size())};
+}
+
+QPainterPath annotationPath(const Annotation& annotation) {
+    QPainterPath path;
+    if (annotation.points.isEmpty())
+        return path;
+    const QRectF bounds = pointBounds(annotation).normalized();
+    switch (annotation.tool) {
+        case Tool::Rectangle:
+        case Tool::Mosaic:
+            if (annotation.variant == Variant::Rounded || annotation.variant == Variant::RoundedFilled)
+                path.addRoundedRect(bounds, std::min(18.0, bounds.width() * 0.18), std::min(18.0, bounds.height() * 0.18));
+            else
+                path.addRect(bounds);
+            break;
+        case Tool::Ellipse:
+        case Tool::Spotlight:
+            path.addEllipse(bounds);
+            break;
+        case Tool::Number: {
+            const qreal radius = annotation.width * 2.0 + 12.0;
+            path.addEllipse(annotation.points.front(), radius, radius);
+            break;
+        }
+        case Tool::Text:
+            path.addRect(textBounds(annotation));
+            break;
+        default:
+            path.moveTo(annotation.points.front());
+            if (annotation.tool == Tool::Arrow && (annotation.variant == Variant::Curved || annotation.variant == Variant::DoubleCurved) && annotation.points.size() >= 2) {
+                const QPointF start = annotation.points.front(), end = annotation.points.back();
+                const QPointF difference = end - start;
+                path.quadTo((start + end) / 2.0 + QPointF(-difference.y(), difference.x()) * 0.25, end);
+            } else {
+                for (int i = 1; i < annotation.points.size(); ++i)
+                    path.lineTo(annotation.points[i]);
+            }
+            break;
+    }
+    return path;
+}
+
+void drawArrowHead(QPainter& painter, const QPointF& tip, const QPointF& direction, qreal width) {
+    const qreal length = std::hypot(direction.x(), direction.y());
+    if (length < 0.001)
+        return;
+    const QPointF unit = direction / length;
+    const QPointF normal(-unit.y(), unit.x());
+    const qreal size = width * 2.8 + 9.0;
+    QPolygonF triangle;
+    triangle << tip << tip - unit * size + normal * size * 0.45 << tip - unit * size - normal * size * 0.45;
+    painter.save();
+    painter.setBrush(painter.pen().color());
+    painter.setPen(Qt::NoPen);
+    painter.drawPolygon(triangle);
+    painter.restore();
+}
+
+// Redaction tiles are opaque, including when the source screenshot has alpha.
+// Average each entire source block rather than sampling a single source pixel.
+void drawMosaic(QPainter& painter, const QImage& source, const Annotation& annotation) {
+    const QRect bounds = pointBounds(annotation).toAlignedRect().intersected(source.rect());
+    if (bounds.isEmpty())
+        return;
+    const int block = std::clamp(qRound(annotation.width * 3.0), 8, 72);
+    if (annotation.mosaicCache.isNull() || annotation.mosaicBounds != bounds || annotation.mosaicBlock != block || annotation.mosaicSource != source.cacheKey()) {
+        const QSize grid((bounds.width() + block - 1) / block, (bounds.height() + block - 1) / block);
+        QImage cache(grid, QImage::Format_RGB32);
+        if (cache.isNull()) {
+            painter.fillRect(bounds, QColor(36, 36, 36));
+            return;
+        }
+        for (int row = 0; row < grid.height(); ++row) {
+            const int y = bounds.top() + row * block;
+            for (int column = 0; column < grid.width(); ++column) {
+                const int x = bounds.left() + column * block;
+                const QRect tile(x, y, std::min(block, bounds.right() - x + 1), std::min(block, bounds.bottom() - y + 1));
+                quint64 red = 0, green = 0, blue = 0;
+                for (int sy = tile.top(); sy <= tile.bottom(); ++sy) {
+                    for (int sx = tile.left(); sx <= tile.right(); ++sx) {
+                        const QColor pixel = source.pixelColor(sx, sy);
+                        const unsigned alpha = static_cast<unsigned>(pixel.alpha());
+                        red += (static_cast<unsigned>(pixel.red()) * alpha + 36U * (255U - alpha)) / 255U;
+                        green += (static_cast<unsigned>(pixel.green()) * alpha + 36U * (255U - alpha)) / 255U;
+                        blue += (static_cast<unsigned>(pixel.blue()) * alpha + 36U * (255U - alpha)) / 255U;
+                    }
+                }
+                const quint64 count = static_cast<quint64>(tile.width()) * tile.height();
+                cache.setPixel(column, row, qRgb(static_cast<int>(red / count), static_cast<int>(green / count), static_cast<int>(blue / count)));
+            }
+        }
+        annotation.mosaicCache = std::move(cache);
+        annotation.mosaicBounds = bounds;
+        annotation.mosaicBlock = block;
+        annotation.mosaicSource = source.cacheKey();
+    }
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    // Keep final partial tiles aligned exactly with the covered source pixels.
+    painter.setClipRect(bounds, Qt::IntersectClip);
+    painter.drawImage(QRect(bounds.topLeft(), QSize(annotation.mosaicCache.width() * block, annotation.mosaicCache.height() * block)), annotation.mosaicCache);
+    painter.restore();
+}
+
+void drawAnnotation(QPainter& painter, const QImage& source, const Annotation& annotation) {
+    if (annotation.points.isEmpty())
+        return;
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(annotation.color, annotation.width, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(Qt::NoBrush);
+    const QPainterPath path = annotationPath(annotation);
+    switch (annotation.tool) {
+        case Tool::Mosaic:
+            drawMosaic(painter, source, annotation);
+            break;
+        case Tool::Spotlight: {
+            QPainterPath outside;
+            outside.addRect(source.rect());
+            painter.fillPath(outside.subtracted(path), QColor(0, 0, 0, 150));
+            break;
+        }
+        case Tool::Text: {
+            const QFont font = annotation.textFont.pixelSize() > 0 ? annotation.textFont : annotationFont(annotation.width);
+            if (annotation.textBox.isValid()) {
+                QTextDocument document;
+                document.setDocumentMargin(0);
+                document.setDefaultFont(font);
+                QTextOption option;
+                option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+                document.setDefaultTextOption(option);
+                document.setPlainText(annotation.text);
+                document.setTextWidth(annotation.textBox.width());
+                painter.translate(annotation.points.front());
+                painter.setClipRect(QRectF(QPointF(), annotation.textBox), Qt::IntersectClip);
+                QAbstractTextDocumentLayout::PaintContext context;
+                context.palette.setColor(QPalette::Text, annotation.color);
+                document.documentLayout()->draw(&painter, context);
+            } else {
+                painter.setFont(font);
+                const QFontMetricsF metrics(font);
+                qreal y = annotation.points.front().y() + metrics.ascent();
+                for (const auto& line : annotation.text.split('\n')) {
+                    painter.drawText(QPointF(annotation.points.front().x(), y), line);
+                    y += metrics.lineSpacing();
+                }
+            }
+            break;
+        }
+        case Tool::Number: {
+            painter.fillPath(path, annotation.color);
+            painter.setPen(annotation.color.lightness() > 155 ? Qt::black : Qt::white);
+            QFont font = annotationFont(annotation.width);
+            font.setPixelSize(qRound(annotation.width * 2.0 + 15.0));
+            painter.setFont(font);
+            painter.drawText(path.boundingRect(), Qt::AlignCenter, QString::number(annotation.number));
+            break;
+        }
+        case Tool::Highlighter: {
+            QColor color = annotation.color;
+            color.setAlpha(85);
+            painter.setPen(QPen(color, annotation.width * 5.0, Qt::SolidLine, Qt::FlatCap, Qt::RoundJoin));
+            painter.drawPath(path);
+            break;
+        }
+        case Tool::Rectangle:
+        case Tool::Ellipse:
+            if (annotation.variant == Variant::Filled || annotation.variant == Variant::RoundedFilled)
+                painter.setBrush(annotation.color);
+            painter.drawPath(path);
+            break;
+        case Tool::Arrow:
+            painter.drawPath(path);
+            if (annotation.points.size() >= 2) {
+                const QPointF start = annotation.points.front(), end = annotation.points.back();
+                const QPointF difference = end - start;
+                const QPointF control = (start + end) / 2.0 + QPointF(-difference.y(), difference.x()) * 0.25;
+                const bool curved = annotation.variant == Variant::Curved || annotation.variant == Variant::DoubleCurved;
+                drawArrowHead(painter, end, curved ? end - control : difference, annotation.width);
+                if (annotation.variant == Variant::DoubleHeaded || annotation.variant == Variant::DoubleCurved)
+                    drawArrowHead(painter, start, curved ? start - control : -difference, annotation.width);
+            }
+            break;
+        default:
+            if (annotation.points.size() == 1)
+                painter.drawPoint(annotation.points.front());
+            else
+                painter.drawPath(path);
+            break;
+    }
+    painter.restore();
+}
+
+// Embedded in the layer-shell surface: never creates a separate modal window
+// or a nested event loop that can end up behind the capture overlay on Wayland.
+class HdrGainSlider final : public QSlider {
+public:
+    explicit HdrGainSlider(QWidget* parent) : QSlider(Qt::Vertical, parent) {
+        for (QWidget* ancestor = parent; ancestor; ancestor = ancestor->parentWidget())
+            ancestor->installEventFilter(this);
+        connect(this, &QSlider::valueChanged, this, [this] { dirty = true; update(); });
+    }
+    void setTargetColor(const QColor& color) {
+        if (target == color) return;
+        target = color; dirty = true; update();
+    }
+protected:
+    bool eventFilter(QObject*, QEvent* event) override {
+        if (event->type() == QEvent::Hide && backdrop) backdrop->setVisible(false);
+        if (event->type() == QEvent::Move || event->type() == QEvent::Resize ||
+            event->type() == QEvent::Show || event->type() == QEvent::Hide) update();
+        return false;
+    }
+    void hideEvent(QHideEvent* event) override {
+        if (backdrop) backdrop->setVisible(false);
+        QSlider::hideEvent(event);
+    }
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton) { pick(event->position()); event->accept(); }
+        else event->ignore();
+    }
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (event->buttons() & Qt::LeftButton) { pick(event->position()); event->accept(); }
+        else event->ignore();
+    }
+    void paintEvent(QPaintEvent* event) override {
+        Q_UNUSED(event);
+        const QRect track = rect();
+        if (dirty || ramp.size() != track.size()) {
+            ramp = QImage(track.size(), QImage::Format_RGBA16FPx4);
+            ramp.setColorSpace(QColorSpace::SRgbLinear);
+            const QColor opaque(target.red(), target.green(), target.blue());
+            QImage swatch(1, 1, QImage::Format_ARGB32);
+            swatch.fill(opaque);
+            const auto linear = hyprcapture::ui::sdrToHdr(swatch).convertToFormat(QImage::Format_RGBA16FPx4);
+            const auto* rgb = reinterpret_cast<const qfloat16*>(linear.constBits());
+            for (int y = 0; y < ramp.height(); ++y) {
+                const float gain = 8.0F - 7.0F*y/std::max(1, ramp.height()-1);
+                auto* row = reinterpret_cast<qfloat16*>(ramp.scanLine(y));
+                for (int x = 0; x < ramp.width(); ++x) {
+                    for (int c = 0; c < 3; ++c) row[x*4+c] = qfloat16(float(rgb[c])*gain);
+                    row[x*4+3] = qfloat16(1.0F);
+                }
+            }
+            // Keep the position marker visible above the native HDR color ramp.
+            QPainter marker(&ramp);
+            const qreal y = std::clamp((maximum()-value()) * qreal(height()-1) / (maximum()-minimum()), 3.5, height()-4.5);
+            marker.setBrush(Qt::NoBrush);
+            marker.setPen(QPen(Qt::black, 3));
+            marker.drawRect(QRectF(1.5, y-2, width()-3, 4));
+            marker.setPen(QPen(Qt::white, 1));
+            marker.drawRect(QRectF(1.5, y-2, width()-3, 4));
+            marker.end();
+            dirty = false;
+            upload = true;
+        }
+        const QRect destination(mapTo(window(), track.topLeft()), track.size());
+        if (!backdrop && window()->windowHandle() && window()->windowHandle()->isExposed())
+            backdrop = std::make_unique<hyprcapture::ui::HdrBackdrop>(window()->windowHandle(), true);
+        if (backdrop) {
+            backdrop->setReadyCallback([this](bool ready) { nativeReady = ready; update(); });
+            if (upload) { nativeReady = backdrop->setImage(ramp, destination, 203) && backdrop->ready(); upload = false; }
+            backdrop->setGeometry(destination);
+            backdrop->setVisible(isVisible());
+        }
+        setProperty("hdrPreviewAvailable", nativeReady);
+        if (!nativeReady) {
+            QPainter painter(this);
+            painter.drawImage(track, hyprcapture::ui::hdrToSdr(ramp));
+        }
+    }
+private:
+    void pick(const QPointF& point) {
+        const qreal fraction = std::clamp(point.y()/std::max(1, height()-1), 0.0, 1.0);
+        setValue(qRound(maximum()-fraction*(maximum()-minimum())));
+    }
+    QColor target = Qt::white;
+    QImage ramp;
+    bool dirty = true, upload = true, nativeReady = false;
+    std::unique_ptr<hyprcapture::ui::HdrBackdrop> backdrop;
+};
+
+HdrGainSlider* addHdrGainSlider(QHBoxLayout* row, QWidget* parent, qreal gain, const char* name) {
+    auto* slider = new HdrGainSlider(parent);
+    slider->setObjectName(name);
+    slider->setFixedSize(20, 160);
+    slider->setRange(100, 800);
+    slider->setValue(qRound(gain * 100));
+    slider->setAccessibleName(AnnotationEditor::tr("HDR brightness gain"));
+    const auto updateValue = [slider](int percent) {
+        const QString value = QString::number(percent / 100.0, 'f', 2) + QStringLiteral("×");
+        slider->setToolTip(AnnotationEditor::tr("HDR brightness gain") + QStringLiteral(": ") + value);
+        slider->setAccessibleDescription(value);
+    };
+    updateValue(slider->value());
+    QObject::connect(slider, &QSlider::valueChanged, slider, updateValue);
+    row->addWidget(slider);
+    return slider;
+}
+
+class AnnotationTextInput final : public QPlainTextEdit {
+  public:
+    using QPlainTextEdit::QPlainTextEdit;
+    bool textAt(const QPointF& point) const {
+        for (auto block = firstVisibleBlock(); block.isValid(); block = block.next()) {
+            const QPointF origin = blockBoundingGeometry(block).translated(contentOffset()).topLeft();
+            if (origin.y() > viewport()->height()) break;
+            const auto* layout = block.layout();
+            if (!layout) continue;
+            const QPointF local = point - origin;
+            for (int i = 0; i < layout->lineCount(); ++i) {
+                const auto line = layout->lineAt(i);
+                if (!line.naturalTextRect().contains(local)) continue;
+                const int character = line.xToCursor(local.x(), QTextLine::CursorOnCharacter);
+                return character < block.text().size() && !block.text().at(character).isSpace();
+            }
+        }
+        return false;
+    }
+    std::function<void(bool)> finished;
+  protected:
+    bool event(QEvent* event) override {
+        if (event->type() == QEvent::ShortcutOverride) { event->accept(); return true; }
+        return QPlainTextEdit::event(event);
+    }
+    void keyPressEvent(QKeyEvent* event) override {
+        if (event->key() == Qt::Key_Escape) {
+            if (finished) finished(false);
+            event->accept();
+        } else if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
+                   event->modifiers().testFlag(Qt::ControlModifier)) {
+            if (finished) finished(true);
+            event->accept();
+        } else QPlainTextEdit::keyPressEvent(event);
+    }
+};
+
+class TextBoxFrame final : public QFrame {
+  public:
+    using QFrame::QFrame;
+    std::function<void(bool)> finished;
+    std::function<void()> geometryChanged;
+    void setTextInput(AnnotationTextInput* input) {
+        m_input = input;
+        input->viewport()->setMouseTracking(true);
+        input->viewport()->installEventFilter(this);
+    }
+  protected:
+    void moveEvent(QMoveEvent* event) override { QFrame::moveEvent(event); if (geometryChanged) geometryChanged(); }
+    void resizeEvent(QResizeEvent* event) override { QFrame::resizeEvent(event); if (geometryChanged) geometryChanged(); }
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress) {
+            auto* key = static_cast<QKeyEvent*>(event);
+            const bool cancel = key->key() == Qt::Key_Escape;
+            const bool accept = (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) && key->modifiers().testFlag(Qt::ControlModifier);
+            if (cancel || accept) {
+                if (event->type() == QEvent::KeyPress && finished) finished(accept);
+                event->accept(); return true;
+            }
+        }
+        if (!m_input || watched != m_input->viewport()) return QFrame::eventFilter(watched, event);
+        if (event->type() == QEvent::MouseButtonPress) {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            if (mouse->button() == Qt::LeftButton && !m_input->textAt(mouse->position())) {
+                m_input->setFocus(Qt::MouseFocusReason);
+                begin(mouse, 0); return true;
+            }
+        }
+        if (event->type() == QEvent::MouseMove) {
+            auto* mouse = static_cast<QMouseEvent*>(event);
+            if (m_active) { change(mouse); return true; }
+            if (!mouse->buttons()) m_input->viewport()->setCursor(m_input->textAt(mouse->position()) ? Qt::IBeamCursor : Qt::SizeAllCursor);
+        }
+        if (event->type() == QEvent::MouseButtonRelease && m_active) { m_active = false; return true; }
+        return false;
+    }
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton) begin(event, edgesAt(event->position()));
+        else QFrame::mousePressEvent(event);
+    }
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (m_active) { change(event); return; }
+        const int edges = edgesAt(event->position());
+        setCursor(edges == 5 || edges == 10 ? Qt::SizeFDiagCursor :
+                  edges == 6 || edges == 9 ? Qt::SizeBDiagCursor :
+                  edges & 3 ? Qt::SizeHorCursor : edges ? Qt::SizeVerCursor : Qt::SizeAllCursor);
+    }
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        if (m_active) { change(event); m_active = false; event->accept(); }
+        else QFrame::mouseReleaseEvent(event);
+    }
+    void paintEvent(QPaintEvent* event) override {
+        QFrame::paintEvent(event);
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(QPen(QColor("#69bfff"), 1));
+        painter.setBrush(Qt::white);
+        painter.setPen(QPen(QColor("#69bfff"), 3, Qt::SolidLine, Qt::RoundCap));
+        painter.setPen(QPen(QColor("#69bfff"), 1));
+        for (const QPointF point : {QPointF(3, 3), QPointF(width()-4, 3), QPointF(3, height()-4), QPointF(width()-4, height()-4)})
+            painter.drawRoundedRect(QRectF(point - QPointF(2, 2), QSizeF(4, 4)), 1, 1);
+        painter.setPen(QPen(QColor("#69bfff"), 3, Qt::SolidLine, Qt::RoundCap));
+        const qreal cx = (width()-1)/2.0, cy = (height()-1)/2.0;
+        painter.drawLine(QPointF(cx-18, 3), QPointF(cx+18, 3));
+        painter.drawLine(QPointF(cx-18, height()-4), QPointF(cx+18, height()-4));
+        painter.drawLine(QPointF(3, cy-18), QPointF(3, cy+18));
+        painter.drawLine(QPointF(width()-4, cy-18), QPointF(width()-4, cy+18));
+    }
+  private:
+    int edgesAt(QPointF p) const {
+        const int horizontal = p.x() <= 6 ? 1 : p.x() >= width()-7 ? 2 : 0;
+        const int vertical = p.y() <= 6 ? 4 : p.y() >= height()-7 ? 8 : 0;
+        if (horizontal && vertical) return horizontal | vertical;
+        const bool middleX = std::abs(p.x()-(width()-1)/2.0) <= 20;
+        const bool middleY = std::abs(p.y()-(height()-1)/2.0) <= 20;
+        return (middleY ? (p.x() <= 6 ? 1 : p.x() >= width()-7 ? 2 : 0) : 0) |
+               (middleX ? (p.y() <= 6 ? 4 : p.y() >= height()-7 ? 8 : 0) : 0);
+    }
+    void begin(QMouseEvent* event, int edges) {
+        m_active = true; m_edges = edges; m_start = geometry(); m_pointer = event->globalPosition(); event->accept();
+    }
+    void change(QMouseEvent* event) {
+        const QPoint delta = (event->globalPosition() - m_pointer).toPoint();
+        const QRect bounds = parentWidget()->rect().adjusted(8, 8, -8, -8);
+        QRect target = m_start;
+        if (!m_edges) {
+            target.moveTopLeft(m_start.topLeft() + delta);
+            target.moveLeft(std::clamp(target.left(), bounds.left(), std::max(bounds.left(), bounds.right()-target.width()+1)));
+            target.moveTop(std::clamp(target.top(), bounds.top(), std::max(bounds.top(), bounds.bottom()-target.height()+1)));
+        } else {
+            if (m_edges & 1) target.setLeft(std::clamp(m_start.left()+delta.x(), bounds.left(), m_start.right()-minimumWidth()+1));
+            if (m_edges & 2) target.setRight(std::clamp(m_start.right()+delta.x(), m_start.left()+minimumWidth()-1, bounds.right()));
+            if (m_edges & 4) target.setTop(std::clamp(m_start.top()+delta.y(), bounds.top(), m_start.bottom()-minimumHeight()+1));
+            if (m_edges & 8) target.setBottom(std::clamp(m_start.bottom()+delta.y(), m_start.top()+minimumHeight()-1, bounds.bottom()));
+        }
+        setGeometry(target); event->accept();
+    }
+    AnnotationTextInput* m_input = nullptr;
+    bool m_active = false;
+    int m_edges = 0;
+    QRect m_start;
+    QPointF m_pointer;
+};
+
+void drawMappedAnnotation(QPainter& p,const QImage& base,const Annotation& a,const std::optional<ScrollLayout>& layout,bool live) {
+    if(!layout || !a.scrollAnchored) { drawAnnotation(p,base,a); return; }
+    for(const auto& piece:annotationPieces(a,*layout,live)) {
+        if(piece.clip.isEmpty()) continue;
+        Annotation mapped=a;
+        for(auto& point:mapped.points) point.ry()+=piece.dy;
+        p.save(); p.setClipRect(piece.clip.translated(0,piece.dy),Qt::IntersectClip);
+        drawAnnotation(p,base,mapped); p.restore();
+    }
+}
+
+QRect annotationDamage(const Annotation& annotation, const QImage& base,
+                       const std::optional<ScrollLayout>& layout, bool spotlightHole = false) {
+    if (annotation.points.isEmpty()) return {};
+    if (annotation.tool == Tool::Spotlight && !spotlightHole) return base.rect();
+    QRectF bounds = annotationPath(annotation).boundingRect();
+    if (annotation.tool == Tool::Text && !annotation.textBox.isValid()) {
+        const QFontMetricsF metrics(annotation.textFont.pixelSize() > 0 ? annotation.textFont : annotationFont(annotation.width));
+        qreal y = annotation.points.front().y() + metrics.ascent();
+        for (const auto& line : annotation.text.split('\n')) {
+            bounds |= metrics.boundingRect(line).translated(annotation.points.front().x(), y);
+            y += metrics.lineSpacing();
+        }
+    }
+    // Include round caps, wide highlighters, arrow heads, glyph overhang and AA.
+    const qreal margin = annotation.width * 4 + 16;
+    bounds.adjust(-margin, -margin, margin, margin);
+    if (!layout || !annotation.scrollAnchored) return bounds.toAlignedRect().intersected(base.rect());
+    QRect damage;
+    for (const auto& piece : annotationPieces(annotation, *layout, false))
+        damage |= bounds.intersected(piece.clip).translated(0, piece.dy).toAlignedRect();
+    return damage.intersected(base.rect());
+}
+QRect changedInkDamage(const Annotation& before, const Annotation& after, const QImage& base,
+                       const std::optional<ScrollLayout>& layout) {
+    auto sameStyle=before; sameStyle.points=after.points;
+    const bool hole=before.tool==Tool::Spotlight && after.tool==Tool::Spotlight && sameStyle.sameInk(after);
+    // A moving Spotlight only changes its old/new holes, not the black mask
+    // outside them. Creation/removal/style/layout changes still invalidate all.
+    return annotationDamage(before,base,layout,hole) | annotationDamage(after,base,layout,hole);
+}
+
+struct PqPreviewCache {
+    std::mutex mutex;
+    qint64 hdrKey = 0, sdrKey = 0;
+    float reference = 0, peak = 0;
+    bool hdrEnabled = false;
+    QImage pq;
+    std::vector<Annotation> annotations;
+    std::optional<ScrollLayout> layout;
+};
+
+class AnnotationCanvas final : public QWidget {
+  public:
+    explicit AnnotationCanvas(QWidget* parent) : QWidget(parent) {
+        setObjectName("annotationCanvas");
+        setMouseTracking(true);
+        setAttribute(Qt::WA_AcceptTouchEvents);
+        setFocusPolicy(Qt::StrongFocus);
+        setAttribute(Qt::WA_TranslucentBackground);
+        setCursor(Qt::CrossCursor);
+    }
+
+    QImage base;
+    bool externalImagePresentation = false;
+    bool externalAnnotationPresentation = false;
+    bool hdrEnabled = false;
+    bool previewDirty = true;
+    std::shared_ptr<PqPreviewCache> pqPreviewCache = std::make_shared<PqPreviewCache>();
+    std::function<void()> previewChanged;
+    qint64 lastInputUs = 0;
+    void inputTiming() {
+        if (hyprcapture::ui::timingEnabled())
+            lastInputUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void update() { previewDirty = true; QWidget::update(); }
+    void updateInk(const Annotation& before, const Annotation& after) {
+        previewDirty = true;
+        if (!externalImagePresentation || externalAnnotationPresentation) { QWidget::update(); return; }
+        const QRect damage = changedInkDamage(before, after, base, scrollLayout);
+        QWidget::update(imageTransform().mapRect(QRectF(damage)).toAlignedRect().adjusted(-8,-8,8,8));
+    }
+    Tool tool = Tool::Rectangle;
+    Variant variant = Variant::Outline;
+    QColor color = QColor("#ff5252");
+    qreal strokeWidth = 4.0;
+    qreal hdrGain = 1.0;
+    std::function<void()> changed;
+    std::function<void()> viewChanged;
+    std::function<void(const QRect&)> captureRectChanged;
+    QRect resizeBounds;
+
+    bool scrollEnabled=false, liveScroll=false, annotationsReady=true;
+    qreal annotationOpacity=1,annotationOffset=0;
+    std::optional<ScrollLayout> scrollLayout;
+    std::optional<ScrollLayout> fadingLayout;
+    std::function<void(QPointF,double,int,bool,bool)> scrollRequested;
+    std::shared_ptr<const AnnotationSnapshot> snapshot() const {
+        return std::make_shared<AnnotationSnapshot>(AnnotationSnapshot{m_annotations,m_history,m_historyPosition,m_selected,base,m_displayRect,m_zoom,m_pan,m_fitToViewport});
+    }
+    void restore(const std::shared_ptr<const AnnotationSnapshot>& state) {
+        if(!state) return;
+        cancelGesture(); m_editingTextIndex=-1; base=state->base; m_annotations=state->annotations; m_history=state->history;
+        m_historyPosition=state->position; m_selected=state->selected; m_displayRect=state->display; m_zoom=state->zoom; m_pan=state->pan; m_fitToViewport=state->fitToViewport;
+        scrollLayout.reset(); fadingLayout.reset(); liveScroll=false; annotationsReady=true; annotationOpacity=1; annotationOffset=0; notify();
+    }
+    void scrollImage(const QImage& image,const ScrollLayout& layout,bool live) {
+        if(image.isNull()) return;
+        if(!scrollLayout) {
+            auto anchor=[&](Annotation& a) { a.scrollAnchored=true; a.documentY=0; a.anchorLayout=layout; };
+            for(auto& a:m_annotations) anchor(a);
+            for(auto& e:m_history) { anchor(e.before); anchor(e.after); for(auto& a:e.all) anchor(a); }
+        }
+        if(!scrollLayout || scrollLayout->viewportY!=layout.viewportY) cancelGesture();
+        if (fadingLayout && fadingLayout->frameSize != layout.frameSize)
+            fadingLayout = layout;
+        scrollLayout=layout; liveScroll=live; base=image; base.setDevicePixelRatio(1);
+        resizeBounds={}; notify();
+    }
+    QImage annotatedPreview(const QImage& preview,const ScrollLayout& layout) const {
+        if(preview.isNull()) return {};
+        if (hyprcapture::ui::isHdrImage(preview)) {
+            QImage result=preview.convertToFormat(QImage::Format_RGBA16FPx4_Premultiplied);
+            QPainter composite(&result);
+            for (auto a:m_annotations) {
+                QImage layer(preview.size(),QImage::Format_ARGB32_Premultiplied); layer.fill(Qt::transparent);
+                QPainter p(&layer); p.scale(qreal(layer.width())/layout.frameSize.width(),qreal(layer.height())/layout.outputHeight());
+                a.scrollAnchored=true; drawMappedAnnotation(p,base,a,layout,false); p.end();
+                composite.drawImage(QPoint{},hyprcapture::ui::sdrToHdr(layer,203.0F * (hdrEnabled && a.tool!=Tool::Mosaic ? a.hdrGain : 1.0)));
+            }
+            return result;
+        }
+        QImage result=preview.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        QPainter p(&result); p.scale(qreal(result.width())/layout.frameSize.width(),qreal(result.height())/layout.outputHeight());
+        for(auto a:m_annotations) {
+            a.scrollAnchored=true;
+            if(a.tool!=Tool::Mosaic) { drawMappedAnnotation(p,base,a,layout,false); continue; }
+            const qreal sx=qreal(result.width())/layout.frameSize.width(),sy=qreal(result.height())/layout.outputHeight();
+            for(const auto& piece:annotationPieces(a,layout,false)) {
+                auto scaled=a; for(auto& pt:scaled.points) pt=QPointF(pt.x()*sx,(pt.y()+piece.dy)*sy);
+                scaled.width*=sx;
+                p.save(); p.resetTransform(); p.setClipRect(QRectF(piece.clip.x()*sx,(piece.clip.y()+piece.dy)*sy,piece.clip.width()*sx,piece.clip.height()*sy));
+                drawAnnotation(p,preview,scaled); p.restore();
+            }
+        }
+        return result;
+    }
+    void presentation(bool ready,qreal opacity,qreal offset) {
+        if(!ready) {
+            if (annotationsReady)
+                fadingLayout = scrollLayout.value_or(ScrollLayout{base.rect(), base.size()});
+            cancelGesture();
+        } else {
+            fadingLayout.reset();
+        }
+        annotationsReady=ready; annotationOpacity=opacity; annotationOffset=offset; update();
+    }
+    void replaceCapture(const QImage& image, const QRect& target) {
+        if (base.isNull() || m_displayRect.isEmpty() || image.isNull()) return;
+        const QRect oldView = displayRect();
+        const QRect previous = m_displayRect;
+        const qreal sx = qreal(image.width()) / target.width();
+        const qreal sy = qreal(image.height()) / target.height();
+        const qreal ax = sx * previous.width() / base.width();
+        const qreal ay = sy * previous.height() / base.height();
+        const QPointF offset((previous.x() - target.x()) * sx, (previous.y() - target.y()) * sy);
+        const auto remap = [&](Annotation& item) {
+            for (auto& p : item.points) p = QPointF(p.x() * ax, p.y() * ay) + offset;
+            item.width *= std::sqrt(ax * ay);
+            if (item.textBox.isValid()) item.textBox = QSizeF(item.textBox.width() * ax, item.textBox.height() * ay);
+            if (item.textFont.pixelSize() > 0) item.textFont.setPixelSize(std::max(1, qRound(item.textFont.pixelSize() * ay)));
+            item.mosaicCache = {};
+            item.mosaicSource = 0;
+        };
+        for (auto& item : m_annotations) remap(item);
+        for (auto& edit : m_history) {
+            remap(edit.before); remap(edit.after);
+            for (auto& item : edit.all) remap(item);
+        }
+        // Keep the desktop-to-view transform stable, including a zoomed/panned view.
+        m_zoom = qreal(oldView.width()) / previous.width();
+        const QPointF desired = QPointF(oldView.topLeft()) + QPointF(target.topLeft() - previous.topLeft()) * m_zoom;
+        m_displayRect = target;
+        m_fitToViewport = false;
+        m_pan = desired - QRectF(target).center() + QPointF(target.width(), target.height()) * (m_zoom / 2);
+        base = image;
+        base.setDevicePixelRatio(1.0);
+        notify();
+        if (viewChanged) viewChanged();
+    }
+
+    std::function<void()> pressed;
+    std::function<void(const Annotation&, const QTransform&, std::function<void(std::optional<Annotation>, bool)>)> requestText;
+    std::function<void()> copy;
+    std::function<void()> save;
+    std::function<void()> pin;
+    std::function<void()> reselect;
+
+    void setImage(const QImage& image, bool preserve) {
+        const bool sameSize = image.size() == base.size();
+        if(!preserve) { scrollLayout.reset(); fadingLayout.reset(); liveScroll=false; annotationsReady=true; annotationOpacity=1; annotationOffset=0; }
+        base = image;
+        base.setDevicePixelRatio(1.0);
+        m_draft.reset();
+        m_dragBefore.reset();
+        if (!preserve || !sameSize) {
+            m_annotations.clear();
+            m_history.clear();
+            m_historyPosition = 0;
+            m_selected = -1;
+            fit();
+        }
+        notify();
+    }
+
+    QImage result() const {
+        if (base.isNull())
+            return {};
+        QImage output = base.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        if (output.isNull())
+            return {};
+        QPainter painter(&output);
+        for (const auto& annotation : m_annotations)
+            drawMappedAnnotation(painter, base, annotation,scrollLayout,false);
+        return output;
+    }
+
+    std::function<QImage()> rendererOn(const QImage& hdrBase, bool preview) const {
+        // Capture COW images and annotation values; workers never access widgets.
+        return [base = base, hdrBase, annotations = m_annotations, draft = m_draft,
+                editingTextIndex = m_editingTextIndex, scrollLayout = scrollLayout,
+                hdrEnabled = hdrEnabled, preview]() -> QImage {
+            if (!hyprcapture::ui::isHdrImage(hdrBase) || hdrBase.size() != base.size()) return {};
+            QImage output = hdrBase.convertToFormat(QImage::Format_RGBA16FPx4_Premultiplied);
+            if (output.isNull()) return {};
+            QImage layer(base.size(), QImage::Format_ARGB32_Premultiplied);
+            if (layer.isNull()) return {};
+            QPainter painter(&output);
+            const auto draw = [&](const Annotation& annotation) {
+                layer.fill(Qt::transparent);
+                {
+                    QPainter layerPainter(&layer);
+                    drawMappedAnnotation(layerPainter, base, annotation, scrollLayout, false);
+                }
+                const float gain = !hdrEnabled || annotation.tool == Tool::Mosaic ? 1.0F : static_cast<float>(annotation.hdrGain);
+                painter.drawImage(QPoint(0, 0), hyprcapture::ui::sdrToHdr(layer, 203.0F * gain));
+            };
+            for (int i = 0; i < static_cast<int>(annotations.size()); ++i)
+                if (!preview || i != editingTextIndex) draw(annotations[i]);
+            if (preview && draft) draw(*draft);
+            return output;
+        };
+    }
+    QImage resultOn(const QImage& hdrBase, bool preview = false) const {
+        return rendererOn(hdrBase, preview)();
+    }
+
+    bool needsHdrComposition() const {
+        const auto special = [this](const Annotation& a) {
+            // Spotlight is an alpha-only black mask; it never samples the base
+            // and its zero RGB stays zero at every gain. Mosaic uses SDR source
+            // samples; gains need linear HDR ink. Keep both on the exact path.
+            return a.tool == Tool::Mosaic || (hdrEnabled && a.tool != Tool::Spotlight && !qFuzzyCompare(a.hdrGain, 1.0));
+        };
+        for (int i=0; i<int(m_annotations.size()); ++i)
+            if (i!=m_editingTextIndex && special(m_annotations[i])) return true;
+        return m_draft && special(*m_draft);
+    }
+
+    std::function<QImage(float*, QRegion*)> pqRendererOn(const QImage& hdrBase, float reference, bool baseOnly = false) const {
+        std::vector<Annotation> annotations;
+        if (!baseOnly) {
+            annotations = m_annotations;
+            if (m_editingTextIndex >= 0 && m_editingTextIndex < int(annotations.size()))
+                annotations.erase(annotations.begin() + m_editingTextIndex);
+            if (m_draft) annotations.push_back(*m_draft);
+        }
+        return [cache = pqPreviewCache, base = base, hdrBase, annotations = std::move(annotations),
+                layout = scrollLayout, hdrEnabled = hdrEnabled, reference](float* peak, QRegion* changed) -> QImage {
+            if (!hyprcapture::ui::isHdrImage(hdrBase) || hdrBase.size() != base.size()) return {};
+            std::lock_guard lock(cache->mutex);
+            const bool reset = cache->hdrKey != hdrBase.cacheKey() || cache->reference != reference || cache->pq.isNull();
+            if (reset) {
+                hyprcapture::ui::ScopedUiTiming timing("hdr.preview.base_convert");
+                // Match the export renderer's FP16 premultiplication rounding,
+                // including straight-alpha FP16/FP32 callers.
+                cache->pq = hyprcapture::ui::hdrToPq10(
+                    hdrBase.convertToFormat(QImage::Format_RGBA16FPx4_Premultiplied), &cache->peak, reference);
+                if (cache->pq.isNull()) return {};
+                cache->hdrKey = hdrBase.cacheKey(); cache->reference = reference;
+                cache->annotations.clear(); cache->layout = layout;
+                cache->sdrKey = base.cacheKey(); cache->hdrEnabled = hdrEnabled;
+            }
+            QRect damage;
+            if (cache->layout != layout || cache->sdrKey != base.cacheKey() || cache->hdrEnabled != hdrEnabled) {
+                // Layout, mosaic source or gain mode changed: erase old ink too.
+                damage = base.rect();
+            } else {
+                for (size_t i = 0; i < std::max(annotations.size(), cache->annotations.size()); ++i) {
+                    if (i < annotations.size() && i < cache->annotations.size() &&
+                        annotations[i].sameInk(cache->annotations[i])) continue;
+                    if (i < annotations.size() && i < cache->annotations.size()) {
+                        damage |= changedInkDamage(cache->annotations[i], annotations[i], base, layout); continue;
+                    }
+                    if (i < annotations.size()) damage |= annotationDamage(annotations[i], base, layout);
+                    if (i < cache->annotations.size()) damage |= annotationDamage(cache->annotations[i], base, layout);
+                }
+            }
+            if (!damage.isEmpty()) {
+                QImage output;
+                {
+                    hyprcapture::ui::ScopedUiTiming timing("hdr.preview.render_damage");
+                    output = hdrBase.copy(damage).convertToFormat(QImage::Format_RGBA16FPx4_Premultiplied);
+                    if (output.isNull()) return {};
+                    QPainter painter(&output);
+                    for (const auto& annotation : annotations) {
+                        const QRect ink = annotationDamage(annotation, base, layout).intersected(damage);
+                        if (ink.isEmpty()) continue;
+                        QImage layer(ink.size(), QImage::Format_ARGB32_Premultiplied);
+                        if (layer.isNull()) return {};
+                        layer.fill(Qt::transparent);
+                        {
+                            QPainter layerPainter(&layer);
+                            layerPainter.translate(-ink.topLeft());
+                            drawMappedAnnotation(layerPainter, base, annotation, layout, false);
+                        }
+                        const float gain = !hdrEnabled || annotation.tool == Tool::Mosaic ? 1.0F : float(annotation.hdrGain);
+                        painter.drawImage(ink.topLeft() - damage.topLeft(), hyprcapture::ui::sdrToHdr(layer, 203.0F * gain));
+                    }
+                }
+                float patchPeak = 0;
+                QImage patch;
+                {
+                    hyprcapture::ui::ScopedUiTiming timing("hdr.preview.convert_damage");
+                    patch = hyprcapture::ui::hdrToPq10(output, &patchPeak, reference, damage.topLeft());
+                }
+                if (patch.isNull()) return {};
+                QPainter painter(&cache->pq);
+                painter.setCompositionMode(QPainter::CompositionMode_Source);
+                painter.drawImage(damage.topLeft(), patch);
+                // Conservative display metadata until the base is replaced;
+                // removing a bright annotation cannot understate the peak.
+                cache->peak = std::max(cache->peak, patchPeak);
+            }
+            cache->annotations = annotations; cache->layout = layout;
+            cache->sdrKey = base.cacheKey(); cache->hdrEnabled = hdrEnabled;
+            if (peak) *peak = cache->peak;
+            if (changed) *changed = reset ? QRegion(hdrBase.rect()) : QRegion(damage);
+            return cache->pq;
+        };
+    }
+
+    QRect displayRect() const { return imageTransform().mapRect(QRectF(base.rect())).toAlignedRect(); }
+    void setDisplayRect(const QRect& rect) {
+        if (m_displayRect == rect)
+            return;
+        m_displayRect = rect;
+        m_fitToViewport = false;
+        fit();
+    }
+    void fit() { m_zoom = 1.0; m_pan = {}; update(); if (viewChanged) viewChanged(); }
+    void fitViewport() { m_fitToViewport = true; fit(); }
+    void setViewportBottomInset(int inset) {
+        if (m_fitBottomInset == inset)
+            return;
+        m_fitBottomInset = inset;
+        if (m_fitToViewport || m_displayRect.isEmpty()) {
+            update();
+            if (viewChanged) viewChanged();
+        }
+    }
+    void finishEditing() { finishDraft(); }
+    bool canUndo() const { return m_historyPosition > 0; }
+    bool canRedo() const { return m_historyPosition < static_cast<int>(m_history.size()); }
+    bool hasAnnotations() const { return !m_annotations.empty(); }
+    void selectTool(Tool selectedTool) {
+        finishDraft();
+        tool = selectedTool;
+        m_selected = -1;
+        setCursor(tool == Tool::Select ? Qt::ArrowCursor : Qt::CrossCursor);
+        update();
+    }
+    void undo() {
+        cancelGesture();
+        if (!canUndo())
+            return;
+        const Edit& edit = m_history[--m_historyPosition];
+        switch (edit.kind) {
+            case Edit::Kind::Add: m_annotations.erase(m_annotations.begin() + edit.index); break;
+            case Edit::Kind::Remove: m_annotations.insert(m_annotations.begin() + edit.index, edit.before); break;
+            case Edit::Kind::Replace: m_annotations[edit.index] = edit.before; break;
+            case Edit::Kind::Clear: m_annotations = edit.all; break;
+        }
+        m_selected = -1;
+        notify();
+    }
+    void redo() {
+        cancelGesture();
+        if (!canRedo())
+            return;
+        const Edit& edit = m_history[m_historyPosition++];
+        switch (edit.kind) {
+            case Edit::Kind::Add: m_annotations.insert(m_annotations.begin() + edit.index, edit.after); break;
+            case Edit::Kind::Remove: m_annotations.erase(m_annotations.begin() + edit.index); break;
+            case Edit::Kind::Replace: m_annotations[edit.index] = edit.after; break;
+            case Edit::Kind::Clear: m_annotations.clear(); break;
+        }
+        m_selected = -1;
+        notify();
+    }
+    void clearAnnotations() {
+        cancelGesture();
+        if (!m_annotations.empty()) {
+            Edit edit;
+            edit.kind = Edit::Kind::Clear;
+            edit.all = m_annotations;
+            commit(std::move(edit));
+        }
+        m_selected = -1;
+        notify();
+    }
+
+  protected:
+    bool event(QEvent* event) override {
+        using Gesture=hyprcapture::ui::TouchGesture;
+        if(event->type()!=QEvent::TouchBegin && event->type()!=QEvent::TouchUpdate && event->type()!=QEvent::TouchEnd && event->type()!=QEvent::TouchCancel)
+            return QWidget::event(event);
+        auto* touch=static_cast<QTouchEvent*>(event);
+        if(touch->pointingDevice()->type()!=QInputDevice::DeviceType::TouchScreen) return QWidget::event(event);
+        if (m_touchDevice && m_touchDevice != touch->pointingDevice()) { event->accept(); return true; }
+        m_touchDevice = touch->pointingDevice();
+        QVector<Gesture::Point> points;
+        for(const auto& p:touch->points()) if(p.state()!=QEventPoint::State::Released) points.push_back({p.id(),p.position()});
+        if(event->type()==QEvent::TouchCancel) points.clear();
+        const auto updates=m_touch.update(points,event->type()==QEvent::TouchCancel,scrollLayout.has_value() && !liveScroll);
+        if (points.empty()) m_touchDevice = nullptr;
+        auto mouse=[&](QEvent::Type type,QPointF at) {
+            QMouseEvent e(type,at,mapToGlobal(at),Qt::LeftButton,type==QEvent::MouseButtonRelease?Qt::NoButton:Qt::LeftButton,Qt::NoModifier);
+            if(type==QEvent::MouseButtonPress) mousePressEvent(&e);
+            else if(type==QEvent::MouseButtonRelease) mouseReleaseEvent(&e); else mouseMoveEvent(&e);
+        };
+        for(const auto& u:updates) {
+            switch(u.action) {
+            case Gesture::Action::BeginStroke:
+                m_touchBefore=snapshot(); m_touchStart=u.position;
+                m_touchDeferred=tool==Tool::Text || tool==Tool::Number || (tool==Tool::Select && annotationAt(imagePoint(u.position))>=0 && m_annotations[annotationAt(imagePoint(u.position))].tool==Tool::Text);
+                if(!m_touchDeferred) mouse(QEvent::MouseButtonPress,u.position);
+                break;
+            case Gesture::Action::MoveStroke: if(!m_touchDeferred) mouse(QEvent::MouseMove,u.position); break;
+            case Gesture::Action::EndStroke:
+                if(m_touchDeferred) mouse(QEvent::MouseButtonPress,m_touchStart);
+                mouse(QEvent::MouseButtonRelease,u.position); m_touchBefore.reset(); break;
+            case Gesture::Action::CancelStroke:
+                cancelGesture();
+                if(m_touchBefore) {
+                    m_annotations=m_touchBefore->annotations; m_history=m_touchBefore->history; m_historyPosition=m_touchBefore->position; m_selected=m_touchBefore->selected;
+                    if(m_resizeEdges && captureRectChanged) captureRectChanged(m_touchBefore->display);
+                }
+                m_resizeEdges=0; m_touchBefore.reset(); notify(); break;
+            case Gesture::Action::Scroll:
+                if(scrollEnabled && scrollRequested) scrollRequested(mapToGlobal(u.position),u.delta,0,true,false);
+                else if(scrollLayout && !liveScroll) { m_pan+=u.movement; update(); if(viewChanged) viewChanged(); }
+                break;
+            case Gesture::Action::EndScroll:
+                if(scrollEnabled && scrollRequested) scrollRequested(mapToGlobal(u.position),0,0,true,false);
+                break;
+            default: break;
+            }
+        }
+        event->accept(); return true;
+    }
+
+    void paintEvent(QPaintEvent*) override {
+        hyprcapture::ui::ScopedUiTiming timing(externalAnnotationPresentation ? "editor.canvas_paint.composited" : "editor.canvas_paint.layered");
+        if (externalImagePresentation && !externalAnnotationPresentation)
+            hyprcapture::ui::HdrBackdrop::traceParentFrame(window()->windowHandle());
+        if (const auto input = std::exchange(lastInputUs, 0); input && hyprcapture::ui::timingEnabled())
+            hyprcapture::ui::traceTiming("editor.input_dispatch_to_paint", -1,
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()-input);
+        if (previewDirty) {
+            previewDirty = false;
+            if (previewChanged) previewChanged();
+        }
+        if (base.isNull())
+            return;
+        QPainter painter(this);
+        const QTransform transform = imageTransform();
+        const QRectF rect = transform.mapRect(QRectF(base.rect()));
+        painter.save();
+        painter.setClipRect(rect);
+        // Checkerboard is only a display aid; result() never paints it.
+        constexpr int check = 12;
+        const QRect visible = rect.toAlignedRect().intersected(this->rect());
+        const int startX = visible.left() - (visible.left() % check);
+        const int startY = visible.top() - (visible.top() % check);
+        if(!liveScroll && !externalImagePresentation) for (int y = startY; y <= visible.bottom(); y += check)
+            for (int x = startX; x <= visible.right(); x += check)
+                painter.fillRect(QRect(x, y, check, check), ((x / check + y / check) & 1) ? QColor(72, 77, 86) : QColor(94, 100, 111));
+        painter.setTransform(transform);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform);
+        if(!liveScroll && !externalImagePresentation) painter.drawImage(QPoint(0, 0), base);
+        painter.setOpacity(annotationOpacity);
+        painter.translate(0,annotationOffset / transform.m22());
+        // Registration keeps advancing while the ink fades. Keep its last
+        // visible placement fixed until it is hidden, then reveal the new one.
+        const auto& displayLayout = fadingLayout ? fadingLayout : scrollLayout;
+        for (int i = 0; i < static_cast<int>(m_annotations.size()); ++i)
+            if (!externalAnnotationPresentation && i != m_editingTextIndex) drawMappedAnnotation(painter, base, m_annotations[i],displayLayout,liveScroll);
+        if (m_draft && !externalAnnotationPresentation)
+            drawMappedAnnotation(painter, base, *m_draft,displayLayout,liveScroll);
+        if (m_selected >= 0 && m_selected != m_editingTextIndex && m_selected < static_cast<int>(m_annotations.size())) {
+            QPainterPath selectedPath;
+            const auto& selected=m_annotations[m_selected];
+            if(displayLayout && selected.scrollAnchored) {
+                for(const auto& piece:annotationPieces(selected,*displayLayout,liveScroll)) {
+                    QPainterPath clip; clip.addRect(piece.clip);
+                    selectedPath.addPath(QTransform::fromTranslate(0,piece.dy).map(annotationPath(selected).intersected(clip)));
+                }
+            } else selectedPath=annotationPath(selected);
+            const QRectF selectedBounds=selectedPath.boundingRect();
+            painter.setPen(QPen(QColor("#69bfff"), 1.5 / transform.m11(), Qt::DashLine));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawRect(selectedBounds.adjusted(-5.0 / transform.m11(), -5.0 / transform.m11(), 5.0 / transform.m11(), 5.0 / transform.m11()));
+        }
+        painter.restore();
+        if (!resizeBounds.isEmpty()) {
+            const QRectF frame = QRectF(displayRect()).adjusted(0.5, 0.5, -0.5, -0.5);
+            painter.setPen(QPen(QColor("#69bfff"), 1));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawRect(frame);
+            painter.setBrush(QColor("#ffffff"));
+            for (const QPointF p : {frame.topLeft(), frame.topRight(), frame.bottomLeft(), frame.bottomRight(),
+                 QPointF(frame.center().x(), frame.top()), QPointF(frame.center().x(), frame.bottom()),
+                 QPointF(frame.left(), frame.center().y()), QPointF(frame.right(), frame.center().y())})
+                painter.drawRoundedRect(QRectF(p - QPointF(3, 3), QSizeF(6, 6)), 1.5, 1.5);
+        }
+    }
+
+    void mousePressEvent(QMouseEvent* event) override {
+        inputTiming();
+        if(liveScroll && !annotationsReady) { event->accept(); return; }
+        if (pressed) pressed();
+        if (event->button() == Qt::LeftButton && !m_spaceDown && (m_resizeEdges = resizeEdgesAt(event->position()))) {
+            finishEditing();
+            m_resizeStart = m_displayRect;
+            m_resizeView = displayRect();
+            m_resizePointer = event->position();
+            event->accept();
+            return;
+        }
+        if (base.isNull() || !displayRect().contains(event->position().toPoint())) {
+            event->ignore();
+            return;
+        }
+        if (event->button() == Qt::MiddleButton || (event->button() == Qt::LeftButton && m_spaceDown)) {
+            m_panning = true;
+            m_pointerOrigin = event->position();
+            m_panBefore = m_pan;
+            setCursor(Qt::ClosedHandCursor);
+            event->accept();
+            return;
+        }
+        if (event->button() != Qt::LeftButton) {
+            event->ignore();
+            return;
+        }
+        setFocus(Qt::MouseFocusReason);
+        const QPointF point = imagePoint(event->position());
+        if ((tool == Tool::Select || tool == Tool::Text) && editTextAt(point)) {
+            event->accept();
+            return;
+        }
+        if (tool == Tool::Select) {
+            m_selected = annotationAt(point);
+            if (m_selected >= 0) {
+                m_dragBefore = m_annotations[m_selected];
+                m_pointerOrigin = point;
+            }
+            update();
+            event->accept();
+            return;
+        }
+        Annotation annotation;
+        annotation.scrollAnchored=scrollLayout.has_value() && liveScroll;
+        annotation.documentY=scrollLayout?scrollLayout->viewportY:0;
+        annotation.anchorLayout=scrollLayout;
+        annotation.tool = tool;
+        annotation.variant = variant;
+        annotation.color = color;
+        annotation.hdrGain = hdrEnabled ? hdrGain : 1.0;
+        annotation.width = strokeWidth;
+        annotation.points.push_back(point);
+        if (tool == Tool::Text) {
+            annotation.textFont = annotationFont(strokeWidth);
+            if (requestText) requestText(annotation, imageTransform(), [this, index = -1](std::optional<Annotation> text, bool final) mutable {
+                if (!text) return;
+                if (index < 0 && !text->text.trimmed().isEmpty()) {
+                    index = static_cast<int>(m_annotations.size());
+                    m_annotations.push_back(*text);
+                    m_editingTextIndex = index;
+                } else if (index >= 0 && index < static_cast<int>(m_annotations.size())) m_annotations[index] = *text;
+                if (final) {
+                    m_editingTextIndex = -1;
+                    if (index >= 0 && index < static_cast<int>(m_annotations.size())) {
+                        m_annotations.erase(m_annotations.begin() + index);
+                        if (!text->text.trimmed().isEmpty()) commit({Edit::Kind::Add, index, {}, *text});
+                    }
+                }
+                notify();
+            });
+            event->accept();
+            return;
+        }
+        if (tool == Tool::Number) {
+            for (const auto& item : m_annotations)
+                if (item.tool == Tool::Number)
+                    annotation.number = std::max(annotation.number, item.number + 1);
+            add(annotation);
+            event->accept();
+            return;
+        }
+        if (tool != Tool::Pen && tool != Tool::Highlighter)
+            annotation.points.push_back(point);
+        m_draft = std::move(annotation);
+        updateInk({}, *m_draft);
+        event->accept();
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override {
+        inputTiming();
+        if (m_resizeEdges) {
+            updateResize(event->position());
+            event->accept();
+            return;
+        }
+        if (!m_panning && !m_draft && !m_dragBefore) {
+            const int edges = resizeEdgesAt(event->position());
+            if (edges) { setCursor(resizeCursor(edges)); event->accept(); return; }
+            setCursor(m_spaceDown ? Qt::OpenHandCursor : tool == Tool::Select ? Qt::ArrowCursor : Qt::CrossCursor);
+        }
+        if (m_panning) {
+            m_pan = m_panBefore + event->position() - m_pointerOrigin;
+            update();
+            if (viewChanged) viewChanged();
+            event->accept();
+            return;
+        }
+        const QPointF point = imagePoint(event->position());
+        if (m_dragBefore && m_selected >= 0) {
+            const auto previous = m_annotations[m_selected];
+            m_annotations[m_selected] = *m_dragBefore;
+            for (auto& item : m_annotations[m_selected].points)
+                item += point - m_pointerOrigin;
+            updateInk(previous, m_annotations[m_selected]);
+            event->accept();
+            return;
+        }
+        if (m_draft) {
+            const auto previous = *m_draft;
+            if (m_draft->tool == Tool::Pen || m_draft->tool == Tool::Highlighter) {
+                if (QLineF(m_draft->points.back(), point).length() >= 0.7 && m_draft->points.size() < 20000)
+                    m_draft->points.push_back(point);
+            } else
+                m_draft->points.back() = point;
+            updateInk(previous, *m_draft);
+            event->accept();
+            return;
+        }
+        if (tool == Tool::Select && displayRect().contains(event->position().toPoint()))
+            setCursor(annotationAt(point) >= 0 ? Qt::SizeAllCursor : Qt::ArrowCursor);
+        event->ignore();
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        inputTiming();
+        if (m_resizeEdges && event->button() == Qt::LeftButton) {
+            updateResize(event->position());
+            m_resizeEdges = 0;
+            event->accept();
+            return;
+        }
+        if (m_panning) {
+            m_panning = false;
+            setCursor(m_spaceDown ? Qt::OpenHandCursor : tool == Tool::Select ? Qt::ArrowCursor : Qt::CrossCursor);
+            event->accept();
+            return;
+        }
+        if (event->button() != Qt::LeftButton) {
+            event->ignore();
+            return;
+        }
+        if (m_dragBefore && m_selected >= 0) {
+            const Annotation after = m_annotations[m_selected];
+            const Annotation before = *m_dragBefore;
+            m_dragBefore.reset();
+            if (after.points != before.points)
+                commit({Edit::Kind::Replace, m_selected, before, after});
+            notify();
+            event->accept();
+            return;
+        }
+        if (m_draft) {
+            finishDraft();
+            event->accept();
+            return;
+        }
+        event->ignore();
+    }
+
+    bool editTextAt(const QPointF& point) {
+        const int index = annotationAt(point);
+        if (index < 0 || m_annotations[index].tool != Tool::Text || !requestText) return false;
+        const Annotation before = m_annotations[index];
+        m_dragBefore.reset();
+        m_editingTextIndex = index;
+        update();
+        int dy=0;
+        if(scrollLayout && before.scrollAnchored) for(const auto& piece:annotationPieces(before,*scrollLayout,liveScroll))
+            if(piece.clip.translated(0,piece.dy).contains(point)) { dy=piece.dy; break; }
+        Annotation visible=before; for(auto& p:visible.points) p.ry()+=dy;
+        requestText(visible, imageTransform(), [this, before, index,dy](std::optional<Annotation> text, bool final) {
+            if (text && index < static_cast<int>(m_annotations.size())) {
+                for(auto& p:text->points) p.ry()-=dy;
+                m_annotations[index] = *text;
+                if (final) {
+                    if (text->text.trimmed().isEmpty()) commit({Edit::Kind::Remove, index, before, {}});
+                    else commit({Edit::Kind::Replace, index, before, *text});
+                }
+            }
+            if (final) m_editingTextIndex = -1;
+            notify();
+        });
+        return true;
+    }
+
+    void mouseDoubleClickEvent(QMouseEvent* event) override {
+        if ((tool == Tool::Select || tool == Tool::Text) && event->button() == Qt::LeftButton &&
+            editTextAt(imagePoint(event->position()))) event->accept();
+        else event->ignore();
+    }
+
+    void wheelEvent(QWheelEvent* event) override {
+        if (base.isNull() || !displayRect().contains(event->position().toPoint())) {
+            event->ignore();
+            return;
+        }
+        if(!(event->modifiers() & Qt::ControlModifier)) {
+            if(m_draft || m_dragBefore || m_resizeEdges || m_panning) { event->accept(); return; }
+            if(scrollEnabled && scrollRequested) {
+                const double delta=event->pixelDelta().isNull() ? -event->angleDelta().y()/8.0 : -event->pixelDelta().y();
+                scrollRequested(event->globalPosition(),delta,-event->angleDelta().y(),!event->pixelDelta().isNull(),event->inverted());
+            } else if(scrollLayout && !liveScroll) {
+                m_pan.ry()+=event->pixelDelta().isNull()?event->angleDelta().y()/2.0:event->pixelDelta().y(); update();
+            }
+            event->accept(); return;
+        }
+        const QPointF anchor = imageTransform().inverted().map(event->position());
+        m_zoom = std::clamp(m_zoom * std::pow(1.0015, event->angleDelta().y()), 0.2, 12.0);
+        const QPointF mapped = imageTransform().map(anchor);
+        m_pan += event->position() - mapped;
+        update();
+        if (viewChanged) viewChanged();
+        event->accept();
+    }
+
+    void keyPressEvent(QKeyEvent* event) override {
+        if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
+            m_spaceDown = true;
+            setCursor(Qt::OpenHandCursor);
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace) {
+            if (m_selected >= 0) {
+                commit({Edit::Kind::Remove, m_selected, m_annotations[m_selected], {}});
+                m_selected = -1;
+                notify();
+            }
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Escape && (m_draft || m_dragBefore || m_selected >= 0)) {
+            cancelGesture();
+            m_selected = -1;
+            update();
+            event->accept();
+            return;
+        }
+        QWidget::keyPressEvent(event);
+    }
+
+    void keyReleaseEvent(QKeyEvent* event) override {
+        if (event->key() == Qt::Key_Space) {
+            m_spaceDown = false;
+            if (!m_panning)
+                setCursor(tool == Tool::Select ? Qt::ArrowCursor : Qt::CrossCursor);
+            event->accept();
+            return;
+        }
+        QWidget::keyReleaseEvent(event);
+    }
+
+    void focusOutEvent(QFocusEvent* event) override {
+        m_spaceDown = false;
+        m_panning = false;
+        QWidget::focusOutEvent(event);
+    }
+
+  private:
+    hyprcapture::ui::TouchGesture m_touch;
+    const QPointingDevice* m_touchDevice = nullptr;
+    std::shared_ptr<const AnnotationSnapshot> m_touchBefore;
+    QPointF m_touchStart;
+    bool m_touchDeferred=false;
+    int m_resizeEdges = 0;
+    QRect m_resizeStart;
+    QRect m_resizeView;
+    QPointF m_resizePointer;
+    int resizeEdgesAt(QPointF point) const {
+        if (resizeBounds.isEmpty() || base.isNull()) return 0;
+        const QRectF r(displayRect());
+        if (!r.adjusted(-6, -6, 6, 6).contains(point)) return 0;
+        int edges = 0;
+        if (std::abs(point.x() - r.left()) <= 6) edges |= 1;
+        else if (std::abs(point.x() - r.right()) <= 6) edges |= 2;
+        if (std::abs(point.y() - r.top()) <= 6) edges |= 4;
+        else if (std::abs(point.y() - r.bottom()) <= 6) edges |= 8;
+        return edges;
+    }
+    static Qt::CursorShape resizeCursor(int edges) {
+        if (edges == 5 || edges == 10) return Qt::SizeFDiagCursor;
+        if (edges == 6 || edges == 9) return Qt::SizeBDiagCursor;
+        return edges & 3 ? Qt::SizeHorCursor : Qt::SizeVerCursor;
+    }
+    void updateResize(QPointF pointer) {
+        const QPointF delta = pointer - m_resizePointer;
+        const int dx = qRound(delta.x() * m_resizeStart.width() / m_resizeView.width());
+        const int dy = qRound(delta.y() * m_resizeStart.height() / m_resizeView.height());
+        QRect target = m_resizeStart;
+        if (m_resizeEdges & 1) target.setLeft(std::clamp(target.left() + dx, resizeBounds.left(), target.right() - 1));
+        if (m_resizeEdges & 2) target.setRight(std::clamp(target.right() + dx, target.left() + 1, resizeBounds.right()));
+        if (m_resizeEdges & 4) target.setTop(std::clamp(target.top() + dy, resizeBounds.top(), target.bottom() - 1));
+        if (m_resizeEdges & 8) target.setBottom(std::clamp(target.bottom() + dy, target.top() + 1, resizeBounds.bottom()));
+        if (target != m_displayRect && captureRectChanged) captureRectChanged(target);
+    }
+    std::vector<Annotation> m_annotations;
+    std::vector<Edit> m_history;
+    int m_historyPosition = 0;
+    int m_selected = -1;
+    int m_editingTextIndex = -1;
+    std::optional<Annotation> m_draft;
+    std::optional<Annotation> m_dragBefore;
+    QPointF m_pointerOrigin;
+    QPointF m_panBefore;
+    QPointF m_pan;
+    QRect m_displayRect;
+    qreal m_zoom = 1.0;
+    int m_fitBottomInset = 74;
+    bool m_fitToViewport = false;
+    bool m_spaceDown = false;
+    bool m_panning = false;
+
+    QTransform imageTransform() const {
+        if (base.isNull())
+            return {};
+        const QRectF viewport = m_fitToViewport || m_displayRect.isEmpty() ? QRectF(rect().adjusted(12, 12, -12, -m_fitBottomInset)) : QRectF(m_displayRect);
+        const qreal scale = std::max(0.001, std::min(viewport.width() / base.width(), viewport.height() / base.height())) * m_zoom;
+        const QPointF offset = viewport.center() - QPointF(base.width(), base.height()) * (scale / 2.0) + m_pan;
+        QTransform transform;
+        transform.translate(offset.x(), offset.y());
+        transform.scale(scale, scale);
+        return transform;
+    }
+    QPointF imagePoint(const QPointF& point) const {
+        const QPointF mapped = imageTransform().inverted().map(point);
+        return {std::clamp(mapped.x(), 0.0, static_cast<qreal>(std::max(0, base.width() - 1))), std::clamp(mapped.y(), 0.0, static_cast<qreal>(std::max(0, base.height() - 1)))};
+    }
+    int annotationAt(const QPointF& point) const {
+        const qreal tolerance = 7.0 / imageTransform().m11();
+        for (int index = static_cast<int>(m_annotations.size()) - 1; index >= 0; --index) {
+            const auto& annotation = m_annotations[index];
+            QPainterPath path;
+            if(scrollLayout && annotation.scrollAnchored) {
+                for(const auto& piece:annotationPieces(annotation,*scrollLayout,liveScroll)) {
+                    QPainterPath clip; clip.addRect(piece.clip);
+                    path.addPath(QTransform::fromTranslate(0,piece.dy).map(annotationPath(annotation).intersected(clip)));
+                }
+            } else path=annotationPath(annotation);
+            QPainterPathStroker stroker;
+            stroker.setWidth(std::max(annotation.width, tolerance * 2.0));
+            const bool filled = annotation.tool == Tool::Text || annotation.tool == Tool::Number || annotation.tool == Tool::Mosaic || annotation.tool == Tool::Spotlight || annotation.variant == Variant::Filled || annotation.variant == Variant::RoundedFilled;
+            if ((filled && path.contains(point)) || stroker.createStroke(path).contains(point))
+                return index;
+        }
+        return -1;
+    }
+    void commit(Edit edit) {
+        m_history.resize(m_historyPosition);
+        switch (edit.kind) {
+            case Edit::Kind::Add: m_annotations.insert(m_annotations.begin() + edit.index, edit.after); break;
+            case Edit::Kind::Remove: m_annotations.erase(m_annotations.begin() + edit.index); break;
+            case Edit::Kind::Replace: m_annotations[edit.index] = edit.after; break;
+            case Edit::Kind::Clear: m_annotations.clear(); break;
+        }
+        m_history.push_back(std::move(edit));
+        ++m_historyPosition;
+        // A bounded action log avoids unbounded memory after long drawing sessions.
+        if (m_history.size() > 1000) {
+            m_history.erase(m_history.begin());
+            --m_historyPosition;
+        }
+    }
+    void add(const Annotation& annotation) {
+        commit({Edit::Kind::Add, static_cast<int>(m_annotations.size()), {}, annotation});
+        notify();
+    }
+    void finishDraft() {
+        if (!m_draft)
+            return;
+        const Annotation annotation = *m_draft;
+        m_draft.reset();
+        if (annotation.tool == Tool::Pen || annotation.tool == Tool::Highlighter || pointBounds(annotation).width() > 1.0 || pointBounds(annotation).height() > 1.0)
+            add(annotation);
+        else
+            update();
+    }
+    void cancelGesture() {
+        m_draft.reset();
+        if (m_dragBefore && m_selected >= 0)
+            m_annotations[m_selected] = *m_dragBefore;
+        m_dragBefore.reset();
+        m_panning = false;
+    }
+    void notify() { update(); if (changed) changed(); }
+};
+
+// Official Material Symbols Rounded, rendered directly from SVG at device DPI.
+QIcon toolIcon(Tool tool, Variant variant, bool dark, const QColor&) {
+    const QColor ink(dark ? hyprcapture::ui::theme::text : "#26313d");
+    const bool filled = variant == Variant::Filled || variant == Variant::RoundedFilled;
+    const char* name = "arrow_selector_tool";
+    qreal rotation = 0;
+    switch (tool) {
+        case Tool::Select: break;
+        case Tool::Rectangle:
+            name = filled ? "rectangle_fill1" : (variant == Variant::Rounded ? "rounded_corner" : "crop_square");
+            break;
+        case Tool::Ellipse: name = filled ? "circle_fill1" : "circle"; break;
+        case Tool::Arrow:
+            name = variant == Variant::Curved ? "trending_up" :
+                   variant == Variant::DoubleHeaded ? "open_in_full" :
+                   variant == Variant::DoubleCurved ? "swap_calls" : "north_east";
+            break;
+        case Tool::Line: name = "horizontal_rule"; rotation = -45; break;
+        case Tool::Pen: name = "edit"; break;
+        case Tool::Highlighter: name = "ink_highlighter"; break;
+        case Tool::Text: name = "text_fields"; break;
+        case Tool::Number: name = "counter_1"; break;
+        case Tool::Mosaic: name = "blur_on"; break;
+        case Tool::Spotlight: name = "center_focus_strong"; break;
+    }
+    return hyprcapture::ui::materialIcon(name, ink, rotation);
+}
+
+QIcon actionIcon(const QString& action, bool dark, const QColor&) {
+    const QColor ink(dark ? hyprcapture::ui::theme::text : "#26313d");
+    static const std::map<QString, std::string_view> names{
+        {"color", "palette"}, {"undo", "undo"}, {"redo", "redo"},
+        {"save", "save"}, {"pin", "push_pin"}, {"confirm", "check"}, {"cancel", "close"},
+        {"light", "light_mode"}, {"dark", "dark_mode"}, {"fit", "fit_screen"},
+        {"clear", "delete"}, {"reselect", "restart_alt"}, {"more", "more_horiz"}};
+    const auto found = names.find(action);
+    return hyprcapture::ui::materialIcon(found == names.end() ? "more_horiz" : found->second,
+                                        ink);
+}
+
+void paintStripButton(QWidget* widget, const QString& hint, const QIcon& icon, bool dark, bool checked, bool hover, bool focus) {
+    QPainter painter(widget);
+    painter.setRenderHint(QPainter::Antialiasing);
+    const QRectF highlight = QRectF(widget->rect()).adjusted(2, 3, -2, -3);
+    if (checked || hover)
+        painter.fillPath([&] { QPainterPath path; path.addRoundedRect(highlight, 5, 5); return path; }(), QColor(checked ? (dark ? hyprcapture::ui::theme::selected : "#dcecff") : (dark ? hyprcapture::ui::theme::surface : "#edf3f9")));
+    if (focus) {
+        painter.setPen(QPen(QColor(dark ? hyprcapture::ui::theme::green : "#6291bd"), 1, Qt::DotLine));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawRoundedRect(highlight, 5, 5);
+    }
+    if (!widget->isEnabled())
+        painter.setOpacity(0.38);
+    const int labelWidth = hint.isEmpty() ? 0 : 25;
+    const int contentWidth = labelWidth + (labelWidth ? 2 : 0) + 22;
+    const int left = (widget->width() - contentWidth) / 2;
+    if (labelWidth) {
+        QFont font = QApplication::font();
+        font.setPixelSize(14);
+        painter.setFont(font);
+        painter.setPen(QColor(dark ? hyprcapture::ui::theme::text : "#26313d"));
+        painter.drawText(QRect(left, (widget->height() - 20) / 2, labelWidth, 20), Qt::AlignCenter, hint + ":");
+    }
+    icon.paint(&painter, QRect(left + labelWidth + (labelWidth ? 2 : 0), (widget->height() - 22) / 2, 22, 22), Qt::AlignCenter, QIcon::Normal);
+    if (widget->property("annotationAccent").isValid()) {
+        const QRectF swatch(left + labelWidth + (labelWidth ? 2 : 0) + 2, widget->height() - 5, 18, 3);
+        painter.setPen(QPen(QColor(dark ? hyprcapture::ui::theme::muted : "#aab8c6"), 0.5));
+        painter.setBrush(widget->property("annotationAccent").value<QColor>());
+        painter.drawRoundedRect(swatch, 1.5, 1.5);
+    }
+}
+
+class StripToolButton final : public QToolButton {
+  public:
+    StripToolButton(QString hint, QWidget* parent) : QToolButton(parent), hint(std::move(hint)) {
+        setAttribute(Qt::WA_Hover);
+        setCursor(Qt::ArrowCursor);
+        setFixedSize(this->hint.isEmpty() ? 36 : 64, 36);
+    }
+    QString hint;
+    bool dark = true;
+  protected:
+    void paintEvent(QPaintEvent*) override { paintStripButton(this, hint, icon(), dark, isChecked(), underMouse(), hasFocus()); }
+};
+
+class StripActionButton final : public QPushButton {
+  public:
+    StripActionButton(QString hint, QWidget* parent) : QPushButton(parent), hint(std::move(hint)) {
+        setAttribute(Qt::WA_Hover);
+        setCursor(Qt::ArrowCursor);
+        setFixedSize(this->hint.isEmpty() ? 36 : 64, 36);
+    }
+    QString hint;
+    bool dark = true;
+  protected:
+    void paintEvent(QPaintEvent*) override { paintStripButton(this, hint, icon(), dark, isChecked(), underMouse(), hasFocus()); }
+};
+
+// These frames absorb clicks on panel padding so they cannot start a new capture
+// through the transparent overlay below them.
+class ToolbarFrame final : public QFrame {
+  public:
+    explicit ToolbarFrame(QWidget* parent) : QFrame(parent) { setAttribute(Qt::WA_StyledBackground); setCursor(Qt::ArrowCursor); }
+  protected:
+    void mousePressEvent(QMouseEvent* event) override { event->accept(); }
+    void mouseReleaseEvent(QMouseEvent* event) override { event->accept(); }
+};
+
+class ColorField final : public QWidget {
+  public:
+    ColorField(bool hueField, QWidget* parent) : QWidget(parent), m_hueField(hueField) {
+        setFixedSize(hueField ? QSize(20, 160) : QSize(208, 160));
+        setCursor(Qt::CrossCursor);
+    }
+    std::function<void(const QColor&)> colorPicked;
+    void setColor(const QColor& color) {
+        if (color.hsvHueF() >= 0)
+            m_hue = color.hsvHueF();
+        m_saturation = color.hsvSaturationF();
+        m_value = color.valueF();
+        update();
+    }
+  protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        if (m_hueField) {
+            QLinearGradient hue(0, 0, 0, height());
+            for (int step = 0; step <= 6; ++step)
+                hue.setColorAt(step / 6.0, QColor::fromHsvF(step == 6 ? 0.0 : step / 6.0, 1, 1));
+            painter.fillRect(rect(), hue);
+            const qreal y = std::clamp(m_hue * (height() - 1), 3.5, height() - 4.5);
+            painter.setPen(QPen(Qt::black, 3));
+            painter.drawRect(QRectF(1.5, y - 2, width() - 3, 4));
+            painter.setPen(QPen(Qt::white, 1));
+            painter.drawRect(QRectF(1.5, y - 2, width() - 3, 4));
+        } else {
+            painter.fillRect(rect(), QColor::fromHsvF(m_hue, 1, 1));
+            QLinearGradient saturation(0, 0, width(), 0);
+            saturation.setColorAt(0, Qt::white);
+            saturation.setColorAt(1, QColor(255, 255, 255, 0));
+            painter.fillRect(rect(), saturation);
+            QLinearGradient value(0, 0, 0, height());
+            value.setColorAt(0, QColor(0, 0, 0, 0));
+            value.setColorAt(1, Qt::black);
+            painter.fillRect(rect(), value);
+            painter.setRenderHint(QPainter::Antialiasing);
+            const QPointF point(std::clamp(m_saturation * (width() - 1), 7.5, width() - 8.5),
+                                std::clamp((1.0 - m_value) * (height() - 1), 7.5, height() - 8.5));
+            painter.setBrush(Qt::NoBrush);
+            painter.setPen(QPen(QColor("#26313d"), 3));
+            painter.drawEllipse(point, 6, 6);
+            painter.setPen(QPen(Qt::white, 1.5));
+            painter.drawEllipse(point, 6, 6);
+        }
+    }
+    void mousePressEvent(QMouseEvent* event) override { if (event->button() == Qt::LeftButton) pick(event->position()); else event->ignore(); }
+    void mouseMoveEvent(QMouseEvent* event) override { if (event->buttons() & Qt::LeftButton) pick(event->position()); else event->ignore(); }
+  private:
+    bool m_hueField;
+    qreal m_hue = 0, m_saturation = 1, m_value = 1;
+    void pick(const QPointF& point) {
+        if (m_hueField)
+            m_hue = std::clamp(point.y() / std::max(1, height() - 1), 0.0, 0.99999);
+        else {
+            m_saturation = std::clamp(point.x() / std::max(1, width() - 1), 0.0, 1.0);
+            m_value = 1.0 - std::clamp(point.y() / std::max(1, height() - 1), 0.0, 1.0);
+        }
+        if (colorPicked)
+            colorPicked(QColor::fromHsvF(m_hue, m_saturation, m_value));
+        update();
+    }
+};
+}
+
+struct AnnotationEditor::Impl {
+    struct Choice { int group; Tool tool; Variant variant; QString name; StripToolButton* button = nullptr; };
+    explicit Impl(AnnotationEditor* owner) : owner(owner) {}
+    AnnotationEditor* owner;
+    AnnotationCanvas* canvas = nullptr;
+    ToolbarFrame* toolbar = nullptr;
+    ToolbarFrame* variantPanel = nullptr;
+    ToolbarFrame* colorPanel = nullptr;
+    HdrGainSlider* hdrGainSlider = nullptr;
+    QPointer<HdrGainSlider> textGainSlider;
+    ToolbarFrame* morePanel = nullptr;
+    std::vector<StripToolButton*> toolButtons = std::vector<StripToolButton*>(11, nullptr);
+    std::vector<Choice> choices;
+    std::vector<QAbstractButton*> strip;
+    std::map<int, std::pair<Tool, Variant>> remembered = {
+        {1, {Tool::Rectangle, Variant::Outline}}, {2, {Tool::Ellipse, Variant::Outline}},
+        {3, {Tool::Arrow, Variant::Straight}}, {5, {Tool::Pen, Variant::Outline}}
+    };
+    QSpinBox* width = nullptr;
+    QLabel* widthLabel = nullptr;
+    StripToolButton* color = nullptr;
+    StripToolButton* customColor = nullptr;
+    StripToolButton* themeDark = nullptr;
+    StripToolButton* themeLight = nullptr;
+    ColorField* saturationValue = nullptr;
+    ColorField* hue = nullptr;
+    StripActionButton* undo = nullptr;
+    StripActionButton* redo = nullptr;
+    StripActionButton* clear = nullptr;
+    StripActionButton* fit = nullptr;
+    StripActionButton* confirm = nullptr;
+    StripActionButton* save = nullptr;
+    StripActionButton* cancel = nullptr;
+    StripActionButton* pin = nullptr;
+    StripActionButton* reselect = nullptr;
+    StripActionButton* more = nullptr;
+    int openGroup = -1;
+    StripToolButton* popupAnchor = nullptr;
+    bool dark = true;
+    bool layoutActive = false;
+    QSize captureSize;
+    QRect captureGeometry;
+    QRect clusterGeometry;
+    QSettings* settings = nullptr;
+    QPointer<QWidget> textPanel, textControls, textFonts, textPalette;
+    std::function<void(bool)> finishText;
+    void finishTextEditing(bool accept) {
+        auto finish = std::move(finishText);
+        finishText = {};
+        if (finish) finish(accept);
+    }
+
+
+    void savePreferences() {
+        settings->setValue("color", canvas->color.name());
+        settings->setValue("width", static_cast<int>(canvas->strokeWidth));
+        settings->setValue("dark", dark);
+    }
+    QString toolName(Tool tool) const {
+        switch (tool) {
+            case Tool::Select: return owner->tr("Select");
+            case Tool::Rectangle: return owner->tr("Rectangle");
+            case Tool::Ellipse: return owner->tr("Ellipse");
+            case Tool::Arrow: return owner->tr("Arrow");
+            case Tool::Line: return owner->tr("Line");
+            case Tool::Pen: return owner->tr("Pen");
+            case Tool::Highlighter: return owner->tr("Highlighter");
+            case Tool::Text: return owner->tr("Text");
+            case Tool::Number: return owner->tr("Number");
+            case Tool::Mosaic: return owner->tr("Mosaic");
+            case Tool::Spotlight: return owner->tr("Spotlight");
+        }
+        return {};
+    }
+    QString choiceLabel(const Choice& choice) const {
+        switch (choice.variant) {
+            case Variant::Filled: return toolName(choice.tool) + " · " + owner->tr("Filled");
+            case Variant::Rounded: return owner->tr("Rounded") + " · " + toolName(choice.tool);
+            case Variant::RoundedFilled: return owner->tr("Rounded filled");
+            case Variant::Curved: return owner->tr("Curved") + " · " + toolName(choice.tool);
+            case Variant::DoubleHeaded: return owner->tr("Double headed");
+            case Variant::DoubleCurved: return owner->tr("Double curved");
+            default: return toolName(choice.tool);
+        }
+    }
+    int groupFor(Tool tool) const {
+        switch (tool) {
+            case Tool::Rectangle: return 1;
+            case Tool::Ellipse: case Tool::Spotlight: return 2;
+            case Tool::Arrow: case Tool::Line: return 3;
+            case Tool::Pen: case Tool::Highlighter: return 5;
+            default: return -1;
+        }
+    }
+    void closePanels() {
+        finishTextEditing(false);
+        variantPanel->hide();
+        colorPanel->hide();
+        morePanel->hide();
+        openGroup = -1;
+    }
+    void prepareOutput() { finishTextEditing(true); canvas->finishEditing(); closePanels(); }
+    void updateTools() {
+        const int selectedGroup = groupFor(canvas->tool);
+        for (int id : {0, 1, 2, 3, 5, 7, 8, 9}) {
+            auto* button = toolButtons[id];
+            const bool group = remembered.contains(id);
+            const Tool displayed = group ? remembered[id].first : static_cast<Tool>(id);
+            const Variant variant = group ? remembered[id].second : Variant::Outline;
+            button->dark = dark;
+            button->setIcon(toolIcon(displayed, variant, dark, canvas->color));
+            button->setChecked(group ? selectedGroup == id : canvas->tool == displayed);
+            button->setAccessibleName(toolName(displayed));
+            button->setToolTip(toolName(displayed) + " (" + button->hint + ")");
+        }
+        for (auto& choice : choices) {
+            choice.button->dark = dark;
+            choice.button->setIcon(toolIcon(choice.tool, choice.variant, dark, canvas->color));
+            choice.button->setChecked(choice.tool == canvas->tool && choice.variant == canvas->variant);
+            choice.button->setAccessibleName(choiceLabel(choice));
+            choice.button->setToolTip(choiceLabel(choice));
+        }
+    }
+    void activateTool(Tool tool, Variant variant, bool remember = true) {
+        canvas->selectTool(tool);
+        canvas->variant = variant;
+        const int group = groupFor(tool);
+        if (remember && group >= 0)
+            remembered[group] = {tool, variant};
+        closePanels();
+        updateTools();
+        canvas->setFocus(Qt::ShortcutFocusReason);
+        positionToolbar();
+    }
+    void activateGroup(int group, bool popup) {
+        const bool wasOpen = variantPanel->isVisible() && openGroup == group;
+        const auto [tool, variant] = remembered[group];
+        activateTool(tool, variant, false);
+        if (popup && !wasOpen) {
+            openGroup = group;
+            popupAnchor = toolButtons[group];
+            for (auto& choice : choices)
+                choice.button->setVisible(choice.group == group);
+            variantPanel->adjustSize();
+            variantPanel->show();
+            positionPopups();
+        }
+    }
+    void toggleColor() {
+        const bool wasOpen = colorPanel->isVisible();
+        canvas->finishEditing();
+        closePanels();
+        if (!wasOpen) {
+            saturationValue->setColor(canvas->color);
+            hue->setColor(canvas->color);
+            colorPanel->show();
+            positionPopups();
+        }
+        canvas->setFocus(Qt::ShortcutFocusReason);
+    }
+    void toggleMore() {
+        const bool wasOpen = morePanel->isVisible();
+        closePanels();
+        if (!wasOpen) {
+            morePanel->show();
+            positionPopups();
+        }
+        canvas->setFocus(Qt::ShortcutFocusReason);
+    }
+    void updateColor() {
+        if (hdrGainSlider) hdrGainSlider->setTargetColor(canvas->color);
+        color->dark = dark;
+        color->setProperty("annotationAccent", canvas->color);
+        color->setIcon(actionIcon("color", dark, canvas->color));
+        customColor->dark = dark;
+        customColor->setIcon(actionIcon("color", dark, canvas->color));
+        saturationValue->setColor(canvas->color);
+        hue->setColor(canvas->color);
+        updateTools();
+    }
+    void chooseColor(const QColor& selected, bool close) {
+        if (!selected.isValid())
+            return;
+        canvas->color = selected;
+        updateColor();
+        savePreferences();
+        if (close) {
+            closePanels();
+            canvas->setFocus(Qt::ShortcutFocusReason);
+        }
+    }
+    void applyTheme() {
+        const QString surface = dark ? hyprcapture::ui::theme::base : "#ffffff";
+        const QString border = dark ? hyprcapture::ui::theme::border : "#cbd4de";
+        const QString ink = dark ? hyprcapture::ui::theme::text : "#26313d";
+        const QString selected = dark ? hyprcapture::ui::theme::selected : "#dcecff";
+        for (auto* frame : {toolbar, variantPanel, colorPanel, morePanel})
+            frame->setStyleSheet(QString("QFrame#%1 { background: %2; border: 1px solid %3; border-radius: 10px; } QLabel { color: %4; } QSpinBox { color: %4; background: %2; border: 1px solid %3; border-radius: 4px; padding: 1px 2px; selection-background-color: %5; selection-color: %4; } QToolButton#annotationWidthDecrease, QToolButton#annotationWidthIncrease { color:%4; background:%2; border:1px solid %3; border-radius:4px; } QToolButton#annotationWidthDecrease:hover, QToolButton#annotationWidthIncrease:hover { background:%5; }")
+                .arg(frame->objectName(), surface, border, ink, selected));
+        for (const auto& [button, action] : std::vector<std::pair<StripActionButton*, QString>>{{save, "save"}, {undo, "undo"}, {redo, "redo"}, {pin, "pin"}, {confirm, "confirm"}, {cancel, "cancel"}, {clear, "clear"}, {fit, "fit"}, {reselect, "reselect"}, {more, "more"}}) {
+            button->dark = dark;
+            button->setIcon(actionIcon(action, dark, canvas->color));
+            button->update();
+        }
+        themeDark->dark = dark;
+        themeLight->dark = dark;
+        themeDark->setChecked(dark);
+        themeLight->setChecked(!dark);
+        themeDark->setIcon(actionIcon("dark", dark, canvas->color));
+        themeLight->setIcon(actionIcon("light", dark, canvas->color));
+        updateColor();
+        positionToolbar();
+    }
+    QSize arrangeStrip(int availableWidth) {
+        int rowHeight=36;
+        for(auto* button:strip) rowHeight=std::max(rowHeight,button->height());
+        constexpr int horizontalMargin = 6, verticalMargin = 5, spacing = 2;
+        const auto shown = [](const QAbstractButton* button) { return !button->isHidden(); };
+        int naturalWidth = horizontalMargin * 2 - spacing;
+        for (auto* button : strip)
+            if (shown(button)) naturalWidth += button->width() + spacing;
+        const int panelWidth = std::max(1, std::min(naturalWidth, availableWidth));
+        const int rowWidth = std::max(1, panelWidth - horizontalMargin * 2);
+        int x = 0, y = 0;
+        for (auto* button : strip) {
+            if (!shown(button)) continue;
+            // Keep the final decision controls together when the strip wraps.
+            const int requiredWidth = button == cancel
+                ? cancel->width() + confirm->width() + more->width() + spacing * 2 +
+                      (shown(save) ? save->width() + spacing : 0)
+                : button->width();
+            if (x && x + requiredWidth > rowWidth) {
+                x = 0;
+                y += rowHeight + spacing;
+            }
+            button->move(horizontalMargin + x, verticalMargin + y);
+            x += button->width() + spacing;
+        }
+        return QSize(panelWidth, y + rowHeight + verticalMargin * 2);
+    }
+    void positionToolbar() {
+        if (layoutActive || !toolbar || !canvas)
+            return;
+        layoutActive = true;
+        const QRect bounds = owner->rect().adjusted(8, 8, -8, -8);
+        const QSize panelSize = arrangeStrip(std::max(1, bounds.width()));
+        const QSize accessory = captureSize.isEmpty() ? QSize() : QSize(std::min(captureSize.width(), std::max(1, bounds.width())), captureSize.height());
+        const int gap = accessory.isEmpty() ? 0 : 6;
+        const int clusterHeight = panelSize.height() + accessory.height() + gap;
+        canvas->setViewportBottomInset(clusterHeight + 28);
+        const QRect imageRect = canvas->displayRect();
+        const int clusterWidth = std::max(panelSize.width(), accessory.width());
+        const int maximumX = std::max(bounds.left(), bounds.right() - clusterWidth + 1);
+        const int x = std::clamp(imageRect.right() - clusterWidth + 1, bounds.left(), maximumX);
+        int y = imageRect.bottom() + 9;
+        if (y + clusterHeight > bounds.bottom() + 1) {
+            const int above = imageRect.top() - clusterHeight - 8;
+            y = above >= bounds.top() ? above : bounds.bottom() - clusterHeight + 1;
+        }
+        y = std::max(bounds.top(), y);
+        const QRect oldToolbar = toolbar->geometry();
+        const QRect oldCapture = captureGeometry;
+        clusterGeometry = QRect(x, y, clusterWidth, clusterHeight);
+        captureGeometry = accessory.isEmpty() ? QRect() : QRect(x + clusterWidth - accessory.width(), y + panelSize.height() + gap, accessory.width(), accessory.height());
+        toolbar->setGeometry(x + clusterWidth - panelSize.width(), y, panelSize.width(), panelSize.height());
+        toolbar->raise();
+        positionPopups();
+        layoutActive = false;
+        if (toolbar->geometry() != oldToolbar || captureGeometry != oldCapture)
+            emit owner->toolbarGeometryChanged(toolbar->geometry());
+    }
+    void placePopup(QWidget* panel, int centerX) {
+        const QRect bounds = owner->rect().adjusted(8, 8, -8, -8);
+        QSize size = panel->sizeHint().expandedTo(panel->minimumSizeHint());
+        if (panel == colorPanel)
+            size = QSize(260, 246);
+        const int width = std::min(size.width(), std::max(1, bounds.width()));
+        const int height = std::min(size.height(), std::max(1, bounds.height()));
+        const int maxX = std::max(bounds.left(), bounds.right() - width + 1);
+        const int x = std::clamp(centerX - width / 2, bounds.left(), maxX);
+        int y = clusterGeometry.top() - height - 8;
+        if (y < bounds.top())
+            y = clusterGeometry.bottom() + 9;
+        y = std::clamp(y, bounds.top(), std::max(bounds.top(), bounds.bottom() - height + 1));
+        panel->setGeometry(x, y, width, height);
+        panel->raise();
+    }
+    void positionPopups() {
+        if (variantPanel->isVisible() && popupAnchor)
+            placePopup(variantPanel, popupAnchor->mapTo(owner, popupAnchor->rect().center()).x());
+        if (colorPanel->isVisible())
+            placePopup(colorPanel, toolbar->x() + 130);
+        if (morePanel->isVisible())
+            placePopup(morePanel, more->mapTo(owner, more->rect().center()).x());
+    }
+    void retranslate() {
+        const auto actionLabel = [&](QAbstractButton* button, const QString& label, const QString& key) {
+            button->setText(label);
+            button->setAccessibleName(label);
+            button->setToolTip(key.isEmpty() ? label : label + " (" + key + ")");
+        };
+        actionLabel(color, owner->tr("Color"), "Q");
+        actionLabel(customColor, owner->tr("Color"), {});
+        actionLabel(undo, owner->tr("Undo"), "Z");
+        actionLabel(redo, owner->tr("Redo"), "X");
+        actionLabel(save, owner->tr("Save"), {});
+        actionLabel(confirm, owner->tr("Capture"), "Enter");
+        actionLabel(cancel, owner->tr("Cancel"), "Esc");
+        actionLabel(pin, owner->tr("Pin"), "P");
+        actionLabel(clear, owner->tr("Clear"), {});
+        actionLabel(fit, owner->tr("Fit"), "Ctrl+0");
+        actionLabel(reselect, owner->tr("Reselect"), {});
+        actionLabel(more, owner->tr("Pin") + " · " + owner->tr("Fit") + " · " + owner->tr("Clear") + " · " + owner->tr("Reselect"), {});
+        actionLabel(themeDark, owner->tr("Dark"), {});
+        actionLabel(themeLight, owner->tr("Light"), {});
+        widthLabel->setText(owner->tr("Width"));
+        width->setToolTip(owner->tr("Width"));
+        canvas->setAccessibleDescription(owner->tr("Drag to draw. Select to move or delete annotations. Ctrl+wheel to zoom; Space+drag to pan. Single finger to draw; two fingers to scroll."));
+        updateTools();
+        morePanel->adjustSize();
+        positionToolbar();
+    }
+};
+
+AnnotationEditor::AnnotationEditor(QWidget* parent) : QWidget(parent), m_impl(std::make_unique<Impl>(this)) {
+    QCoreApplication::instance()->installEventFilter(this);
+    setObjectName("annotationEditor");
+    setAttribute(Qt::WA_TranslucentBackground);
+    auto& ui = *m_impl;
+    ui.canvas = new AnnotationCanvas(this);
+    ui.settings = new QSettings(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation) + "/hyprcapture/editor.ini", QSettings::IniFormat, this);
+    const QColor savedColor(ui.settings->value("color", "#ff5252").toString());
+    if (savedColor.isValid())
+        ui.canvas->color = savedColor;
+    ui.canvas->strokeWidth = std::clamp(ui.settings->value("width", 4).toInt(), 1, 24);
+    ui.dark = ui.settings->value("dark", QApplication::palette().color(QPalette::Window).lightness() < 128).toBool();
+    ui.toolbar = new ToolbarFrame(this);
+    ui.toolbar->setObjectName("annotationToolbar");
+    ui.variantPanel = new ToolbarFrame(this);
+    ui.variantPanel->setObjectName("annotationVariantPanel");
+    ui.colorPanel = new ToolbarFrame(this);
+    ui.colorPanel->setObjectName("annotationColorPanel");
+    ui.morePanel = new ToolbarFrame(this);
+    ui.morePanel->setObjectName("annotationMorePanel");
+    ui.variantPanel->hide();
+    ui.colorPanel->hide();
+    ui.morePanel->hide();
+
+    ui.color = new StripToolButton("Q", ui.toolbar);
+    ui.color->setObjectName("annotationColorTrigger");
+    ui.strip.push_back(ui.color);
+    const std::vector<std::pair<int, QString>> mainTools = {{0, "V"}, {1, "R"}, {2, "E"}, {3, "A"}, {5, "D"}, {7, "T"}, {9, "G"}, {8, "B"}};
+    for (const auto& [id, key] : mainTools) {
+        auto* button = new StripToolButton(key, ui.toolbar);
+        button->setObjectName(QString("annotationTool%1").arg(id));
+        button->setCheckable(true);
+        ui.toolButtons[id] = button;
+        ui.strip.push_back(button);
+        connect(button, &QToolButton::clicked, this, [this, id] {
+            if (m_impl->remembered.contains(id))
+                m_impl->activateGroup(id, true);
+            else
+                m_impl->activateTool(static_cast<Tool>(id), Variant::Outline);
+        });
+    }
+    const auto action = [&](const QString& key, const char* name) {
+        auto* button = new StripActionButton(key, ui.toolbar);
+        button->setObjectName(name);
+        ui.strip.push_back(button);
+        return button;
+    };
+    ui.undo = action("Z", "annotationUndo");
+    ui.redo = action("X", "annotationRedo");
+    ui.cancel = action({}, "annotationCancel");
+    ui.save = action({}, "annotationSave");
+    ui.confirm = action({}, "annotationConfirm");
+    ui.more = action({}, "annotationMore");
+
+    auto* variantRow = new QHBoxLayout(ui.variantPanel);
+    variantRow->setContentsMargins(5, 6, 5, 6);
+    variantRow->setSpacing(2);
+    const std::vector<Impl::Choice> options = {
+        {1, Tool::Rectangle, Variant::Outline, "annotationVariantRectOutline"},
+        {1, Tool::Rectangle, Variant::Rounded, "annotationVariantRectRounded"},
+        {1, Tool::Rectangle, Variant::Filled, "annotationVariantRectFilled"},
+        {1, Tool::Rectangle, Variant::RoundedFilled, "annotationVariantRectRoundedFilled"},
+        {2, Tool::Ellipse, Variant::Outline, "annotationVariantEllipseOutline"},
+        {2, Tool::Ellipse, Variant::Filled, "annotationVariantEllipseFilled"},
+        {2, Tool::Spotlight, Variant::Outline, "annotationTool10"},
+        {3, Tool::Arrow, Variant::Straight, "annotationVariantArrowStraight"},
+        {3, Tool::Arrow, Variant::Curved, "annotationVariantArrowCurved"},
+        {3, Tool::Arrow, Variant::DoubleCurved, "annotationVariantArrowDoubleCurved"},
+        {3, Tool::Line, Variant::Outline, "annotationTool4"},
+        {3, Tool::Arrow, Variant::DoubleHeaded, "annotationVariantArrowDouble"},
+        {5, Tool::Pen, Variant::Outline, "annotationVariantPen"},
+        {5, Tool::Highlighter, Variant::Outline, "annotationTool6"}
+    };
+    for (auto choice : options) {
+        choice.button = new StripToolButton({}, ui.variantPanel);
+        choice.button->setObjectName(choice.name);
+        choice.button->setCheckable(true);
+        variantRow->addWidget(choice.button);
+        if (choice.tool == Tool::Line || choice.tool == Tool::Highlighter || choice.tool == Tool::Spotlight)
+            ui.toolButtons[static_cast<int>(choice.tool)] = choice.button;
+        choice.button->hide();
+        connect(choice.button, &QToolButton::clicked, this, [this, tool = choice.tool, variant = choice.variant] { m_impl->activateTool(tool, variant); });
+        ui.choices.push_back(std::move(choice));
+    }
+
+    auto* colorRows = new QVBoxLayout(ui.colorPanel);
+    colorRows->setContentsMargins(10, 10, 10, 10);
+    colorRows->setSpacing(10);
+    auto* colorTop = new QHBoxLayout;
+    colorTop->setSpacing(4);
+    ui.themeLight = new StripToolButton({}, ui.colorPanel);
+    ui.themeLight->setObjectName("annotationThemeLight");
+    ui.themeDark = new StripToolButton({}, ui.colorPanel);
+    ui.themeDark->setObjectName("annotationThemeDark");
+    for (auto* button : {ui.themeLight, ui.themeDark}) {
+        button->setCheckable(true);
+        button->setFixedSize(28, 26);
+        colorTop->addWidget(button);
+    }
+    colorTop->addStretch();
+    ui.widthLabel = new QLabel(ui.colorPanel);
+    colorTop->addWidget(ui.widthLabel);
+    ui.width = new QSpinBox(ui.colorPanel);
+    ui.width->setObjectName("annotationWidth");
+    ui.width->setRange(1, 24);
+    ui.width->setValue(static_cast<int>(ui.canvas->strokeWidth));
+    ui.width->setButtonSymbols(QAbstractSpinBox::NoButtons);
+    ui.width->setAlignment(Qt::AlignCenter);
+    ui.width->setFixedSize(36, 26);
+    for (int direction : {-1, 1}) {
+        auto* step = new QToolButton(ui.colorPanel);
+        step->setObjectName(direction < 0 ? "annotationWidthDecrease" : "annotationWidthIncrease");
+        step->setText(direction < 0 ? QStringLiteral("−") : QStringLiteral("+"));
+        step->setFixedSize(22, 26);
+        step->setAutoRepeat(true);
+        step->setAccessibleName(tr("Width") + (direction < 0 ? " −" : " +"));
+        colorTop->addWidget(step);
+        if (direction < 0) colorTop->addWidget(ui.width);
+        connect(step, &QToolButton::clicked, ui.width, [spin = ui.width, direction] { spin->stepBy(direction); });
+    }
+    ui.customColor = new StripToolButton({}, ui.colorPanel);
+    ui.customColor->setObjectName("annotationColorPicker");
+    ui.customColor->setFixedSize(28, 26);
+    colorTop->addWidget(ui.customColor);
+    colorRows->addLayout(colorTop);
+    auto* hsv = new QHBoxLayout;
+    hsv->setSpacing(10);
+    ui.saturationValue = new ColorField(false, ui.colorPanel);
+    ui.saturationValue->setObjectName("annotationSaturationValue");
+    ui.hue = new ColorField(true, ui.colorPanel);
+    ui.hue->setObjectName("annotationHue");
+    hsv->addWidget(ui.saturationValue);
+    auto* sliders = new QHBoxLayout;
+    sliders->setSpacing(0);
+    sliders->addWidget(ui.hue);
+    hsv->addLayout(sliders);
+    auto* hdrGain = addHdrGainSlider(sliders, ui.colorPanel, ui.canvas->hdrGain, "annotationHdrGain");
+    ui.hdrGainSlider = hdrGain;
+    hdrGain->setVisible(ui.canvas->hdrEnabled);
+    hdrGain->setTargetColor(ui.canvas->color);
+    connect(hdrGain, &QSlider::valueChanged, this, [this](int value) { m_impl->canvas->hdrGain = value / 100.0; });
+    colorRows->addLayout(hsv);
+    auto* swatches = new QHBoxLayout;
+    swatches->setSpacing(5);
+    for (const QString value : {"#ff4b55", "#ff9d42", "#ffd84d", "#5bd686", "#42c8d8", "#4d94ff", "#a77bff", "#f774ba", "#ffffff", "#202020"}) {
+        auto* swatch = new QToolButton(ui.colorPanel);
+        swatch->setObjectName("annotationColor" + value.mid(1));
+        swatch->setFixedSize(18, 18);
+        swatch->setStyleSheet(QString("background: %1; border: 1px solid #79889b; border-radius: 4px;").arg(value));
+        swatch->setToolTip(value);
+        swatch->setAccessibleName(value);
+        swatches->addWidget(swatch);
+        connect(swatch, &QToolButton::clicked, this, [this, value] { m_impl->chooseColor(QColor(value), true); });
+    }
+    swatches->addStretch();
+    colorRows->addLayout(swatches);
+    colorRows->addStretch();
+
+    auto* moreRows = new QHBoxLayout(ui.morePanel);
+    moreRows->setContentsMargins(5, 6, 5, 6);
+    moreRows->setSpacing(2);
+    const auto overflow = [&](const char* name) {
+        auto* button = new StripActionButton({}, ui.morePanel);
+        button->setObjectName(name);
+        moreRows->addWidget(button);
+        return button;
+    };
+    ui.pin = overflow("annotationPin");
+    ui.clear = overflow("annotationClear");
+    ui.fit = overflow("annotationFit");
+    ui.reselect = overflow("annotationReselect");
+
+    ui.canvas->previewChanged = [this] { emit previewChanged(); };
+    ui.canvas->changed = [this] {
+        m_impl->undo->setEnabled(m_impl->canvas->canUndo());
+        m_impl->redo->setEnabled(m_impl->canvas->canRedo());
+        m_impl->clear->setEnabled(m_impl->canvas->hasAnnotations());
+        m_impl->positionToolbar();
+        emit annotationsChanged();
+    };
+    ui.canvas->scrollRequested = [this](QPointF p,double d,int discrete,bool finger,bool inverted) { emit scrollRequested(p,d,discrete,finger,inverted); };
+    ui.canvas->viewChanged = [this] { m_impl->positionToolbar(); emit imageDisplayGeometryChanged(); };
+    ui.canvas->captureRectChanged = [this](const QRect& rect) { emit captureRectChangeRequested(rect); };
+    ui.canvas->pressed = [this] { m_impl->closePanels(); };
+    ui.canvas->requestText = [this](const Annotation& existing, const QTransform& transform, std::function<void(std::optional<Annotation>, bool)> completed) {
+        m_impl->closePanels();
+        auto* panel = new TextBoxFrame(this);
+        panel->setObjectName("annotationTextPanel");
+        panel->setAttribute(Qt::WA_StyledBackground);
+        panel->setMouseTracking(true);
+        panel->setMinimumSize(std::min(240, std::max(1, width()-16)), std::min(100, std::max(1, height()-16)));
+        const bool dark = m_impl->dark;
+        panel->setStyleSheet(QString("QFrame#annotationTextPanel { background:rgba(80,120,160,18); border:1px solid #69bfff; border-radius:5px; } QWidget#annotationTextControls, QLabel#annotationTextDragHandle { background:%1; color:%2; border-radius:3px; } QPlainTextEdit { background:transparent; border:0; } QLineEdit, QSpinBox, QListWidget { background:%1; color:%2; } ")
+            .arg(dark ? hyprcapture::ui::theme::base : "#ffffff", dark ? hyprcapture::ui::theme::text : "#26313d"));
+        auto* layout = new QVBoxLayout(panel);
+        layout->setContentsMargins(8, 8, 8, 8);
+        layout->setSpacing(5);
+        auto* controls = new QFrame(this);
+        controls->setObjectName("annotationTextControls");
+        controls->setAttribute(Qt::WA_StyledBackground);
+        QFont controlsFont = controls->font();
+        controlsFont.setPixelSize(12);
+        controls->setFont(controlsFont);
+        controls->setStyleSheet(QString("QFrame#annotationTextControls { background:%1; border:1px solid %3; border-radius:6px; } QLineEdit, QSpinBox, QPushButton { color:%2; background:%1; border:1px solid %3; border-radius:4px; padding:1px 4px; }")
+            .arg(dark ? hyprcapture::ui::theme::base : "#ffffff", dark ? hyprcapture::ui::theme::text : "#26313d", dark ? hyprcapture::ui::theme::border : "#cbd5e1"));
+        auto* rows = new QVBoxLayout(controls);
+        rows->setContentsMargins(5, 5, 5, 5); rows->setSpacing(4);
+        auto* styleRow = new QHBoxLayout;
+        auto* fontButton = new QPushButton(controls);
+        fontButton->setObjectName("annotationTextFont");
+        fontButton->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+        fontButton->setMinimumWidth(0);
+        fontButton->setAccessibleName(tr("Font")); fontButton->setToolTip(tr("Font"));
+        auto* size = new QSpinBox(controls);
+        size->setObjectName("annotationTextSize");
+        size->setRange(6, 192); size->setSuffix(" px");
+        size->setButtonSymbols(QAbstractSpinBox::NoButtons);
+        size->setFixedWidth(70);
+        size->setAccessibleName(tr("Font size")); size->setToolTip(tr("Font size"));
+        QFont font = existing.textFont.pixelSize() > 0 ? existing.textFont : annotationFont(existing.width);
+        font.setPixelSize(std::clamp(qRound(font.pixelSize() * transform.m11()), 6, 192));
+        size->setValue(font.pixelSize());
+        fontButton->setText(font.family());
+        auto* color = new QLineEdit(existing.color.name(), controls);
+        color->setObjectName("annotationTextColor"); color->setMaxLength(7); color->setFixedWidth(78);
+        color->setAccessibleName(tr("Color")); color->setToolTip(tr("Color") + " (#RRGGBB)");
+        const int fieldHeight = 24;
+        for (QWidget* field : {static_cast<QWidget*>(fontButton), static_cast<QWidget*>(size), static_cast<QWidget*>(color)})
+            field->setFixedHeight(fieldHeight);
+        styleRow->addWidget(fontButton, 1);
+        auto* sizeGroup = new QHBoxLayout;
+        sizeGroup->setSpacing(2);
+        sizeGroup->addWidget(size);
+        auto* sizeSteps = new QVBoxLayout;
+        sizeSteps->setSpacing(0);
+        for (int direction : {1, -1}) {
+            auto* step = new QToolButton(controls);
+            step->setObjectName(direction > 0 ? "annotationTextSizeIncrease" : "annotationTextSizeDecrease");
+            step->setText(direction > 0 ? QStringLiteral("+") : QStringLiteral("−"));
+            step->setFixedSize(22, direction > 0 ? fieldHeight/2 : fieldHeight-fieldHeight/2);
+            step->setAutoRepeat(true);
+            step->setAccessibleName(tr("Font size") + (direction > 0 ? " +" : " −"));
+            step->setStyleSheet(QString("QToolButton { color:%1; background:%2; border:1px solid %3; padding:0; }")
+                .arg(dark ? hyprcapture::ui::theme::text : "#26313d", dark ? hyprcapture::ui::theme::base : "#ffffff", dark ? hyprcapture::ui::theme::border : "#cbd5e1"));
+            sizeSteps->addWidget(step);
+            connect(step, &QToolButton::clicked, size, [size, direction] { size->stepBy(direction); });
+        }
+        sizeGroup->addLayout(sizeSteps);
+        styleRow->addLayout(sizeGroup);
+        rows->addLayout(styleRow);
+        auto* colors = new QHBoxLayout;
+        colors->setSpacing(4);
+        auto* paletteButton = new QToolButton(controls);
+        paletteButton->setObjectName("annotationTextPaletteButton");
+        paletteButton->setIcon(actionIcon("color", dark, existing.color));
+        paletteButton->setFixedSize(24, fieldHeight);
+        paletteButton->setAccessibleName(tr("Color")); paletteButton->setToolTip(tr("Color"));
+        colors->addWidget(paletteButton);
+        colors->addWidget(color);
+        auto* textPalette = new QFrame(this);
+        textPalette->setObjectName("annotationTextPalette");
+        textPalette->setAttribute(Qt::WA_StyledBackground);
+        textPalette->setStyleSheet(QString("QFrame#annotationTextPalette { background:%1; border:1px solid #79889b; border-radius:6px; }").arg(dark ? hyprcapture::ui::theme::base : "#ffffff"));
+        auto* paletteRows = new QVBoxLayout(textPalette);
+        paletteRows->setContentsMargins(10, 10, 10, 10); paletteRows->setSpacing(8);
+        auto* paletteLayout = new QHBoxLayout;
+        paletteRows->addLayout(paletteLayout);
+        paletteLayout->setContentsMargins(0, 0, 0, 0); paletteLayout->setSpacing(10);
+        auto* textSaturation = new ColorField(false, textPalette);
+        textSaturation->setObjectName("annotationTextSaturationValue");
+        auto* textHue = new ColorField(true, textPalette);
+        textHue->setObjectName("annotationTextHue");
+        paletteLayout->addWidget(textSaturation);
+        auto* textSliders = new QHBoxLayout;
+        textSliders->setSpacing(0);
+        textSliders->addWidget(textHue);
+        paletteLayout->addLayout(textSliders);
+        auto* textGain = addHdrGainSlider(textSliders, textPalette, existing.hdrGain, "annotationTextHdrGain");
+        textGain->setTargetColor(existing.color);
+        m_impl->textGainSlider = textGain;
+        textGain->setVisible(m_impl->canvas->hdrEnabled);
+        connect(color, &QLineEdit::textChanged, textGain, [textGain](const QString& value) {
+            const QColor selected(value); if (selected.isValid()) textGain->setTargetColor(selected);
+        });
+        textSaturation->setColor(existing.color); textHue->setColor(existing.color);
+        textSaturation->colorPicked = textHue->colorPicked = [color](const QColor& selected) { color->setText(selected.name()); };
+        connect(color, &QLineEdit::textChanged, textPalette, [textSaturation, textHue, paletteButton, dark](const QString& value) {
+            const QColor selected(value);
+            if (!selected.isValid()) return;
+            textSaturation->setColor(selected); textHue->setColor(selected);
+            paletteButton->setIcon(actionIcon("color", dark, selected));
+        });
+        textPalette->hide();
+        for (const QString hex : {"#ff4b55", "#ffd84d", "#5bd686", "#4d94ff", "#a77bff", "#ffffff", "#202020"}) {
+            auto* swatch = new QToolButton(controls);
+            swatch->setObjectName("annotationTextPreset" + hex.mid(1));
+            swatch->setFixedSize(16, 16); swatch->setToolTip(hex); swatch->setAccessibleName(hex);
+            swatch->setStyleSheet(QString("background:%1; border:1px solid #79889b; border-radius:4px").arg(hex));
+            colors->addWidget(swatch);
+            connect(swatch, &QToolButton::clicked, color, [color, hex] { color->setText(hex); });
+        }
+        colors->addStretch(); rows->addLayout(colors);
+
+        auto* input = new AnnotationTextInput(panel);
+        input->setObjectName("annotationTextInput");
+        panel->setTextInput(input);
+        input->setAccessibleName(tr("Text annotation"));
+        input->setFrameShape(QFrame::NoFrame);
+        input->document()->setDocumentMargin(0);
+        input->setFont(font);
+        input->setPlainText(existing.text);
+        input->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+        input->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+        input->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        input->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        auto textColor = std::make_shared<QColor>(existing.color);
+        const auto applyColor = [input, textColor] { auto palette = input->palette(); palette.setColor(QPalette::Text, *textColor); input->setPalette(palette); };
+        applyColor();
+        connect(color, &QLineEdit::textChanged, input, [textColor, applyColor](const QString& value) { const QColor selected(value); if (selected.isValid()) { *textColor = selected; applyColor(); } });
+        connect(size, &QSpinBox::valueChanged, input, [input](int pixels) { auto font = input->font(); font.setPixelSize(pixels); input->setFont(font); });
+        layout->addWidget(input, 1);
+        // A font list embedded in this same surface avoids native popup/focus issues.
+        auto* fonts = new QListWidget(this);
+        fonts->setObjectName("annotationTextFontList");
+        for (const QString& family : QFontDatabase::families())
+            if (QFontDatabase::isSmoothlyScalable(family)) fonts->addItem(family);
+        fonts->hide();
+        fonts->setStyleSheet(QString("QListWidget { background:%1; color:%2; border:1px solid #79889b; border-radius:4px; }")
+            .arg(dark ? hyprcapture::ui::theme::base : "#ffffff", dark ? hyprcapture::ui::theme::text : "#26313d"));
+        const auto positionControls = [this, panel, controls, fonts, textPalette] {
+            controls->adjustSize();
+            controls->resize(std::min(360, width()-16), controls->sizeHint().height());
+            // Keep room for the floating bar even when the text frame is enlarged
+            // to the output edge. Moving/resizing the frame never covers its controls.
+            panel->setMaximumHeight(std::max(panel->minimumHeight(), height()-controls->height()-24));
+            if (panel->y()-controls->height()-8 < 8 &&
+                panel->geometry().bottom()+9+controls->height() > height()-8)
+                panel->move(panel->x(), controls->height()+16);
+            const QRect box = panel->geometry();
+            const int x = std::clamp(box.left(), 8, std::max(8, width()-controls->width()-8));
+            int y = box.top()-controls->height()-8;
+            if (y < 8) y = box.bottom()+9;
+            controls->move(x, std::clamp(y, 8, std::max(8, height()-controls->height()-8)));
+            const int listHeight = std::min(160, height()-16);
+            const auto popupY = [this, controls, box](int popupHeight) {
+                const int above = controls->y()-popupHeight-4;
+                const int below = controls->geometry().bottom()+5;
+                if (controls->y() < box.top() && above >= 8) return above;
+                if (below+popupHeight <= height()-8) return below;
+                return std::max(8, above);
+            };
+            const int listY = popupY(listHeight);
+            fonts->setGeometry(x, std::max(8, listY), controls->width(), listHeight);
+            textPalette->adjustSize();
+            const int paletteY = popupY(textPalette->height());
+            textPalette->move(std::clamp(x, 8, std::max(8, width()-textPalette->width()-8)), std::max(8, paletteY));
+            controls->raise();
+            if (fonts->isVisible()) fonts->raise();
+            if (textPalette->isVisible()) textPalette->raise();
+        };
+        panel->geometryChanged = positionControls;
+        connect(fontButton, &QPushButton::clicked, panel, [fonts, textPalette, positionControls] {
+            textPalette->hide();
+            if (fonts->isVisible()) { fonts->hide(); return; }
+            positionControls(); fonts->show(); fonts->raise(); fonts->setFocus();
+        });
+        connect(paletteButton, &QToolButton::clicked, panel, [fonts, textPalette, positionControls] {
+            fonts->hide();
+            if (textPalette->isVisible()) { textPalette->hide(); return; }
+            positionControls(); textPalette->show(); textPalette->raise();
+        });
+        const auto selectFont = [input, fontButton, fonts](QListWidgetItem* item) {
+            if (!item) return;
+            auto font = input->font(); font.setFamily(item->text()); input->setFont(font);
+            fontButton->setText(item->text()); fonts->hide(); input->setFocus();
+        };
+        connect(fonts, &QListWidget::itemClicked, panel, selectFont);
+        connect(fonts, &QListWidget::itemActivated, panel, selectFont);
+        panel->resize(std::min(400, width()-16), std::min(280, height()-16));
+        panel->show();
+        layout->activate();
+        if (existing.textBox.isValid()) {
+            const QSize decoration = panel->size() - input->viewport()->size();
+            const QSize desired(qRound(existing.textBox.width()*transform.m11()) + decoration.width(), qRound(existing.textBox.height()*transform.m22()) + decoration.height());
+            panel->resize(desired.expandedTo(panel->minimumSize()).boundedTo(QSize(width()-16, height()-16)));
+            layout->activate();
+        }
+        const QPoint anchor = transform.map(existing.points.front()).toPoint() - input->viewport()->mapTo(panel, QPoint());
+        panel->move(std::clamp(anchor.x(), 8, std::max(8, width()-panel->width()-8)), std::clamp(anchor.y(), 8, std::max(8, height()-panel->height()-8)));
+        m_impl->textPanel = panel;
+        m_impl->canvas->setEnabled(false);
+        auto completeText = std::make_shared<std::function<void(std::optional<Annotation>, bool)>>(std::move(completed));
+        const auto saveText = [this, input, textColor, textGain, existing, transform, completeText](bool final) {
+            Annotation result = existing;
+            result.text = input->toPlainText(); result.color = *textColor;
+            result.hdrGain = textGain->value() / 100.0;
+            result.textFont = input->font(); result.textFont.setPixelSize(std::max(1, qRound(input->font().pixelSize()/transform.m11())));
+            const QRectF box(input->viewport()->mapTo(this, QPoint()), input->viewport()->size());
+            const QRectF native = transform.inverted().mapRect(box);
+            result.points = {native.topLeft()}; result.textBox = native.size();
+            (*completeText)(result, final);
+        };
+        connect(textGain, &QSlider::valueChanged, panel, [saveText] { saveText(false); });
+        connect(input, &QPlainTextEdit::textChanged, panel, [saveText] { saveText(false); });
+        connect(color, &QLineEdit::textChanged, panel, [saveText] { saveText(false); });
+        connect(size, &QSpinBox::valueChanged, panel, [saveText] { saveText(false); });
+        connect(fonts, &QListWidget::itemClicked, panel, [saveText] { saveText(false); });
+        connect(fonts, &QListWidget::itemActivated, panel, [saveText] { saveText(false); });
+        panel->geometryChanged = [positionControls, saveText] { positionControls(); saveText(false); };
+        m_impl->textControls = controls;
+        m_impl->textFonts = fonts;
+        m_impl->textPalette = textPalette;
+        m_impl->finishText = [this, panel, controls, fonts, textPalette, saveText](bool) {
+            panel->geometryChanged = {};
+            saveText(true);
+            controls->hide(); controls->deleteLater(); fonts->hide(); fonts->deleteLater();
+            textPalette->hide(); textPalette->deleteLater();
+            panel->hide(); panel->deleteLater(); m_impl->textPanel = nullptr;
+            m_impl->textControls = nullptr; m_impl->textFonts = nullptr; m_impl->textPalette = nullptr;
+            m_impl->canvas->setEnabled(true); m_impl->canvas->setFocus();
+        };
+        panel->finished = [this](bool accept) { m_impl->finishTextEditing(accept); };
+        input->finished = panel->finished;
+        for (auto* child : panel->findChildren<QWidget*>()) child->installEventFilter(panel);
+        for (auto* child : controls->findChildren<QWidget*>()) child->installEventFilter(panel);
+        fonts->installEventFilter(panel);
+        for (auto* child : textPalette->findChildren<QWidget*>()) child->installEventFilter(panel);
+        panel->show(); panel->raise(); controls->show(); positionControls(); input->setFocus();
+    };
+    connect(ui.color, &QToolButton::clicked, this, [this] { m_impl->toggleColor(); });
+    connect(ui.more, &QPushButton::clicked, this, [this] { m_impl->toggleMore(); });
+    connect(ui.width, &QSpinBox::valueChanged, this, [this](int value) { m_impl->canvas->strokeWidth = value; m_impl->savePreferences(); });
+    connect(ui.themeLight, &QToolButton::clicked, this, [this] { m_impl->dark = false; m_impl->applyTheme(); m_impl->savePreferences(); });
+    connect(ui.themeDark, &QToolButton::clicked, this, [this] { m_impl->dark = true; m_impl->applyTheme(); m_impl->savePreferences(); });
+    connect(ui.customColor, &QToolButton::clicked, this, [this] {
+        m_impl->closePanels();
+        const QColor selected = QColorDialog::getColor(m_impl->canvas->color, this, tr("Color"));
+        m_impl->chooseColor(selected, true);
+    });
+    ui.saturationValue->colorPicked = [this](const QColor& selected) { m_impl->chooseColor(selected, false); };
+    ui.hue->colorPicked = [this](const QColor& selected) { m_impl->chooseColor(selected, false); };
+    connect(ui.undo, &QPushButton::clicked, this, [this] { m_impl->closePanels(); undo(); });
+    connect(ui.redo, &QPushButton::clicked, this, [this] { m_impl->closePanels(); redo(); });
+    connect(ui.clear, &QPushButton::clicked, this, [this] { m_impl->closePanels(); clearAnnotations(); });
+    connect(ui.fit, &QPushButton::clicked, this, [this] { m_impl->closePanels(); fitImage(); });
+    connect(ui.save, &QPushButton::clicked, this, [this] { m_impl->prepareOutput(); emit saveRequested(); });
+    connect(ui.confirm, &QPushButton::clicked, this, [this] { m_impl->prepareOutput(); emit confirmRequested(); });
+    connect(ui.cancel, &QPushButton::clicked, this, [this] { m_impl->closePanels(); emit cancelRequested(); });
+    connect(ui.pin, &QPushButton::clicked, this, [this] { m_impl->prepareOutput(); emit pinRequested(); });
+    connect(ui.reselect, &QPushButton::clicked, this, [this] { m_impl->prepareOutput(); emit reselectRequested(); });
+
+    const auto shortcut = [this](const QKeySequence& sequence, std::function<void()> callback) {
+        auto* key = new QShortcut(sequence, this);
+        key->setContext(Qt::WidgetWithChildrenShortcut);
+        connect(key, &QShortcut::activated, this, [this, callback = std::move(callback)] {
+            // Color width and text dialogs must retain normal text entry.
+            if ((m_impl->textPanel && m_impl->textPanel->isVisible()) || QApplication::activeModalWidget() || qobject_cast<QSpinBox*>(QApplication::focusWidget()) || qobject_cast<QPlainTextEdit*>(QApplication::focusWidget()))
+                return;
+            callback();
+        });
+    };
+    shortcut(QKeySequence::Undo, [this] { undo(); });
+    shortcut(QKeySequence("Ctrl+Shift+Z"), [this] { redo(); });
+    shortcut(QKeySequence("Ctrl+Y"), [this] { redo(); });
+    shortcut(QKeySequence("Ctrl+P"), [this] { m_impl->pin->click(); });
+    shortcut(QKeySequence("Ctrl+0"), [this] { fitImage(); });
+    shortcut(QKeySequence("Q"), [this] { m_impl->toggleColor(); });
+    shortcut(QKeySequence("Z"), [this] { undo(); });
+    shortcut(QKeySequence("X"), [this] { redo(); });
+    shortcut(QKeySequence("P"), [this] { m_impl->pin->click(); });
+    shortcut(QKeySequence(Qt::Key_Return), [this] { m_impl->confirm->click(); });
+    shortcut(QKeySequence(Qt::Key_Enter), [this] { m_impl->confirm->click(); });
+    shortcut(QKeySequence(Qt::Key_Escape), [this] {
+        if (m_impl->variantPanel->isVisible() || m_impl->colorPanel->isVisible() || m_impl->morePanel->isVisible())
+            m_impl->closePanels();
+        else
+            m_impl->cancel->click();
+    });
+    const auto toolShortcut = [&](const QString& key, Tool tool, Variant variant = Variant::Outline) {
+        shortcut(QKeySequence(key), [this, tool, variant] { m_impl->activateTool(tool, variant); });
+    };
+    toolShortcut("V", Tool::Select);
+    for (const auto& [key, group] : std::vector<std::pair<QString, int>>{{"R", 1}, {"E", 2}, {"A", 3}, {"D", 5}})
+        shortcut(QKeySequence(key), [this, group] { m_impl->activateGroup(group, false); });
+    toolShortcut("W", Tool::Line);
+    toolShortcut("H", Tool::Highlighter);
+    toolShortcut("T", Tool::Text);
+    toolShortcut("B", Tool::Number);
+    toolShortcut("G", Tool::Mosaic);
+    toolShortcut("Shift+R", Tool::Rectangle, Variant::Rounded);
+    toolShortcut("Shift+E", Tool::Ellipse, Variant::Filled);
+    toolShortcut("Shift+A", Tool::Arrow, Variant::Curved);
+    toolShortcut("Shift+D", Tool::Rectangle, Variant::Filled);
+    toolShortcut("Shift+B", Tool::Spotlight);
+    toolShortcut("Shift+W", Tool::Arrow, Variant::DoubleCurved);
+    ui.retranslate();
+    ui.applyTheme();
+    ui.undo->setEnabled(false);
+    ui.redo->setEnabled(false);
+    ui.clear->setEnabled(false);
+}
+
+AnnotationEditor::~AnnotationEditor() = default;
+bool AnnotationEditor::eventFilter(QObject* object, QEvent* event) {
+    if (event->type() == QEvent::MouseButtonPress && m_impl->textPanel) {
+        const QPoint global = static_cast<QMouseEvent*>(event)->globalPosition().toPoint();
+        const auto inside = [global](const QPointer<QWidget>& widget) {
+            return widget && widget->isVisible() && widget->rect().contains(widget->mapFromGlobal(global));
+        };
+        if (!inside(m_impl->textPanel) && !inside(m_impl->textControls) &&
+            !inside(m_impl->textFonts) && !inside(m_impl->textPalette)) {
+            m_impl->finishTextEditing(true);
+            return true;
+        }
+    }
+    if (event->type() == QEvent::ToolTip) {
+        if (auto* widget = qobject_cast<QWidget*>(object); widget && (widget == this || isAncestorOf(widget))) {
+            // Native Qt tooltip windows become fullscreen surfaces with
+            // layer-shell. Keep the same help available to accessibility.
+            if (!widget->toolTip().isEmpty())
+                widget->setAccessibleDescription(widget->toolTip());
+            event->accept();
+            return true;
+        }
+    }
+    return QWidget::eventFilter(object, event);
+}
+void AnnotationEditor::setImage(const QImage& image, bool preserveAnnotations) {
+    m_impl->closePanels();
+    m_impl->canvas->setImage(image, preserveAnnotations);
+    m_impl->positionToolbar();
+}
+QImage AnnotationEditor::resultImage() const { return m_impl->canvas->result(); }
+QImage AnnotationEditor::resultImageOn(const QImage& hdrBase) const { return m_impl->canvas->resultOn(hdrBase); }
+void AnnotationEditor::setRegionResizeBounds(const QRect& bounds) { m_impl->canvas->resizeBounds = bounds; m_impl->canvas->update(); }
+void AnnotationEditor::replaceCaptureImage(const QImage& image, const QRect& displayRect) {
+    m_impl->canvas->replaceCapture(image, displayRect);
+}
+
+QRect AnnotationEditor::canvasGeometry() const { return m_impl->canvas->displayRect(); }
+QWidget* AnnotationEditor::toolbarWidget() const { return m_impl->toolbar; }
+QRect AnnotationEditor::toolbarGeometry() const { return m_impl->toolbar->geometry(); }
+void AnnotationEditor::setCaptureToolbarSize(const QSize& size) {
+    if (m_impl->captureSize == size)
+        return;
+    m_impl->captureSize = size;
+    m_impl->positionToolbar();
+}
+QRect AnnotationEditor::captureToolbarGeometry() const { return m_impl->captureGeometry; }
+void AnnotationEditor::undo() { m_impl->canvas->undo(); }
+void AnnotationEditor::redo() { m_impl->canvas->redo(); }
+void AnnotationEditor::clearAnnotations() { m_impl->canvas->clearAnnotations(); }
+void AnnotationEditor::fitImage() { m_impl->canvas->fitViewport(); }
+void AnnotationEditor::setImageDisplayRect(const QRect& rect) { m_impl->canvas->setDisplayRect(rect); }
+void AnnotationEditor::resizeEvent(QResizeEvent* event) {
+    QWidget::resizeEvent(event);
+    m_impl->canvas->setGeometry(rect());
+    m_impl->positionToolbar();
+}
+void AnnotationEditor::hideEvent(QHideEvent* event) {
+    m_impl->closePanels();
+    QWidget::hideEvent(event);
+}
+void AnnotationEditor::changeEvent(QEvent* event) {
+    QWidget::changeEvent(event);
+    if (event->type() == QEvent::LanguageChange && m_impl->toolbar)
+        m_impl->retranslate();
+}
+
+std::shared_ptr<const AnnotationSnapshot> AnnotationEditor::snapshot() const { return m_impl->canvas->snapshot(); }
+void AnnotationEditor::restore(const std::shared_ptr<const AnnotationSnapshot>& state) {
+    if (!state) return;
+    m_impl->finishTextEditing(false);
+    m_impl->canvas->restore(state);
+}
+void AnnotationEditor::setScrollImage(const QImage& image,const hyprcapture::ui::ScrollLayout& layout,bool live) { m_impl->canvas->scrollImage(image,layout,live); }
+void AnnotationEditor::setScrollEnabled(bool enabled) { m_impl->canvas->scrollEnabled=enabled; }
+void AnnotationEditor::setLiveScrollPresentation(bool live) { m_impl->canvas->liveScroll=live; m_impl->canvas->update(); }
+void AnnotationEditor::setExternalImagePresentation(bool enabled, bool includesAnnotations) {
+    auto* canvas = m_impl->canvas;
+    const bool annotations = enabled && includesAnnotations;
+    if (canvas->externalImagePresentation == enabled && canvas->externalAnnotationPresentation == annotations) return;
+    canvas->externalImagePresentation = enabled;
+    canvas->externalAnnotationPresentation = annotations;
+    canvas->QWidget::update();
+}
+QImage AnnotationEditor::previewImageOn(const QImage& hdrBase) const { return m_impl->canvas->resultOn(hdrBase, true); }
+std::function<QImage()> AnnotationEditor::previewRendererOn(const QImage& hdrBase) const { return m_impl->canvas->rendererOn(hdrBase, true); }
+std::function<QImage(float*)> AnnotationEditor::pqPreviewRendererOn(const QImage& hdrBase, float referenceNits) const {
+    return [render=m_impl->canvas->pqRendererOn(hdrBase, referenceNits)](float* peak) { return render(peak,nullptr); };
+}
+std::function<HdrAnnotationPreview()> AnnotationEditor::pqPreviewFrameRendererOn(const QImage& hdrBase, float referenceNits, bool baseOnly) const {
+    return [render=m_impl->canvas->pqRendererOn(hdrBase, referenceNits, baseOnly)] {
+        HdrAnnotationPreview frame; frame.pixels=render(&frame.peakNits,&frame.damage); return frame;
+    };
+}
+bool AnnotationEditor::needsHdrAnnotationComposition() const { return m_impl->canvas->needsHdrComposition(); }
+void AnnotationEditor::setSaveActionVisible(bool visible) {
+    if (m_impl->save->isHidden() != visible) return;
+    m_impl->save->setVisible(visible);
+    m_impl->positionToolbar();
+}
+void AnnotationEditor::setHdrEnabled(bool enabled) {
+    if (m_impl->canvas->hdrEnabled == enabled) return;
+    m_impl->canvas->hdrEnabled = enabled;
+    m_impl->hdrGainSlider->setVisible(enabled);
+    if (m_impl->textGainSlider) m_impl->textGainSlider->setVisible(enabled);
+    m_impl->positionPopups();
+    if (!enabled) setExternalImagePresentation(false);
+    m_impl->canvas->update();
+}
+bool AnnotationEditor::hdrEnabled() const { return m_impl->canvas->hdrEnabled; }
+
+bool AnnotationEditor::externalImagePresentation() const { return m_impl->canvas->externalImagePresentation; }
+bool AnnotationEditor::externalAnnotationPresentation() const { return m_impl->canvas->externalAnnotationPresentation; }
+void AnnotationEditor::setAnnotationPresentation(bool ready,qreal opacity,qreal offset) { m_impl->canvas->presentation(ready,opacity,offset); }
+QImage AnnotationEditor::annotatedPreview(const QImage& image,const hyprcapture::ui::ScrollLayout& layout) const { return m_impl->canvas->annotatedPreview(image,layout); }

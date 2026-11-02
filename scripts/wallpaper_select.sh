@@ -4,7 +4,7 @@ if pidof rofi > /dev/null; then
     pkill rofi
 fi
 
-wallpapers_dir="$HOME/Pictures/Wallpapers"
+wallpapers_dir="$HOME/.config/hypr/assets/wallpapers"
 
 selected_wallpaper=$(for a in "$wallpapers_dir"/*; do
     echo -en "$(basename "${a%.*}")\0icon\x1f$a\n"
@@ -14,4 +14,4 @@ image_fullname_path=$(find "$wallpapers_dir" -type f -name "$selected_wallpaper.
 
 awww img "$image_fullname_path" --transition-type any --transition-duration 2
 
-~/.config/viegphunt/wallpaper_effects.sh
+~/.config/hypr/scripts/wallpaper_effects.sh

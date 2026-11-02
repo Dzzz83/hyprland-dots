@@ -1,0 +1,5663 @@
+#include "ui/capture_output.hpp"
+#include "ui/timing.hpp"
+#include "ui/mapped_image.hpp"
+#include "ui/scroll_capture.hpp"
+#include <QVariantAnimation>
+#include "ui/material_icon.hpp"
+#include "ui/desktop_theme.hpp"
+#include <QScrollArea>
+#include <QSlider>
+#include <QCheckBox>
+#include "ui/audio_meter.hpp"
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QCoreApplication>
+#include "ui/capture_overlay.hpp"
+#include "ui/hdr_image.hpp"
+#include "ui/hdr_thumbnail.hpp"
+#include "ui/hdr_backdrop.hpp"
+#include <QColorSpace>
+
+#include "ui/clipboard_utils.hpp"
+#include "ui/overlay_paint.hpp"
+#include "ui/remembered_settings.hpp"
+#include "audio/aec_policy.hpp"
+#include "ui/result_thumbnail.hpp"
+#include "ui/annotation_editor.hpp"
+#include "ui/i18n.hpp"
+#include "ui/screenshot_notification.hpp"
+#include "ui/watermark.hpp"
+#include "shared/protocol.hpp"
+#include "shared/audio_source.hpp"
+
+#include <LayerShellQt/Window>
+
+#include <QApplication>
+#include <QByteArray>
+#include <QButtonGroup>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QDir>
+#include <QElapsedTimer>
+#include <QEnterEvent>
+#include <QFile>
+#include <QFrame>
+#include <QFileInfo>
+#include <QGuiApplication>
+#include <QGraphicsOpacityEffect>
+#include <QHBoxLayout>
+#include <QIcon>
+#include <QImageWriter>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QLocalServer>
+#include <QLocalSocket>
+#include <QMouseEvent>
+#include <QMetaObject>
+#include <QPalette>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPixmap>
+#include <QPointer>
+#include <QProcess>
+#include <QPropertyAnimation>
+#include <QPushButton>
+#include <QRegularExpression>
+#include <QScreen>
+#include <QSizePolicy>
+#include <QStringList>
+#include <QStyleHints>
+#include <QSvgRenderer>
+#include <QThread>
+#include <QTemporaryDir>
+#include <QVBoxLayout>
+#include <QTimer>
+#include <QThreadPool>
+#include <QRunnable>
+#include <QTransform>
+#include <QWheelEvent>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <map>
+#include <memory>
+#include <utility>
+
+class InlineSelect final : public QWidget {
+  public:
+    explicit InlineSelect(QWidget* popupParent, QWidget* parent = nullptr);
+
+    void addItems(const QStringList& items);
+    void setPrefix(const QString& prefix);
+    void setLabels(const std::map<QString, QString>& labels) { m_labels = labels; addItems(m_items); setCurrentText(m_current); }
+    void setOnOpening(std::function<void()> callback) { m_onOpening = std::move(callback); }
+    void setCompactWidth(int width) { if (m_compactWidth == width) return; m_compactWidth = width; addItems(m_items); setCurrentText(m_current); }
+
+    void setSelectionHint(const QString& hint) { if (m_hint == hint) return; m_hint = hint; setCurrentText(m_current); }
+    void setOnChanged(std::function<void()> onChanged);
+    void setCurrentText(const QString& text);
+    QString currentText() const;
+    void setControlVisible(bool visible);
+    void hidePopup();
+    bool isPopupVisible() const;
+
+  private:
+    QString buttonText(const QString& text) const;
+    void updateButtonIcon();
+    void showPopup();
+    void positionPopup();
+    void choose(const QString& text);
+
+    QWidget*     m_popupParent = nullptr;
+    QPushButton* m_button = nullptr;
+    QFrame*      m_panel = nullptr;
+    QVBoxLayout* m_panelLayout = nullptr;
+    int          m_buttonWidth = 0;
+    QStringList  m_items;
+    QString      m_current;
+    QString      m_prefix;
+    QString      m_hint;
+    std::map<QString, QString> m_labels;
+    std::function<void()> m_onOpening;
+    int m_compactWidth = 0;
+
+    std::function<void()> m_onChanged;
+};
+
+namespace {
+
+InlineSelect* g_openSelect = nullptr;
+constexpr double kWindowFrameFallbackRadius = 8.0;
+constexpr int kOverlayFadeDurationMs = 100;
+constexpr int kModeIconSize = 24;
+constexpr int kCancelIconSize = 16;
+constexpr int kConfirmIconSize = 20;
+constexpr int kSelectArrowIconSize = 12;
+constexpr int kSelectionHandleHitRadius = 10;
+constexpr int kSelectionHandlePaintSize = 8;
+constexpr int kMaxArtifactDimension = 32768;
+constexpr qint64 kMaxArtifactBytes = 512LL * 1024LL * 1024LL;
+constexpr qint64 kMaxSessionArtifactBytes = 768LL * 1024LL * 1024LL;
+constexpr qint64 kMaxSessionJsonBytes = 8LL * 1024LL * 1024LL;
+constexpr int kMaxLogicalCoordinate = 1'000'000;
+constexpr int kMaxSessionMonitors = 64;
+constexpr int kMaxSessionWindows = 512;
+constexpr int kMaxRecordCountdownSeconds = 60;
+constexpr int kThumbnailPreviewMaxWidth = 720;
+constexpr int kThumbnailPreviewMaxHeight = 480;
+
+struct DispatchCommandResult {
+    bool    success = false;
+    QString error;
+};
+
+struct TransparentAutoChoice {
+    QString format;
+    QString codec;
+    QString warning;
+};
+
+
+QString qString(const std::string& value) {
+    return QString::fromStdString(value);
+}
+
+QString normalizedChoice(QString value) {
+    value = value.trimmed().toLower();
+    value.replace(QLatin1Char('_'), QLatin1Char('-'));
+    value.replace(QLatin1Char('.'), QLatin1Char('-'));
+    return value;
+}
+
+QString normalizedRecordFormat(QString value) {
+    return qString(hyprcapture::normalizeRecordFormat(value.toStdString()));
+}
+
+bool isImageAnimationRecordFormat(const QString& format) {
+    return hyprcapture::recordFormatIsImageAnimation(format.toStdString());
+}
+
+QString recordFormatFromTemplate(const std::string& filenameTemplate) {
+    const QString suffix = QFileInfo(qString(filenameTemplate)).suffix().toLower();
+    if (suffix == "webm" || suffix == "mkv" || suffix == "mp4" || suffix == "mov" || suffix == "gif" || suffix == "apng" || suffix == "webp")
+        return suffix;
+    return QStringLiteral("mp4");
+}
+
+QStringList animationDurationChoices() {
+    return QStringList{"3s", "5s", "10s", "15s", "30s"};
+}
+
+int animationDurationSeconds(QString value) {
+    value = value.trimmed().toLower();
+    if (value.endsWith(QLatin1Char('s')))
+        value.chop(1);
+    bool ok = false;
+    const int seconds = value.toInt(&ok);
+    if (ok && (seconds == 3 || seconds == 5 || seconds == 10 || seconds == 15 || seconds == 30))
+        return seconds;
+    return 5;
+}
+
+QString animationDurationChoice(std::int64_t seconds) {
+    return QStringLiteral("%1s").arg(animationDurationSeconds(QString::number(seconds)));
+}
+
+QString defaultRecordFormat(const hyprcapture::CaptureDefaults& defaults) {
+    const QString configured = normalizedRecordFormat(qString(defaults.recordFormat));
+    if (!configured.isEmpty())
+        return configured;
+    return recordFormatFromTemplate(defaults.recordFilenameTemplate);
+}
+
+bool solidAlphaBackground(hyprcapture::WindowBackground background) {
+    return background == hyprcapture::WindowBackground::White || background == hyprcapture::WindowBackground::Black ||
+        background == hyprcapture::WindowBackground::FollowSystem;
+}
+
+bool solidAlphaRecordingRequested(const hyprcapture::CaptureDefaults& defaults, hyprcapture::WindowBackground background) {
+    return defaults.recordSolidAlpha && solidAlphaBackground(background);
+}
+
+bool alphaRecordingRequested(const hyprcapture::CaptureDefaults& defaults, hyprcapture::WindowBackground background) {
+    return background == hyprcapture::WindowBackground::Transparent || solidAlphaRecordingRequested(defaults, background);
+}
+
+bool transparencyRequired(hyprcapture::WindowBackground background) {
+    return background == hyprcapture::WindowBackground::Transparent;
+}
+
+QString defaultRecordFormatForBackground(const hyprcapture::CaptureDefaults& defaults, hyprcapture::WindowBackground background) {
+    if (transparencyRequired(background))
+        return normalizedRecordFormat(qString(defaults.recordTransparentFormat));
+    return defaultRecordFormat(defaults);
+}
+
+QStringList recordFpsChoices(const hyprcapture::CaptureDefaults& defaults) {
+    QStringList choices;
+    const QStringList tokens = qString(defaults.recordFpsOptions).split(QRegularExpression(QStringLiteral("[,;\\s]+")), Qt::SkipEmptyParts);
+    for (const QString& token : tokens) {
+        bool ok = false;
+        const int fps = token.toInt(&ok);
+        if (!ok || fps < 1 || fps > 240)
+            continue;
+        const QString value = QString::number(fps);
+        if (!choices.contains(value))
+            choices.push_back(value);
+    }
+
+    const QString current = QString::number(std::clamp<std::int64_t>(defaults.recordFps, 1, 240));
+    if (!choices.contains(current))
+        choices.push_back(current);
+    if (choices.isEmpty())
+        choices = QStringList{"15", "24", "30", "60"};
+    return choices;
+}
+
+QString codecChoiceFromConfig(const std::string& codec) {
+    const QString value = normalizedChoice(qString(codec));
+    if (value == "libx264" || value == "h264" || value == "h264-vaapi" || value == "h264-nvenc")
+        return QStringLiteral("h264");
+    if (value == "libx265" || value == "h265" || value == "hevc" || value == "hevc-vaapi" || value == "h265-vaapi" ||
+        value == "hevc-nvenc" || value == "h265-nvenc")
+        return QStringLiteral("h265");
+    if (value == "libsvtav1" || value == "libaom-av1" || value == "librav1e" || value == "av1" || value == "av1-vaapi" ||
+        value == "av1-nvenc")
+        return QStringLiteral("av1");
+    if (value == "libvpx-vp9" || value == "vp9" || value == "vp9-vaapi")
+        return QStringLiteral("vp9");
+    if (value == "ffv1")
+        return QStringLiteral("ffv1");
+    return QStringLiteral("auto");
+}
+
+QString defaultRecordCodecForBackground(const hyprcapture::CaptureDefaults& defaults, hyprcapture::WindowBackground background) {
+    if (transparencyRequired(background))
+        return codecChoiceFromConfig(defaults.recordTransparentCodec);
+    return codecChoiceFromConfig(defaults.recordCodec);
+}
+
+QString codecConfigFromChoice(const QString& choice) {
+    const QString value = normalizedChoice(choice);
+    if (value == "h264")
+        return QStringLiteral("h264");
+    if (value == "h265")
+        return QStringLiteral("h265");
+    if (value == "av1")
+        return QStringLiteral("av1");
+    if (value == "vp9")
+        return QStringLiteral("vp9");
+    if (value == "ffv1")
+        return QStringLiteral("ffv1");
+    return QStringLiteral("auto");
+}
+
+QString firstWritableRenderDevice() {
+    for (int minor = 128; minor <= 143; ++minor) {
+        const QString path = QStringLiteral("/dev/dri/renderD%1").arg(minor);
+        const QFileInfo info(path);
+        if (info.exists() && info.isReadable() && info.isWritable())
+            return path;
+    }
+    return {};
+}
+
+QByteArray alphaProbeFrame() {
+    QByteArray frame;
+    frame.resize(16 * 16 * 4);
+    for (int y = 0; y < 16; ++y) {
+        for (int x = 0; x < 16; ++x) {
+            const qsizetype i = static_cast<qsizetype>(y * 16 + x) * 4;
+            frame[i] = static_cast<char>(x < 8 ? 255 : 0);
+            frame[i + 1] = static_cast<char>(y < 8 ? 255 : 0);
+            frame[i + 2] = static_cast<char>(128);
+            frame[i + 3] = static_cast<char>((x + y) % 3 == 0 ? 0 : ((x + y) % 3 == 1 ? 128 : 255));
+        }
+    }
+    return frame;
+}
+
+bool runProbeProcess(const QString& program, const QStringList& args, QByteArray* stdoutData = nullptr) {
+    if (program.isEmpty())
+        return false;
+    QProcess process;
+    process.setProgram(program);
+    process.setArguments(args);
+    process.setProcessEnvironment(hyprcapture::ui::trustedProcessEnvironment());
+    process.start();
+    if (!process.waitForStarted(1000))
+        return false;
+    if (!process.waitForFinished(3000)) {
+        process.kill();
+        process.waitForFinished(500);
+        return false;
+    }
+    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0)
+        return false;
+    if (stdoutData)
+        *stdoutData = process.readAllStandardOutput();
+    return true;
+}
+
+bool decodedFrameHasAlpha(const QString& path) {
+    const QString ffmpeg = hyprcapture::ui::trustedSystemProgram(QStringLiteral("ffmpeg"));
+    QByteArray decoded;
+    if (!runProbeProcess(ffmpeg,
+                         QStringList{QStringLiteral("-hide_banner"),
+                                     QStringLiteral("-loglevel"),
+                                     QStringLiteral("error"),
+                                     QStringLiteral("-i"),
+                                     path,
+                                     QStringLiteral("-frames:v"),
+                                     QStringLiteral("1"),
+                                     QStringLiteral("-f"),
+                                     QStringLiteral("rawvideo"),
+                                     QStringLiteral("-pix_fmt"),
+                                     QStringLiteral("rgba"),
+                                     QStringLiteral("-")},
+                         &decoded))
+        return false;
+    if (decoded.size() < 16 * 16 * 4)
+        return false;
+    for (qsizetype i = 3; i < decoded.size(); i += 4) {
+        if (static_cast<unsigned char>(decoded[i]) < 250)
+            return true;
+    }
+    return false;
+}
+
+bool webmHasAlphaMode(const QString& path) {
+    const QString ffprobe = hyprcapture::ui::trustedSystemProgram(QStringLiteral("ffprobe"));
+    QByteArray output;
+    if (!runProbeProcess(ffprobe,
+                         QStringList{QStringLiteral("-hide_banner"),
+                                     QStringLiteral("-loglevel"),
+                                     QStringLiteral("error"),
+                                     QStringLiteral("-show_entries"),
+                                     QStringLiteral("stream_tags=alpha_mode"),
+                                     QStringLiteral("-of"),
+                                     QStringLiteral("default=nw=1:nk=1"),
+                                     path},
+                         &output))
+        return false;
+    return QString::fromUtf8(output).trimmed() == QStringLiteral("1");
+}
+
+bool alphaProbeSucceeded(const QString& format, const QString& codecChoice) {
+    const QString normalizedFormat = normalizedRecordFormat(format);
+    const QString normalizedCodec = normalizedChoice(codecChoice);
+    static std::map<QString, bool> cache;
+    const QString key = normalizedFormat + QLatin1Char('|') + normalizedCodec;
+    if (const auto it = cache.find(key); it != cache.end())
+        return it->second;
+
+    const QString ffmpeg = hyprcapture::ui::trustedSystemProgram(QStringLiteral("ffmpeg"));
+    QTemporaryDir dir;
+    if (ffmpeg.isEmpty() || !dir.isValid()) {
+        cache[key] = false;
+        return false;
+    }
+
+    const QString inputPath = dir.filePath(QStringLiteral("input.rgba"));
+    QFile input(inputPath);
+    if (!input.open(QIODevice::WriteOnly) || input.write(alphaProbeFrame()) != 16 * 16 * 4) {
+        cache[key] = false;
+        return false;
+    }
+    input.close();
+
+    const QString outputPath = dir.filePath(QStringLiteral("output.") + normalizedFormat);
+    QStringList args{QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"), QStringLiteral("error"), QStringLiteral("-y")};
+    if (normalizedCodec == "vp9-vaapi") {
+        const QString renderDevice = firstWritableRenderDevice();
+        if (renderDevice.isEmpty()) {
+            cache[key] = false;
+            return false;
+        }
+        args << QStringLiteral("-vaapi_device") << renderDevice;
+    }
+    args << QStringLiteral("-f") << QStringLiteral("rawvideo") << QStringLiteral("-pix_fmt") << QStringLiteral("rgba") << QStringLiteral("-video_size")
+         << QStringLiteral("16x16") << QStringLiteral("-framerate") << QStringLiteral("1") << QStringLiteral("-i") << inputPath << QStringLiteral("-frames:v")
+         << QStringLiteral("1") << QStringLiteral("-an");
+
+    if (normalizedCodec == "vp9-vaapi") {
+        args << QStringLiteral("-vf") << QStringLiteral("format=rgba,hwupload,scale_vaapi=format=nv12") << QStringLiteral("-c:v")
+             << QStringLiteral("vp9_vaapi") << QStringLiteral("-qp") << QStringLiteral("23") << QStringLiteral("-quality") << QStringLiteral("7");
+    } else if (normalizedCodec == "vp9") {
+        args << QStringLiteral("-c:v") << QStringLiteral("libvpx-vp9") << QStringLiteral("-pix_fmt") << QStringLiteral("yuva420p")
+             << QStringLiteral("-deadline") << QStringLiteral("realtime") << QStringLiteral("-cpu-used") << QStringLiteral("8") << QStringLiteral("-b:v")
+             << QStringLiteral("0") << QStringLiteral("-crf") << QStringLiteral("32");
+    } else if (normalizedCodec == "ffv1") {
+        args << QStringLiteral("-c:v") << QStringLiteral("ffv1") << QStringLiteral("-level") << QStringLiteral("3") << QStringLiteral("-pix_fmt")
+             << QStringLiteral("rgba");
+    } else {
+        cache[key] = false;
+        return false;
+    }
+    args << outputPath;
+
+    const bool encoded = runProbeProcess(ffmpeg, args);
+    const bool preservesAlpha = encoded && (normalizedFormat == "webm" ? webmHasAlphaMode(outputPath) : decodedFrameHasAlpha(outputPath));
+    cache[key] = preservesAlpha;
+    return preservesAlpha;
+}
+
+TransparentAutoChoice transparentAutoChoiceForFormat(QString format) {
+    format = normalizedRecordFormat(format);
+    if (format == "webm") {
+        for (const QString& codec : QStringList{QStringLiteral("vp9-vaapi")}) {
+            if (alphaProbeSucceeded(format, codec))
+                return {.format = format, .codec = codec};
+        }
+        const QString fallback = alphaProbeSucceeded(format, QStringLiteral("vp9")) ? QStringLiteral("vp9") : QStringLiteral("auto");
+        return {.format = format, .codec = fallback, .warning = QStringLiteral("no hardware alpha encoder detected; using CPU vp9")};
+    }
+    if (format == "mkv") {
+        const QString fallback = alphaProbeSucceeded(format, QStringLiteral("ffv1")) ? QStringLiteral("ffv1") : QStringLiteral("auto");
+        return {.format = format, .codec = fallback, .warning = QStringLiteral("no hardware alpha encoder detected; using CPU ffv1")};
+    }
+    return {.format = format, .codec = QStringLiteral("auto")};
+}
+
+QString recordTemplateWithFormat(const std::string& filenameTemplate, const QString& format) {
+    QString value = qString(filenameTemplate);
+    if (value.trimmed().isEmpty())
+        value = QStringLiteral("Recording-%Y-%m-%d-%H%M%S");
+    QFileInfo info(value);
+    const QString suffix = info.suffix();
+    if (!suffix.isEmpty())
+        value.chop(suffix.size() + 1);
+    return value + QLatin1Char('.') + normalizedRecordFormat(format);
+}
+
+using hyprcapture::ui::traceTiming;
+using hyprcapture::ui::CaptureOutputResult;
+using hyprcapture::ui::savePng;
+using hyprcapture::ui::plannedCaptureOutputPath;
+using hyprcapture::ui::sdrCaptureOutputPath;
+using hyprcapture::ui::writeCaptureOutput;
+using hyprcapture::ui::ScopedUiTiming;
+
+void applyHdrWatermark(QImage& image, const hyprcapture::CaptureDefaults& defaults) {
+    if (image.isNull() || defaults.watermark.empty()) return;
+    QImage layer(image.size(), QImage::Format_ARGB32_Premultiplied);
+    layer.fill(Qt::transparent);
+    hyprcapture::ui::applyWatermark(layer, defaults);
+    QPainter painter(&image);
+    painter.drawImage(QPoint(0, 0), hyprcapture::ui::sdrToHdr(layer));
+}
+
+bool writePrivateTextFile(const QString& path, const QByteArray& bytes) {
+    if (path.isEmpty() || bytes.isEmpty() || !hyprcapture::ui::isPrivateRuntimePath(path))
+        return false;
+
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly, QFileDevice::ReadOwner | QFileDevice::WriteOwner))
+        return false;
+    if (!file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner)) {
+        file.remove();
+        return false;
+    }
+    if (file.write(bytes) != bytes.size()) {
+        file.remove();
+        return false;
+    }
+    return true;
+}
+
+QString compactProcessErrorText(const QByteArray& stderrData, const QByteArray& stdoutData, const QString& fallback) {
+    QString error = QString::fromUtf8(stderrData).trimmed();
+    if (error.isEmpty())
+        error = QString::fromUtf8(stdoutData).trimmed();
+    if (error.startsWith(QStringLiteral("[hyprcapture] ")))
+        error = error.mid(QStringLiteral("[hyprcapture] ").size()).trimmed();
+    if (error.isEmpty())
+        error = fallback;
+    return error.left(160);
+}
+
+bool hyprctlOutputHasError(const QByteArray& stderrData, const QByteArray& stdoutData) {
+    const QString stderrText = QString::fromUtf8(stderrData).trimmed();
+    const QString stdoutText = QString::fromUtf8(stdoutData).trimmed();
+    return stderrText.startsWith(QStringLiteral("error:"), Qt::CaseInsensitive) ||
+        stdoutText.startsWith(QStringLiteral("error:"), Qt::CaseInsensitive);
+}
+
+DispatchCommandResult evalHyprcaptureExpression(const QString& expression) {
+    const QString hyprctl = hyprcapture::ui::trustedSystemProgram(QStringLiteral("hyprctl"));
+    if (hyprctl.isEmpty() || expression.isEmpty())
+        return {.success = false, .error = QStringLiteral("hyprctl unavailable")};
+
+    QProcess process;
+    process.setProgram(hyprctl);
+    process.setArguments(QStringList{QStringLiteral("eval"), expression});
+    process.setProcessEnvironment(hyprcapture::ui::trustedProcessEnvironment());
+    process.start();
+    if (!process.waitForStarted(1000))
+        return {.success = false, .error = QStringLiteral("hyprctl start failed")};
+    if (!process.waitForFinished(5000)) {
+        process.kill();
+        process.waitForFinished(500);
+        return {.success = false, .error = QStringLiteral("hyprctl timeout")};
+    }
+    const QByteArray stderrData = process.readAllStandardError();
+    const QByteArray stdoutData = process.readAllStandardOutput();
+    if (process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0 && !hyprctlOutputHasError(stderrData, stdoutData))
+        return {.success = true};
+    return {.success = false, .error = compactProcessErrorText(stderrData, stdoutData, QStringLiteral("eval failed"))};
+}
+
+DispatchCommandResult runHymissionCaptureInputCommand(const QString& action, const QString& token) {
+    const QString hyprctl = hyprcapture::ui::trustedSystemProgram(QStringLiteral("hyprctl"));
+    if (hyprctl.isEmpty() || action.isEmpty() || token.isEmpty())
+        return {.success = false, .error = QStringLiteral("hyprctl unavailable")};
+
+    QProcess process;
+    process.setProgram(hyprctl);
+    process.setArguments(QStringList{QStringLiteral("hymission-capture-input"), action, token});
+    process.setProcessEnvironment(hyprcapture::ui::trustedProcessEnvironment());
+    process.start();
+    if (!process.waitForStarted(1000))
+        return {.success = false, .error = QStringLiteral("hyprctl start failed")};
+    if (!process.waitForFinished(1000)) {
+        process.kill();
+        process.waitForFinished(500);
+        return {.success = false, .error = QStringLiteral("hyprctl timeout")};
+    }
+
+    const QByteArray stderrData = process.readAllStandardError();
+    const QByteArray stdoutData = process.readAllStandardOutput();
+    const QString    stdoutText = QString::fromUtf8(stdoutData).trimmed();
+    if (process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0 && stdoutText.startsWith(QStringLiteral("ok")) &&
+        !hyprctlOutputHasError(stderrData, stdoutData))
+        return {.success = true};
+
+    return {.success = false, .error = compactProcessErrorText(stderrData, stdoutData, QStringLiteral("hymission capture input failed"))};
+}
+
+QString luaStringLiteral(const QString& value) {
+    const QJsonArray array{value};
+    const QString json = QString::fromUtf8(QJsonDocument(array).toJson(QJsonDocument::Compact));
+    return json.size() >= 2 ? json.mid(1, json.size() - 2) : QStringLiteral("\"\"");
+}
+
+DispatchCommandResult evalHyprcaptureLuaFunction(const QString& function, const QString& argument = {}) {
+    if (function.isEmpty())
+        return {.success = false, .error = QStringLiteral("lua function missing")};
+
+    QString expression = QStringLiteral("hl.plugin.hyprcapture.%1(").arg(function);
+    if (!argument.isEmpty())
+        expression += luaStringLiteral(argument);
+    expression += QStringLiteral(")");
+    return evalHyprcaptureExpression(expression);
+}
+
+DispatchCommandResult dispatchRecordingStart(const QString& requestPath) {
+    if (requestPath.isEmpty())
+        return {.success = false, .error = QStringLiteral("record request missing")};
+
+    return evalHyprcaptureLuaFunction(QStringLiteral("record_start"), requestPath);
+}
+
+DispatchCommandResult dispatchWindowCapture(const QString& requestPath) {
+    if (requestPath.isEmpty())
+        return {.success = false, .error = QStringLiteral("window capture request missing")};
+
+    return evalHyprcaptureLuaFunction(QStringLiteral("window_capture"), requestPath);
+}
+
+DispatchCommandResult dispatchRecordingStop() {
+    return evalHyprcaptureLuaFunction(QStringLiteral("record_stop"));
+}
+
+void cleanupArtifactFiles(const QStringList& paths) {
+    QStringList dirs;
+    for (const QString& path : paths) {
+        if (!hyprcapture::ui::isPrivateRuntimePath(path))
+            continue;
+        QFile::remove(path);
+        const QString dir = QFileInfo(path).absolutePath();
+        if (!dirs.contains(dir))
+            dirs.push_back(dir);
+    }
+
+    for (const QString& dir : dirs) {
+        if (!hyprcapture::ui::isPrivateRuntimePath(dir))
+            continue;
+        QDir parent(QFileInfo(dir).absolutePath());
+        parent.rmdir(QFileInfo(dir).fileName());
+    }
+}
+
+QString thumbnailTargetPath(const hyprcapture::CaptureDefaults& defaults, const QString& plannedOutputPath) {
+    if (defaults.save)
+        return plannedOutputPath;
+    if (!defaults.showThumbnail)
+        return {};
+    return hyprcapture::ui::runtimeFile("thumbnail-full", defaults.screenshotFormat == "heic" ? ".heic" : ".png");
+}
+
+QString thumbnailDeleteRoot(const hyprcapture::CaptureDefaults& defaults) {
+    if (!defaults.save)
+        return {};
+    return QString::fromStdString(hyprcapture::expandUserPath(defaults.saveDir).string());
+}
+
+QString saveThumbnailPreview(const QImage& image) {
+    if (image.isNull())
+        return {};
+
+    QElapsedTimer timer;
+    timer.start();
+    const QSize maxSize(kThumbnailPreviewMaxWidth, kThumbnailPreviewMaxHeight);
+    QImage preview = image;
+    if (preview.width() > maxSize.width() || preview.height() > maxSize.height())
+        preview = preview.scaled(maxSize, Qt::KeepAspectRatio, Qt::FastTransformation);
+
+    const QString path = hyprcapture::ui::runtimeFile("thumbnail-preview", ".png");
+    if (!hyprcapture::ui::savePrivatePng(preview, path))
+        return {};
+    traceTiming(QStringLiteral("thumbnail_preview_save"), timer.elapsed());
+    return path;
+}
+
+double maxScreenDevicePixelRatio() {
+    double dpr = 1.0;
+    for (const auto* screen : QGuiApplication::screens())
+        dpr = std::max(dpr, screen ? screen->devicePixelRatio() : 1.0);
+    return dpr;
+}
+
+QIcon toolbarIcon(std::string_view name, double rotationDegrees = 0.0) {
+    return hyprcapture::ui::materialIcon(name, QApplication::palette().color(QPalette::WindowText), rotationDegrees);
+}
+
+QColor followSystemColor() {
+    const auto scheme = QGuiApplication::styleHints()->colorScheme();
+    if (scheme == Qt::ColorScheme::Light)
+        return QColor(245, 245, 245);
+    if (scheme == Qt::ColorScheme::Dark)
+        return QColor(17, 19, 23);
+
+    const QColor window = QApplication::palette().color(QPalette::Window);
+    const double luminance = 0.2126 * window.redF() + 0.7152 * window.greenF() + 0.0722 * window.blueF();
+    return luminance >= 0.5 ? QColor(245, 245, 245) : QColor(17, 19, 23);
+}
+
+QString cssRgba(QColor color, int alpha = -1) {
+    if (alpha >= 0)
+        color.setAlpha(alpha);
+    return QStringLiteral("rgba(%1,%2,%3,%4)").arg(color.red()).arg(color.green()).arg(color.blue()).arg(color.alpha());
+}
+
+QColor mixedColor(QColor a, QColor b, double amount) {
+    const auto mix = [&](int av, int bv) { return static_cast<int>(std::round(av * (1.0 - amount) + bv * amount)); };
+    return QColor(mix(a.red(), b.red()), mix(a.green(), b.green()), mix(a.blue(), b.blue()), mix(a.alpha(), b.alpha()));
+}
+
+QString toolbarStyleSheet(const QPalette& palette) {
+    const QColor window = palette.color(QPalette::Window);
+    const QColor button = palette.color(QPalette::Button);
+    const QColor text = palette.color(QPalette::WindowText);
+    const QColor highlight = palette.color(QPalette::Highlight);
+    const QColor highlightedText = palette.color(QPalette::HighlightedText);
+    const QColor border(hyprcapture::ui::theme::border);
+    const QColor hover = mixedColor(button, highlight, 0.16);
+    const QColor checked = mixedColor(button, highlight, 0.32);
+    const QColor modeChecked = mixedColor(button, highlight, 0.32);
+    const QColor recordArmed = mixedColor(button, highlight, 0.32);
+    const QColor recordChecked(hyprcapture::ui::theme::red);
+    const QColor recordPressed = QColor(hyprcapture::ui::theme::red).darker(115);
+
+    return QStringLiteral(
+               "#toolbar { background: %1; border: 1px solid %2; border-radius: 10px; }"
+               "QPushButton { color: %3; background: transparent; padding: 6px 10px; border: none; border-radius: 5px; outline: none; }"
+               "QPushButton:hover { background: %4; }"
+               "QPushButton:checked { color: %3; background: %5; }"
+               "QPushButton:pressed { color: %6; background: %7; }"
+               "#dynamicRangeControl QPushButton:checked, #dynamicRangeControl QPushButton:pressed { color: %3; background: %8; }"
+               "QPushButton#aecRetest { background: %12; }"
+               "QPushButton#aecRetest:hover { background: %4; }"
+               "QPushButton#aecRetest:pressed { background: %7; }"
+               "QPushButton#captureModeButton { padding: 4px 6px; background: transparent; border: none; outline: none; }"
+               "QPushButton#captureModeButton:hover { background: transparent; }"
+               "QPushButton#captureModeButton:checked { background: %8; border-radius: 7px; }"
+               "QPushButton#captureModeButton:pressed { background: %8; border-radius: 7px; }"
+               "QPushButton#recordToggleButton { padding: 4px 6px; background: transparent; border: none; outline: none; }"
+               "QPushButton#recordToggleButton:hover { background: transparent; }"
+               "QPushButton#recordToggleButton:checked { background: %9; border-radius: 7px; }"
+               "QPushButton#recordToggleButton:pressed { background: %9; border-radius: 7px; }"
+               "QPushButton#recordActiveButton { padding: 4px 6px; background: transparent; border: none; outline: none; }"
+               "QPushButton#recordActiveButton:hover { background: transparent; }"
+               "QPushButton#recordActiveButton:checked { background: %10; border-radius: 7px; }"
+               "QPushButton#recordActiveButton:pressed { background: %11; border-radius: 7px; }"
+               "QLabel { color: %3; }")
+        .arg(cssRgba(window, 238),
+             cssRgba(border, 150),
+             cssRgba(text),
+             cssRgba(hover, 180),
+             cssRgba(checked, 220),
+             cssRgba(highlightedText),
+             cssRgba(highlight),
+             cssRgba(modeChecked),
+             cssRgba(recordArmed, 190),
+             cssRgba(recordChecked, 220),
+             cssRgba(recordPressed, 230),
+             cssRgba(mixedColor(window, text, 0.06)));
+}
+
+QString popupStyleSheet(const QPalette& palette) {
+    const QColor window = palette.color(QPalette::Window);
+    const QColor button = palette.color(QPalette::Button);
+    const QColor text = palette.color(QPalette::WindowText);
+    const QColor highlight = palette.color(QPalette::Highlight);
+    const QColor highlightedText = palette.color(QPalette::HighlightedText);
+    const QColor border(hyprcapture::ui::theme::border);
+    const QColor hover = mixedColor(button, highlight, 0.16);
+
+    return QStringLiteral(
+               "#inlineSelectPopup { background: %1; border: 1px solid %2; border-radius: 7px; }"
+               "#inlineSelectPopup QPushButton { color: %3; background: transparent; padding: 7px 12px; border: none; border-radius: 5px; text-align: left; }"
+               "#inlineSelectPopup QPushButton:hover { background: %4; }"
+               "#inlineSelectPopup QPushButton:checked { color: %5; background: %6; }")
+        .arg(cssRgba(window, 246), cssRgba(border, 150), cssRgba(text), cssRgba(hover, 210), cssRgba(highlightedText), cssRgba(highlight));
+}
+
+bool imageSizeWithinBounds(const QSize& size) {
+    if (size.isEmpty() || size.width() <= 0 || size.height() <= 0 || size.width() > kMaxArtifactDimension || size.height() > kMaxArtifactDimension)
+        return false;
+
+    const auto width = static_cast<qint64>(size.width());
+    const auto height = static_cast<qint64>(size.height());
+    if (width > std::numeric_limits<qint64>::max() / height)
+        return false;
+    const auto pixels = width * height;
+    if (pixels > std::numeric_limits<qint64>::max() / 4)
+        return false;
+    return pixels * 4 <= kMaxArtifactBytes;
+}
+
+QImage boundedImage(const QSize& size, QImage::Format format) {
+    if (!imageSizeWithinBounds(size))
+        return {};
+    const int bytesPerPixel = format == QImage::Format_RGBA16FPx4_Premultiplied || format == QImage::Format_RGBA16FPx4 ? 8 : 4;
+    if (qint64(size.width()) * size.height() * bytesPerPixel > kMaxArtifactBytes) return {};
+    return QImage(size, format);
+}
+
+QSize boundedScaledSize(int width, int height, double scaleX, double scaleY) {
+    if (width <= 0 || height <= 0 || !std::isfinite(scaleX) || !std::isfinite(scaleY) || scaleX <= 0.0 || scaleY <= 0.0)
+        return {};
+
+    const double scaledWidth = std::ceil(width * scaleX);
+    const double scaledHeight = std::ceil(height * scaleY);
+    if (!std::isfinite(scaledWidth) || !std::isfinite(scaledHeight) || scaledWidth < 1.0 || scaledHeight < 1.0 ||
+        scaledWidth > kMaxArtifactDimension || scaledHeight > kMaxArtifactDimension)
+        return {};
+
+    const QSize size(static_cast<int>(scaledWidth), static_cast<int>(scaledHeight));
+    return imageSizeWithinBounds(size) ? size : QSize{};
+}
+
+bool boundedDoubleToInt(double value, int minimum, int maximum, bool ceilValue, int& out) {
+    if (!std::isfinite(value))
+        return false;
+    const double rounded = ceilValue ? std::ceil(value) : std::floor(value);
+    if (rounded < minimum || rounded > maximum)
+        return false;
+    out = static_cast<int>(rounded);
+    return true;
+}
+
+QRect protocolRect(const hyprcapture::Rect& rect) {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+    if (!boundedDoubleToInt(rect.x, -kMaxLogicalCoordinate, kMaxLogicalCoordinate, false, x) ||
+        !boundedDoubleToInt(rect.y, -kMaxLogicalCoordinate, kMaxLogicalCoordinate, false, y) ||
+        !boundedDoubleToInt(rect.width, 1, kMaxArtifactDimension, true, width) ||
+        !boundedDoubleToInt(rect.height, 1, kMaxArtifactDimension, true, height))
+        return {};
+
+    return QRect(QPoint(x, y), QSize(width, height));
+}
+
+bool protocolPoint(const hyprcapture::Point& input, QPoint& point) {
+    int x = 0;
+    int y = 0;
+    if (!boundedDoubleToInt(input.x, -kMaxLogicalCoordinate, kMaxLogicalCoordinate, false, x) ||
+        !boundedDoubleToInt(input.y, -kMaxLogicalCoordinate, kMaxLogicalCoordinate, false, y))
+        return false;
+
+    point = QPoint(x, y);
+    return true;
+}
+
+QImage loadRawRgba(const QString& path, int width, int height, bool topDown, qint64& remainingSessionBytes,
+                   const std::string& format = "rgba8", double referenceNits = 80.0, QImage* hdr = nullptr) {
+    QFile file(path);
+    if (path.isEmpty() || width <= 0 || height <= 0 || width > kMaxArtifactDimension || height > kMaxArtifactDimension)
+        return {};
+
+    const bool linear = format == "rgba16f-linear-srgb";
+    const auto pixelFormat = linear ? QImage::Format_RGBA16FPx4 : QImage::Format_RGBA8888;
+    const qint64 expected = static_cast<qint64>(width) * static_cast<qint64>(height) * (linear ? 8 : 4);
+    const auto finish = [&](QImage image) {
+        if (!topDown) image = image.flipped(Qt::Vertical);
+        image.setColorSpace(linear ? QColorSpace::SRgbLinear : QColorSpace::SRgb);
+        if (linear) {
+            if (hdr) *hdr = image;
+            ScopedUiTiming timing("overlay.render.hdr_to_sdr");
+            return hyprcapture::ui::hdrToSdr(image, referenceNits);
+        }
+        return image;
+    };
+    if (expected <= 0 || expected > kMaxArtifactBytes || expected > remainingSessionBytes || !hyprcapture::ui::isPrivateRuntimeFile(path, expected) ||
+        !file.open(QIODevice::ReadOnly))
+        return {};
+
+    if (file.size() != expected)
+        return {};
+    QImage image = hyprcapture::ui::mapRawRgba(file, width, height, pixelFormat);
+    if (!image.isNull()) {
+        remainingSessionBytes -= expected;
+        return finish(image);
+    }
+    // Mapping is an optimization, not a prerequisite (e.g. address-space
+    // pressure). Retain the bounded owned-buffer path as a fallback.
+    image = QImage(width, height, pixelFormat);
+    if (image.isNull())
+        return {};
+    qint64 read = 0;
+    while (read < expected) {
+        const auto count = file.read(reinterpret_cast<char*>(image.bits()) + read, expected - read);
+        if (count <= 0)
+            return {};
+        read += count;
+    }
+    if (!file.atEnd())
+        return {};
+    remainingSessionBytes -= expected;
+    return finish(std::move(image));
+}
+
+int inverseRotationDegreesForMonitorTransform(int transform) {
+    switch (transform) {
+        case 1:
+        case 5: return 90;
+        case 2:
+        case 6: return 180;
+        case 3:
+        case 7: return -90;
+        default: return 0;
+    }
+}
+
+QImage rotateMonitorArtifactToLogicalOrientation(const QImage& image, int transform) {
+    if (transform == 0 || image.isNull())
+        return image;
+
+    QTransform imageTransform;
+    imageTransform.rotate(inverseRotationDegreesForMonitorTransform(transform));
+    return image.transformed(imageTransform, Qt::FastTransformation).convertToFormat(QImage::Format_RGBA8888);
+}
+
+QImage normalizeMonitorArtifactImage(const QImage& image, int transform, const QRect& logicalGeometry) {
+    Q_UNUSED(logicalGeometry)
+    if (image.isNull() || transform == 0)
+        return image;
+
+    return rotateMonitorArtifactToLogicalOrientation(image, transform);
+}
+
+QRect projectedImageRect(const QRect& logicalRect, const QRect& fullGeometry, const QSize& imageSize) {
+    if (!logicalRect.isValid() || !fullGeometry.isValid() || imageSize.isEmpty())
+        return {};
+
+    const double scaleX = static_cast<double>(imageSize.width()) / std::max(1, fullGeometry.width());
+    const double scaleY = static_cast<double>(imageSize.height()) / std::max(1, fullGeometry.height());
+    QRect rect(QPoint(static_cast<int>(std::floor((logicalRect.x() - fullGeometry.x()) * scaleX)),
+                      static_cast<int>(std::floor((logicalRect.y() - fullGeometry.y()) * scaleY))),
+               QSize(std::max(1, static_cast<int>(std::ceil(logicalRect.width() * scaleX))),
+                     std::max(1, static_cast<int>(std::ceil(logicalRect.height() * scaleY)))));
+
+    // Some Hyprland fake-render paths draw the window below its nominal crop and
+    // the plugin shifts the readback up. Keep the expected visible size instead
+    // of losing the bottom rows when that makes the projected top negative.
+    if (rect.x() < 0)
+        rect.moveLeft(0);
+    if (rect.y() < 0)
+        rect.moveTop(0);
+    return rect.intersected(QRect(QPoint(0, 0), imageSize));
+}
+
+QRect artifactRectToLogicalRect(const QRect& artifactRect, const QSize& artifactSize, const QRect& fullGeometry) {
+    if (!artifactRect.isValid() || artifactSize.isEmpty() || !fullGeometry.isValid())
+        return {};
+
+    const double scaleX = static_cast<double>(fullGeometry.width()) / std::max(1, artifactSize.width());
+    const double scaleY = static_cast<double>(fullGeometry.height()) / std::max(1, artifactSize.height());
+    const int x1 = fullGeometry.x() + static_cast<int>(std::floor(artifactRect.x() * scaleX));
+    const int y1 = fullGeometry.y() + static_cast<int>(std::floor(artifactRect.y() * scaleY));
+    const int x2 = fullGeometry.x() + static_cast<int>(std::ceil((artifactRect.x() + artifactRect.width()) * scaleX));
+    const int y2 = fullGeometry.y() + static_cast<int>(std::ceil((artifactRect.y() + artifactRect.height()) * scaleY));
+    return QRect(QPoint(x1, y1), QSize(std::max(1, x2 - x1), std::max(1, y2 - y1))).intersected(fullGeometry);
+}
+
+QRect logicalRectToImageRect(const QRect& logicalRect, const QRect& logicalGeometry, const QSize& imageSize) {
+    const QRect clipped = logicalRect.intersected(logicalGeometry);
+    if (!clipped.isValid() || !logicalGeometry.isValid() || imageSize.isEmpty())
+        return {};
+
+    const double scaleX = static_cast<double>(imageSize.width()) / std::max(1, logicalGeometry.width());
+    const double scaleY = static_cast<double>(imageSize.height()) / std::max(1, logicalGeometry.height());
+    const int x1 = static_cast<int>(std::floor((clipped.x() - logicalGeometry.x()) * scaleX));
+    const int y1 = static_cast<int>(std::floor((clipped.y() - logicalGeometry.y()) * scaleY));
+    const int x2 = static_cast<int>(std::ceil((clipped.x() + clipped.width() - logicalGeometry.x()) * scaleX));
+    const int y2 = static_cast<int>(std::ceil((clipped.y() + clipped.height() - logicalGeometry.y()) * scaleY));
+    return QRect(QPoint(x1, y1), QSize(std::max(1, x2 - x1), std::max(1, y2 - y1))).intersected(QRect(QPoint(0, 0), imageSize));
+}
+
+QRect logicalRectToOutputRect(const QRect& logicalRect, const QRect& outputLogicalGeometry, double scaleX, double scaleY) {
+    if (!logicalRect.isValid() || !outputLogicalGeometry.isValid() || scaleX <= 0.0 || scaleY <= 0.0)
+        return {};
+
+    const int x1 = static_cast<int>(std::floor((logicalRect.x() - outputLogicalGeometry.x()) * scaleX));
+    const int y1 = static_cast<int>(std::floor((logicalRect.y() - outputLogicalGeometry.y()) * scaleY));
+    const int x2 = static_cast<int>(std::ceil((logicalRect.x() + logicalRect.width() - outputLogicalGeometry.x()) * scaleX));
+    const int y2 = static_cast<int>(std::ceil((logicalRect.y() + logicalRect.height() - outputLogicalGeometry.y()) * scaleY));
+    return QRect(QPoint(x1, y1), QSize(std::max(1, x2 - x1), std::max(1, y2 - y1)));
+}
+
+QPointF superellipsePoint(const QPointF& center, double radius, double power, double signX, double signY, double theta) {
+    const double exponent = 2.0 / std::clamp(power, 1.0, 10.0);
+    const double x = std::pow(std::max(0.0, std::cos(theta)), exponent) * radius;
+    const double y = std::pow(std::max(0.0, std::sin(theta)), exponent) * radius;
+    return {center.x() + signX * x, center.y() + signY * y};
+}
+
+void appendSuperellipseCorner(QPainterPath& path,
+                              const QPointF& center,
+                              double radius,
+                              double power,
+                              double signX,
+                              double signY,
+                              double startTheta,
+                              double endTheta) {
+    const int steps = std::clamp(static_cast<int>(std::ceil(radius / 2.0)), 8, 32);
+    for (int i = 1; i <= steps; ++i) {
+        const double t = static_cast<double>(i) / steps;
+        path.lineTo(superellipsePoint(center, radius, power, signX, signY, startTheta + (endTheta - startTheta) * t));
+    }
+}
+
+QPainterPath roundedWindowFramePath(const QRectF& rawRect, double radius, double power) {
+    const QRectF rect = rawRect.normalized();
+    QPainterPath path;
+    if (!rect.isValid())
+        return path;
+
+    radius = std::clamp(radius, 0.0, std::min(rect.width(), rect.height()) / 2.0);
+    if (radius <= 0.0) {
+        path.addRect(rect);
+        return path;
+    }
+
+    constexpr double halfPi = 1.57079632679489661923;
+    const double left = rect.left();
+    const double top = rect.top();
+    const double right = rect.right();
+    const double bottom = rect.bottom();
+
+    path.moveTo(left + radius, top);
+    path.lineTo(right - radius, top);
+    appendSuperellipseCorner(path, {right - radius, top + radius}, radius, power, 1.0, -1.0, halfPi, 0.0);
+    path.lineTo(right, bottom - radius);
+    appendSuperellipseCorner(path, {right - radius, bottom - radius}, radius, power, 1.0, 1.0, 0.0, halfPi);
+    path.lineTo(left + radius, bottom);
+    appendSuperellipseCorner(path, {left + radius, bottom - radius}, radius, power, -1.0, 1.0, halfPi, 0.0);
+    path.lineTo(left, top + radius);
+    appendSuperellipseCorner(path, {left + radius, top + radius}, radius, power, -1.0, -1.0, 0.0, halfPi);
+    path.closeSubpath();
+    return path;
+}
+
+bool paintWindowBackground(QImage& background, hyprcapture::WindowBackground bg, QColor systemColor = {}) {
+    if (background.isNull() || bg == hyprcapture::WindowBackground::Transparent)
+        return false;
+
+    QPainter backgroundPainter(&background);
+    if (bg == hyprcapture::WindowBackground::Real) {
+        // A monitor image already contains the foreground. It cannot supply
+        // an independent background, especially after a scrolling extension.
+        return false;
+    }
+
+    if (bg == hyprcapture::WindowBackground::White)
+        backgroundPainter.fillRect(background.rect(), Qt::white);
+    else if (bg == hyprcapture::WindowBackground::Black)
+        backgroundPainter.fillRect(background.rect(), Qt::black);
+    else if (bg == hyprcapture::WindowBackground::FollowSystem)
+        backgroundPainter.fillRect(background.rect(), systemColor.isValid() ? systemColor : followSystemColor());
+    else
+        backgroundPainter.fillRect(background.rect(), QColor(30, 34, 38));
+    return true;
+}
+
+void clipWindowBackgroundToFrame(QImage& background,
+                                 const QRect& capturedLogicalGeometry,
+                                 const QRect& visibleLogicalGeometry,
+                                 double rounding,
+                                 double roundingPower) {
+    if (background.isNull() || !capturedLogicalGeometry.isValid() || !visibleLogicalGeometry.isValid())
+        return;
+
+    const QRect frame = logicalRectToImageRect(visibleLogicalGeometry, capturedLogicalGeometry, background.size());
+    if (!frame.isValid()) {
+        background.fill(Qt::transparent);
+        return;
+    }
+
+    const double scaleX = static_cast<double>(background.width()) / std::max(1, capturedLogicalGeometry.width());
+    const double scaleY = static_cast<double>(background.height()) / std::max(1, capturedLogicalGeometry.height());
+    const double radius = std::max(0.0, rounding) * std::min(scaleX, scaleY);
+
+    QImage mask = boundedImage(background.size(), QImage::Format_ARGB32_Premultiplied);
+    if (mask.isNull()) {
+        background.fill(Qt::transparent);
+        return;
+    }
+    mask.fill(Qt::transparent);
+    {
+        QPainter maskPainter(&mask);
+        maskPainter.setRenderHint(QPainter::Antialiasing, true);
+        maskPainter.fillPath(roundedWindowFramePath(QRectF(frame), radius, roundingPower), Qt::white);
+    }
+
+    QPainter backgroundPainter(&background);
+    backgroundPainter.setCompositionMode(QPainter::CompositionMode_DestinationIn);
+    backgroundPainter.drawImage(QPoint(0, 0), mask);
+}
+
+int transparentPixelsInRow(const QImage& image, const QRect& span, int y) {
+    if (image.format() != QImage::Format_RGBA8888 || y < 0 || y >= image.height())
+        return 0;
+
+    int transparent = 0;
+    const auto* row = image.constScanLine(y);
+    for (int x = span.left(); x <= span.right(); ++x) {
+        const auto* px = row + static_cast<qsizetype>(x) * 4;
+        if (px[3] == 0)
+            ++transparent;
+    }
+    return transparent;
+}
+
+void copyPatchPixel(QImage& target, const QImage& patch, int x, int y) {
+    auto* dst = target.scanLine(y) + static_cast<qsizetype>(x) * 4;
+    const auto* src = patch.constScanLine(y) + static_cast<qsizetype>(x) * 4;
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = src[2];
+    dst[3] = 255;
+}
+
+void repairMissingWindowTail(QImage& image, const QRect& fullGeometry, const QRect& visibleGeometry, const QImage& desktopImage, const QRect& desktopGeometry) {
+    if (image.isNull() || !fullGeometry.isValid() || !visibleGeometry.isValid() || desktopImage.isNull() || !desktopGeometry.isValid())
+        return;
+
+    if (image.format() != QImage::Format_RGBA8888)
+        image = image.convertToFormat(QImage::Format_RGBA8888);
+
+    const QRect visibleImageRect = projectedImageRect(visibleGeometry, fullGeometry, image.size());
+    if (!visibleImageRect.isValid() || visibleImageRect.width() < 8 || visibleImageRect.height() < 8)
+        return;
+
+    int tailStart = -1;
+    for (int y = visibleImageRect.bottom(); y >= visibleImageRect.top(); --y) {
+        const int transparent = transparentPixelsInRow(image, visibleImageRect, y);
+        if (transparent * 10 >= visibleImageRect.width() * 9)
+            tailStart = y;
+        else
+            break;
+    }
+    if (tailStart < 0 || visibleImageRect.bottom() - tailStart + 1 < 8)
+        return;
+
+    QImage visiblePatch(image.size(), QImage::Format_RGBA8888);
+    visiblePatch.fill(Qt::transparent);
+    {
+        QPainter patchPainter(&visiblePatch);
+        patchPainter.drawImage(visibleImageRect, desktopImage, projectedImageRect(visibleGeometry, desktopGeometry, desktopImage.size()));
+    }
+
+    const QRect visibleTailRect(visibleImageRect.left(), tailStart, visibleImageRect.width(), visibleImageRect.bottom() - tailStart + 1);
+    for (int y = visibleTailRect.top(); y <= visibleTailRect.bottom(); ++y) {
+        for (int x = visibleTailRect.left(); x <= visibleTailRect.right(); ++x) {
+            auto* dst = image.scanLine(y) + static_cast<qsizetype>(x) * 4;
+            if (dst[3] != 0)
+                continue;
+            const auto* src = visiblePatch.constScanLine(y) + static_cast<qsizetype>(x) * 4;
+            if (src[3] == 0)
+                continue;
+            copyPatchPixel(image, visiblePatch, x, y);
+        }
+    }
+}
+
+} // namespace
+
+InlineSelect::InlineSelect(QWidget* popupParent, QWidget* parent) : QWidget(parent), m_popupParent(popupParent) {
+    auto* layout = new QHBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+
+    m_button = new QPushButton(this);
+    m_button->setCheckable(true);
+    m_button->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    m_button->setLayoutDirection(Qt::RightToLeft);
+    m_button->setIconSize(QSize(kSelectArrowIconSize, kSelectArrowIconSize));
+    layout->addWidget(m_button);
+    connect(m_button, &QPushButton::clicked, this, [this] {
+        if (isPopupVisible())
+            hidePopup();
+        else
+            showPopup();
+    });
+
+    m_panel = new QFrame(m_popupParent);
+    m_panel->setObjectName("inlineSelectPopup");
+    m_panel->setAttribute(Qt::WA_StyledBackground);
+    m_panel->setStyleSheet(popupStyleSheet(QApplication::palette()));
+    m_panel->hide();
+
+    auto* panelLayout = new QVBoxLayout(m_panel);
+    panelLayout->setContentsMargins(0, 0, 0, 0);
+    auto* scroll = new QScrollArea(m_panel);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidgetResizable(true);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    auto* content = new QWidget(scroll);
+    scroll->setWidget(content);
+    panelLayout->addWidget(scroll);
+    m_panelLayout = new QVBoxLayout(content);
+    m_panelLayout->setContentsMargins(5, 5, 5, 5);
+    m_panelLayout->setSpacing(2);
+    updateButtonIcon();
+}
+
+void InlineSelect::addItems(const QStringList& items) {
+    m_items = items;
+    while (auto* item = m_panelLayout->takeAt(0)) {
+        delete item->widget();
+        delete item;
+    }
+
+    for (const auto& item : m_items) {
+        const auto found = m_labels.find(item);
+        const auto label = hyprcapture::ui::uiText(found == m_labels.end() ? item : found->second);
+        auto* button = new QPushButton(m_button->fontMetrics().elidedText(label, Qt::ElideRight, 380), m_panelLayout->parentWidget());
+        button->setToolTip(label);
+        button->setProperty("value", item);
+        button->setCheckable(true);
+        connect(button, &QPushButton::clicked, this, [this, item] { choose(item); });
+        m_panelLayout->addWidget(button);
+        // A live refresh must make new items participate in sizeHint now,
+        // before the popup is sized; Qt otherwise defers their visibility.
+        button->show();
+    }
+    m_panelLayout->invalidate();
+    m_panelLayout->activate();
+
+    int width = 0;
+    const auto metrics = m_button->fontMetrics();
+    for (const auto& item : m_items)
+        width = std::max(width, metrics.horizontalAdvance(buttonText(item)) + 42);
+    m_buttonWidth = m_compactWidth > 0 ? std::min(width, m_compactWidth) : width;
+    m_button->setMinimumWidth(m_buttonWidth);
+    m_button->setMaximumWidth(m_compactWidth > 0 ? m_compactWidth : QWIDGETSIZE_MAX);
+    m_panel->setMinimumWidth(std::min(width, 440));
+
+    if (m_current.isEmpty() && !m_items.isEmpty())
+        setCurrentText(m_items.first());
+    else setCurrentText(m_current);
+    if (isPopupVisible()) positionPopup();
+}
+
+void InlineSelect::setPrefix(const QString& prefix) {
+    m_prefix = hyprcapture::ui::uiText(prefix);
+    if (!m_current.isEmpty())
+        m_button->setText(buttonText(m_current));
+}
+
+void InlineSelect::setOnChanged(std::function<void()> onChanged) {
+    m_onChanged = std::move(onChanged);
+}
+
+void InlineSelect::setCurrentText(const QString& text) {
+    m_current = text;
+    const auto fullText = buttonText(text);
+    m_button->setToolTip(fullText + (m_hint.isEmpty() ? QString{} : "\n" + m_hint));
+    m_button->setText(m_compactWidth > 0 ? m_button->fontMetrics().elidedText(fullText, Qt::ElideRight, std::max(30, m_compactWidth - 42)) : fullText);
+    for (auto* button : m_panel->findChildren<QPushButton*>())
+        button->setChecked(button->property("value").toString() == text);
+}
+
+QString InlineSelect::currentText() const {
+    return m_current;
+}
+
+void InlineSelect::setControlVisible(bool visible) {
+    if (!visible) {
+        hidePopup();
+        m_button->hide();
+        m_button->setMinimumSize(0, 0);
+        m_button->setMaximumSize(0, 0);
+        setFixedSize(0, 0);
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        setVisible(false);
+        updateGeometry();
+        return;
+    }
+
+    setVisible(visible);
+    setMinimumSize(0, 0);
+    setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+    setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    m_button->show();
+    m_button->setMinimumWidth(m_buttonWidth);
+    m_button->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+    adjustSize();
+    updateGeometry();
+}
+
+void InlineSelect::hidePopup() {
+    m_panel->hide();
+    m_button->setChecked(false);
+    updateButtonIcon();
+    if (g_openSelect == this)
+        g_openSelect = nullptr;
+}
+
+bool InlineSelect::isPopupVisible() const {
+    return m_panel->isVisible();
+}
+
+QString InlineSelect::buttonText(const QString& text) const {
+    const auto found = m_labels.find(text);
+    const auto label = hyprcapture::ui::uiText(found == m_labels.end() ? text : found->second);
+    if (m_prefix.isEmpty()) return label;
+    return m_prefix + QStringLiteral(": ") + label;
+}
+
+void InlineSelect::updateButtonIcon() {
+    if (!m_button)
+        return;
+    const double rotationDegrees = isPopupVisible() ? 180.0 : 0.0;
+    m_button->setIcon(toolbarIcon("keyboard_arrow_down", rotationDegrees));
+}
+
+void InlineSelect::positionPopup() {
+    m_panel->setFixedSize(std::min(std::max(160, m_panel->minimumWidth()), std::max(1, m_popupParent->width() - 16)),
+                          std::min(std::max(40, m_panelLayout->sizeHint().height() + 4), std::min(360, std::max(1, m_popupParent->height() - 16))));
+    QPoint pos = mapTo(m_popupParent, QPoint(0, height() + 5));
+    if (pos.x() + m_panel->width() > m_popupParent->width() - 8)
+        pos.setX(std::max(8, m_popupParent->width() - m_panel->width() - 8));
+    if (pos.y() + m_panel->height() > m_popupParent->height() - 8)
+        pos.setY(std::max(8, mapTo(m_popupParent, QPoint(0, 0)).y() - m_panel->height() - 5));
+    m_panel->move(pos);
+}
+
+void InlineSelect::showPopup() {
+    if (m_onOpening) m_onOpening();
+    if (g_openSelect && g_openSelect != this)
+        g_openSelect->hidePopup();
+    positionPopup();
+    m_panel->raise();
+    m_panel->show();
+    m_button->setChecked(true);
+    updateButtonIcon();
+    g_openSelect = this;
+}
+
+void InlineSelect::choose(const QString& text) {
+    setCurrentText(text);
+    hidePopup();
+    if (m_onChanged)
+        m_onChanged();
+}
+
+CaptureOverlay::CaptureOverlay(hyprcapture::CaptureDefaults defaults, bool quick, bool record, bool recordActive, QString sessionJson, QWidget* parent)
+    : QMainWindow(parent), m_defaults(std::move(defaults)), m_mode(m_defaults.mode), m_quick(quick), m_record(record), m_recordActive(recordActive) {
+    QElapsedTimer constructorTimer;
+    constructorTimer.start();
+    QElapsedTimer parseTimer;
+    parseTimer.start();
+    const std::string requestedLanguage = m_defaults.language;
+    parseSessionJson(sessionJson);
+    if (!requestedLanguage.empty() && requestedLanguage != "auto" && requestedLanguage != "system")
+        m_defaults.language = requestedLanguage;
+    hyprcapture::ui::installUiTranslations(qString(m_defaults.language));
+    hyprcapture::ui::restoreAecPreferences(m_defaults);
+    if (!m_quick && !m_recordActive && hyprcapture::ui::restoreSettings(m_defaults)) {
+        m_mode = m_defaults.mode;
+        m_recordFormatAuto = false;
+        m_recordCodecAuto = false;
+    }
+    m_confirmBeforeCapture = m_defaults.confirmBeforeCapture && !m_defaults.inPlaceEditToolbar && !m_quick && !m_record && !m_recordActive;
+    beginHymissionCaptureInputSuppression();
+    traceTiming(QStringLiteral("parse_session"), parseTimer.elapsed());
+
+    QElapsedTimer preCaptureTimer;
+    preCaptureTimer.start();
+    captureScreensBeforeOverlay();
+    traceTiming(QStringLiteral("prepare_desktop"), preCaptureTimer.elapsed());
+
+    if (!m_quick && m_hasHdrScreen && std::ranges::any_of(m_monitorArtifacts, [](const auto& artifact) { return !artifact.hdrImage.isNull(); })) {
+        for (auto& artifact : m_monitorArtifacts)
+            if (artifact.hdrActive && !artifact.hdrImage.isNull())
+                artifact.hdrUpload = hyprcapture::ui::HdrUpload::request(artifact.hdrImage, artifact.referenceNits);
+    }
+    initializeOverlay(preferredOverlayLogicalGeometry());
+    traceTiming(QStringLiteral("overlay_construct"), constructorTimer.elapsed());
+    if (m_quick)
+        QTimer::singleShot(0, this, &CaptureOverlay::finishCapture);
+}
+
+CaptureOverlay::CaptureOverlay(const CaptureOverlay& source, const QRect& overlayGeometry, bool active, QWidget* parent)
+    : QMainWindow(parent),
+      m_defaults(source.m_defaults),
+      m_mode(source.m_mode),
+      m_quick(source.m_quick),
+      m_record(source.m_record),
+      m_recordActive(source.m_recordActive),
+      m_recordError(source.m_recordError),
+      m_sessionDecoded(source.m_sessionDecoded),
+      m_regionCaptureAvailable(source.m_regionCaptureAvailable),
+      m_scrollSessionVersion(source.m_scrollSessionVersion),
+      m_hymissionOverviewSession(source.m_hymissionOverviewSession),
+      m_hymissionStageSession(source.m_hymissionStageSession),
+      m_confirmBeforeCapture(source.m_confirmBeforeCapture),
+      m_overlayActive(active),
+      m_cursorLogicalPosition(source.m_cursorLogicalPosition),
+      m_hasCursorLogicalPosition(source.m_hasCursorLogicalPosition),
+      m_recordFormatAuto(source.m_recordFormatAuto),
+      m_recordCodecAuto(source.m_recordCodecAuto),
+      m_desktopImage(source.m_desktopImage),
+      m_desktopGeometry(source.m_desktopGeometry),
+      m_sessionMonitorCount(source.m_sessionMonitorCount),
+      m_sessionWindowCount(source.m_sessionWindowCount),
+      m_monitorArtifacts(source.m_monitorArtifacts),
+      m_windowArtifacts(source.m_windowArtifacts) {
+    m_hasHdrScreen = source.m_hasHdrScreen;
+    m_hdrNativeWarmup = source.m_hdrNativeWarmup;
+    initializeOverlay(overlayGeometry);
+}
+
+void CaptureOverlay::initializeOverlay(const QRect& overlayGeometry) {
+    setWindowFlags(Qt::FramelessWindowHint | Qt::Tool);
+    setAttribute(Qt::WA_TranslucentBackground);
+    setMouseTracking(true);
+    setCursor(Qt::CrossCursor);
+
+    m_overlayLogicalGeometry = overlayGeometry.isValid() ? overlayGeometry : QRect(0, 0, 1280, 720);
+    setGeometry(m_overlayLogicalGeometry);
+    m_hdrStartupWaiting = !m_quick && std::ranges::any_of(m_monitorArtifacts, [this](const auto& a) {
+        return a.hdrActive && a.logicalGeometry.intersects(m_overlayLogicalGeometry);
+    });
+
+    setProperty("hdrFirstFrameMode", m_hdrStartupWaiting ? "waiting" : "sdr");
+
+    QElapsedTimer toolbarTimer;
+    toolbarTimer.start();
+    buildToolbar();
+    connect(this, &CaptureOverlay::finishingStarted, this, &CaptureOverlay::saveRememberedSettings);
+    traceTiming(QStringLiteral("build_toolbar"), toolbarTimer.elapsed());
+
+    winId();
+    QScreen* targetScreen = screenForOverlayGeometry(m_overlayLogicalGeometry);
+    if (targetScreen && windowHandle())
+        windowHandle()->setScreen(targetScreen);
+    if (auto* layerWindow = LayerShellQt::Window::get(windowHandle())) {
+        layerWindow->setScope("hyprcapture-ui");
+        layerWindow->setLayer(LayerShellQt::Window::LayerOverlay);
+        if (targetScreen)
+            layerWindow->setScreen(targetScreen);
+        layerWindow->setAnchors(LayerShellQt::Window::Anchors{LayerShellQt::Window::AnchorTop} | LayerShellQt::Window::AnchorBottom |
+                                LayerShellQt::Window::AnchorLeft | LayerShellQt::Window::AnchorRight);
+        layerWindow->setExclusiveZone(-1);
+        layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityExclusive);
+        layerWindow->setActivateOnShow(true);
+        layerWindow->setDesiredSize(QSize(0, 0));
+    }
+    if (m_toolbar)
+        m_toolbar->setVisible(m_overlayActive && !m_hdrStartupWaiting);
+}
+
+void CaptureOverlay::saveRememberedSettings() {
+    if (!m_defaults.rememberSettings || m_quick || m_recordActive)
+        return;
+    auto snapshot = m_defaults;
+    snapshot.mode = m_mode;
+    snapshot.fullscreenScope = currentFullscreenScope();
+    snapshot.windowBackground = currentWindowBackground();
+    snapshot.recordFps = currentRecordFps();
+    snapshot.recordMaxSeconds = currentRecordMaxSeconds();
+    snapshot.recordWindowBackend = currentRecordBackend();
+    if (m_record) {
+        if (currentRecordBackground() == hyprcapture::WindowBackground::Transparent) {
+            snapshot.recordTransparentFormat = currentRecordFormat().toStdString();
+            snapshot.recordTransparentCodec = currentRecordCodec().toStdString();
+        } else {
+            snapshot.recordFormat = currentRecordFormat().toStdString();
+            snapshot.recordCodec = currentRecordCodec().toStdString();
+        }
+    }
+    if (m_systemGain) snapshot.recordAudioSystemGain = m_systemGain->value();
+    if (m_micGain) snapshot.recordAudioMicGain = m_micGain->value();
+    if (!hyprcapture::ui::saveSettings(snapshot))
+        qWarning("HyprCapture: could not save remembered settings");
+}
+
+CaptureOverlay::~CaptureOverlay() {
+    invalidateHdrEditBase();
+    // QProcess destruction may emit finished after the toolbar children are gone.
+    for (auto* process : findChildren<QProcess*>())
+        process->disconnect(this);
+    if (m_meterProcess) { m_meterProcess->disconnect(this); m_meterProcess->kill(); m_meterProcess->waitForFinished(1000); }
+    endHymissionCaptureInputSuppression();
+}
+
+void CaptureOverlay::abortForSessionLock() {
+    invalidateHdrEditBase();
+    m_finishing = true;
+    clearPendingConfirm();
+    m_dragStart = {};
+    m_dragEnd = {};
+    if (m_scrollController) {
+        auto* controller = std::exchange(m_scrollController, nullptr);
+        controller->disconnect(this);
+        delete controller; // Stop/join the stitch worker, without finish/export.
+    }
+    m_scrolling = false;
+    endHymissionCaptureInputSuppression();
+    setEnabled(false);
+    hide();
+}
+
+QScreen* CaptureOverlay::overlayScreen() const {
+    return screenForOverlayGeometry(m_overlayLogicalGeometry);
+}
+
+hyprcapture::OverlayScope CaptureOverlay::overlayScope() const {
+    return m_defaults.overlayScope;
+}
+
+bool CaptureOverlay::isOverlayActive() const {
+    return m_overlayActive;
+}
+
+void CaptureOverlay::setOverlayActive(bool active) {
+    if (m_overlayActive == active)
+        return;
+
+    m_overlayActive = active;
+    hideOptionPopups();
+    if (!active) {
+        clearPendingConfirm();
+        m_dragStart = {};
+        m_dragEnd = {};
+        m_fullscreenClientSelected = false;
+    }
+    if (m_toolbar)
+        m_toolbar->setVisible(active && !m_hdrStartupWaiting);
+    if (m_editor)
+        m_editor->setVisible(active && m_editing);
+    if (active) {
+        setCursor(Qt::CrossCursor);
+        raise();
+        activateWindow();
+        refreshInitialCursorPosition();
+    }
+    update();
+}
+
+void CaptureOverlay::adoptInteractionState(const CaptureOverlay& source) {
+    if (&source == this || m_hdrExportPending)
+        return;
+
+    m_defaults.screenshotFormat = source.m_defaults.screenshotFormat;
+    if (m_sdrButton) m_sdrButton->setChecked(m_defaults.screenshotFormat == "png");
+    if (m_hdrButton) m_hdrButton->setChecked(m_defaults.screenshotFormat == "heic");
+    if (m_editor) m_editor->setHdrEnabled(m_defaults.screenshotFormat == "heic");
+    m_mode = source.m_mode;
+    m_record = source.m_record;
+    m_recordError = source.m_recordError;
+    m_recordFormatAuto = source.m_recordFormatAuto;
+    m_recordCodecAuto = source.m_recordCodecAuto;
+    m_defaults.recordAudioEchoCancellation = source.m_defaults.recordAudioEchoCancellation;
+    m_defaults.recordAudioEchoBackend = source.m_defaults.recordAudioEchoBackend;
+    if (m_echoCancellation) m_echoCancellation->setCurrentText(QString::number(m_defaults.recordAudioEchoCancellation));
+    if (m_echoBackend) m_echoBackend->setCurrentText(qString(m_defaults.recordAudioEchoBackend));
+    m_defaults.recordAudioMix = source.m_defaults.recordAudioMix;
+    m_defaults.recordAudioSystemGain = source.m_defaults.recordAudioSystemGain;
+    m_defaults.recordAudioMicGain = source.m_defaults.recordAudioMicGain;
+    if (m_soundPreset) m_soundPreset->setCurrentText(qString(m_defaults.recordAudioMix));
+    if (m_systemGain) m_systemGain->setValue(m_defaults.recordAudioSystemGain);
+    if (m_micGain) m_micGain->setValue(m_defaults.recordAudioMicGain);
+    m_defaults.recordAudio = source.m_defaults.recordAudio;
+    m_defaults.recordAudioOutput = source.m_defaults.recordAudioOutput;
+    m_defaults.recordAudioInput = source.m_defaults.recordAudioInput;
+    if (m_soundMode) m_soundMode->setCurrentText(qString(hyprcapture::toString(m_defaults.recordAudio)));
+    if (m_soundOutput) m_soundOutput->setCurrentText(qString(m_defaults.recordAudioOutput));
+    if (m_soundInput) m_soundInput->setCurrentText(qString(m_defaults.recordAudioInput));
+
+    if (m_recordToggle)
+        m_recordToggle->setChecked(m_record);
+    if (m_fullscreenScope)
+        m_fullscreenScope->setCurrentText(qString(hyprcapture::toString(source.currentFullscreenScope())));
+    if (m_windowBackground)
+        m_windowBackground->setCurrentText(qString(hyprcapture::toString(source.currentWindowBackground())));
+    if (m_record && !m_recordActive)
+        ensureRecordControls();
+    if (m_recordFormat)
+        m_recordFormat->setCurrentText(source.currentRecordFormat());
+    if (m_recordCodec)
+        m_recordCodec->setCurrentText(source.currentRecordCodec());
+    if (m_recordFps)
+        m_recordFps->setCurrentText(QString::number(source.currentRecordFps()));
+    if (m_recordDuration)
+        m_recordDuration->setCurrentText(animationDurationChoice(source.currentRecordMaxSeconds()));
+    if (m_recordBackend)
+        m_recordBackend->setCurrentText(qString(hyprcapture::toString(source.currentRecordBackend())));
+    clearPendingConfirm();
+    updateToolbarControlsForMode();
+    updateRecordWarning();
+    updateStatus();
+}
+
+bool CaptureOverlay::requestActivation() {
+    if (!m_overlayActive)
+        emit activationRequested();
+    return m_overlayActive && !m_hdrStartupWaiting;
+}
+
+void CaptureOverlay::parseSessionJson(const QString& json) {
+    const QByteArray encoded = json.toUtf8();
+    const auto       decoded = hyprcapture::decodeSessionJson(std::string(encoded.constData(), static_cast<std::size_t>(encoded.size())));
+    if (!decoded)
+        return;
+
+    m_sessionDecoded = true;
+    m_hasHdrScreen = std::ranges::any_of(decoded->monitors, [](const auto& monitor) { return monitor.hdrActive; });
+    // Monitor state is known before loading/converting artifacts. Other helper
+    // modes never construct an overlay; SDR and quick sessions do no warmup.
+    if (!m_quick && m_hasHdrScreen) {
+        traceTiming("overlay.hdr_prewarm");
+        m_hdrNativeWarmup = hyprcapture::ui::HdrBackdrop::prewarm();
+    }
+    m_regionCaptureAvailable = decoded->regionCaptureAvailable;
+    m_scrollSessionVersion = decoded->scrollSessionVersion;
+    m_defaults = decoded->defaults;
+    m_mode = m_defaults.mode;
+    if (decoded->cursorPosition) {
+        QPoint cursorPosition;
+        if (protocolPoint(*decoded->cursorPosition, cursorPosition)) {
+            m_cursorLogicalPosition = cursorPosition;
+            m_hasCursorLogicalPosition = true;
+        }
+    }
+
+    m_sessionMonitorCount = std::min(static_cast<int>(decoded->monitors.size()), kMaxSessionMonitors);
+    m_sessionWindowCount = std::min(static_cast<int>(decoded->windows.size()), kMaxSessionWindows);
+    QStringList artifactFiles;
+    qint64 remainingArtifactBytes = kMaxSessionArtifactBytes;
+
+    for (std::size_t i = 0; i < decoded->monitors.size() && i < kMaxSessionMonitors; ++i) {
+        const auto& info = decoded->monitors[i];
+        MonitorArtifact artifact;
+        artifact.name = qString(info.name);
+        artifact.logicalGeometry = protocolRect(info.logicalGeometry);
+        artifact.transform = info.transform;
+        artifact.focused = info.focused;
+        artifact.hdrActive = info.hdrActive;
+        artifact.workspaceWindowCount = info.workspaceWindowCount;
+        artifact.singleWorkspaceWindowClass = qString(info.singleWorkspaceWindowClass);
+        artifact.singleWorkspaceWindowTitle = qString(info.singleWorkspaceWindowTitle);
+        const QString artifactPath = qString(info.artifactPath);
+        const QString cursorArtifactPath = qString(info.cursorArtifactPath);
+        artifact.image = loadRawRgba(artifactPath, info.artifactWidth, info.artifactHeight, info.artifactTopDown, remainingArtifactBytes, info.artifactFormat, info.artifactReferenceNits, &artifact.hdrImage);
+        artifact.image = normalizeMonitorArtifactImage(artifact.image, artifact.transform, artifact.logicalGeometry);
+        artifact.referenceNits = info.artifactReferenceNits;
+        artifact.hdrImage = normalizeMonitorArtifactImage(artifact.hdrImage, artifact.transform, artifact.logicalGeometry);
+        artifact.previewCornerRadii =
+            hyprcapture::ui::detectScreenCornerRadii(artifact.image, artifact.logicalGeometry.size());
+        artifact.cursorImage =
+            loadRawRgba(cursorArtifactPath,
+                        info.cursorArtifactWidth,
+                        info.cursorArtifactHeight,
+                        info.cursorArtifactTopDown,
+                        remainingArtifactBytes, info.artifactFormat, info.artifactReferenceNits, &artifact.hdrCursorImage);
+        artifact.cursorImage = normalizeMonitorArtifactImage(artifact.cursorImage, artifact.transform, artifact.logicalGeometry);
+        artifact.hdrCursorImage = normalizeMonitorArtifactImage(artifact.hdrCursorImage, artifact.transform, artifact.logicalGeometry);
+        artifactFiles.push_back(artifactPath);
+        artifactFiles.push_back(cursorArtifactPath);
+        if (!artifact.logicalGeometry.isValid())
+            continue;
+        m_desktopGeometry = m_desktopGeometry.united(artifact.logicalGeometry);
+        if (!artifact.image.isNull())
+            m_monitorArtifacts.push_back(std::move(artifact));
+    }
+
+    for (std::size_t i = 0; i < decoded->windows.size() && i < kMaxSessionWindows; ++i) {
+        const auto& info = decoded->windows[i];
+        WindowArtifact artifact;
+        artifact.address = qString(info.address);
+        artifact.title = qString(info.title);
+        artifact.appClass = qString(info.appClass);
+        artifact.stagePreview = info.stagePreview;
+        artifact.selectionRounding = info.selectionRounding;
+        artifact.zIndex = info.zIndex;
+        artifact.focused = info.focused;
+        artifact.fullscreen = info.fullscreen;
+        artifact.visibleGeometry = protocolRect(info.visibleGeometry);
+        artifact.fullGeometry = protocolRect(info.fullGeometry);
+        if (info.selectionGeometry) {
+            artifact.selectionGeometry = protocolRect(*info.selectionGeometry);
+            if (artifact.selectionGeometry.isValid()) {
+                if (artifact.stagePreview)
+                    m_hymissionStageSession = true;
+                else
+                    m_hymissionOverviewSession = true;
+            }
+        }
+        if (info.selectionClipGeometry)
+            artifact.selectionClipGeometry = protocolRect(*info.selectionClipGeometry);
+        artifact.rounding = info.rounding;
+        artifact.roundingPower = info.roundingPower;
+        artifact.borderSize = info.borderSize;
+        const QString artifactPath = qString(info.artifactPath);
+        const QString realBackgroundPath = qString(info.realBackgroundPath);
+        artifact.image = loadRawRgba(artifactPath, info.artifactWidth, info.artifactHeight, info.artifactTopDown, remainingArtifactBytes, info.artifactFormat, info.artifactReferenceNits, &artifact.hdrImage);
+        artifact.realBackground =
+            loadRawRgba(realBackgroundPath, info.realBackgroundWidth, info.realBackgroundHeight, info.realBackgroundTopDown, remainingArtifactBytes, info.artifactFormat, info.artifactReferenceNits, &artifact.hdrRealBackground);
+        artifactFiles.push_back(artifactPath);
+        artifactFiles.push_back(realBackgroundPath);
+        if (artifact.fullGeometry.isValid())
+            m_windowArtifacts.push_back(std::move(artifact));
+    }
+
+    cleanupArtifactFiles(artifactFiles);
+}
+
+void CaptureOverlay::captureScreensBeforeOverlay() {
+    if (!m_desktopGeometry.isValid())
+        for (const auto* screen : QGuiApplication::screens())
+            m_desktopGeometry = m_desktopGeometry.united(screen->geometry());
+
+    if (!m_desktopGeometry.isValid())
+        return;
+
+    // paintDesktop() draws these artifacts directly. Compose a full desktop
+    // only if a later export needs its background/fallback pixels.
+    if (!m_monitorArtifacts.empty())
+        return;
+
+    const QString grimProgram = hyprcapture::ui::trustedSystemProgram(QStringLiteral("grim"));
+    QProcess      grim;
+    if (!grimProgram.isEmpty()) {
+        grim.setProcessEnvironment(hyprcapture::ui::trustedProcessEnvironment());
+        grim.start(grimProgram, {"-t", "png", "-"});
+    }
+    if (grim.waitForFinished(1500) && grim.exitStatus() == QProcess::NormalExit && grim.exitCode() == 0) {
+        QImage grimImage;
+        if (grimImage.loadFromData(grim.readAllStandardOutput(), "PNG") && !grimImage.isNull()) {
+            const QImage converted = grimImage.convertToFormat(QImage::Format_RGBA8888);
+            if (imageSizeWithinBounds(converted.size())) {
+                m_desktopImage = converted;
+                return;
+            }
+        }
+    }
+
+    const double scale = maxScreenDevicePixelRatio();
+    const QSize imageSize = boundedScaledSize(m_desktopGeometry.width(), m_desktopGeometry.height(), scale, scale);
+    m_desktopImage = boundedImage(imageSize, QImage::Format_RGBA8888);
+    if (m_desktopImage.isNull())
+        return;
+    m_desktopImage.fill(QColor(30, 34, 38));
+
+    QPainter painter(&m_desktopImage);
+    const auto screens = QGuiApplication::screens();
+    for (auto* screen : screens) {
+        const QPixmap pixmap = screen->grabWindow(0);
+        if (pixmap.isNull())
+            continue;
+        const QRect target = logicalRectToOutputRect(screen->geometry(), m_desktopGeometry, scale, scale).intersected(m_desktopImage.rect());
+        if (target.isValid())
+            painter.drawPixmap(target, pixmap);
+    }
+}
+
+void CaptureOverlay::ensureDesktopImage() {
+    if (!m_desktopImage.isNull() || !m_desktopGeometry.isValid())
+        return;
+
+    if (!m_monitorArtifacts.empty()) {
+        double scaleX = 1.0;
+        double scaleY = 1.0;
+        for (const auto& artifact : m_monitorArtifacts) {
+            if (!artifact.image.isNull() && artifact.logicalGeometry.isValid()) {
+                scaleX = std::max(scaleX, static_cast<double>(artifact.image.width()) / std::max(1, artifact.logicalGeometry.width()));
+                scaleY = std::max(scaleY, static_cast<double>(artifact.image.height()) / std::max(1, artifact.logicalGeometry.height()));
+            }
+        }
+
+        const QSize imageSize = boundedScaledSize(m_desktopGeometry.width(), m_desktopGeometry.height(), scaleX, scaleY);
+        m_desktopImage = boundedImage(imageSize, QImage::Format_RGBA8888);
+        if (m_desktopImage.isNull())
+            return;
+        m_desktopImage.fill(QColor(30, 34, 38));
+
+        QPainter painter(&m_desktopImage);
+        for (const auto& artifact : m_monitorArtifacts) {
+            const QRect target = logicalRectToOutputRect(artifact.logicalGeometry, m_desktopGeometry, scaleX, scaleY).intersected(m_desktopImage.rect());
+            if (target.isValid())
+                painter.drawImage(target, artifact.image);
+        }
+    }
+}
+
+QRect CaptureOverlay::preferredOverlayLogicalGeometry() const {
+    if (m_hasCursorLogicalPosition) {
+        for (const auto& artifact : m_monitorArtifacts) {
+            if (artifact.logicalGeometry.contains(m_cursorLogicalPosition))
+                return artifact.logicalGeometry;
+        }
+
+        if (QScreen* screen = QGuiApplication::screenAt(m_cursorLogicalPosition))
+            return screen->geometry();
+    }
+
+    for (const auto& artifact : m_monitorArtifacts) {
+        if (artifact.focused && artifact.logicalGeometry.isValid())
+            return artifact.logicalGeometry;
+    }
+
+    if (QScreen* screen = QGuiApplication::screenAt(QCursor::pos()))
+        return screen->geometry();
+    if (QScreen* screen = QGuiApplication::primaryScreen())
+        return screen->geometry();
+    return m_desktopGeometry.isValid() ? m_desktopGeometry : QRect(0, 0, 1280, 720);
+}
+
+QScreen* CaptureOverlay::screenForOverlayGeometry(const QRect& logicalGeometry) const {
+    QScreen* bestScreen = nullptr;
+    int      bestArea = 0;
+    for (QScreen* screen : QGuiApplication::screens()) {
+        if (!screen)
+            continue;
+        const QRect intersection = logicalGeometry.intersected(screen->geometry());
+        const int area = intersection.isValid() ? intersection.width() * intersection.height() : 0;
+        if (area > bestArea) {
+            bestScreen = screen;
+            bestArea = area;
+        }
+    }
+
+    if (bestScreen)
+        return bestScreen;
+    if (m_hasCursorLogicalPosition)
+        bestScreen = QGuiApplication::screenAt(m_cursorLogicalPosition);
+    if (!bestScreen)
+        bestScreen = QGuiApplication::screenAt(QCursor::pos());
+    return bestScreen ? bestScreen : QGuiApplication::primaryScreen();
+}
+
+void CaptureOverlay::buildToolbar() {
+    m_toolbar = new QWidget(this);
+    m_toolbar->setObjectName("toolbar");
+    m_toolbar->setAttribute(Qt::WA_StyledBackground);
+    m_toolbar->setStyleSheet(toolbarStyleSheet(QApplication::palette()));
+    m_toolbarOpacity = new QGraphicsOpacityEffect(m_toolbar);
+    m_toolbarOpacity->setOpacity(m_overlayOpacity);
+    m_toolbar->setGraphicsEffect(m_toolbarOpacity);
+
+    auto* rootLayout = new QVBoxLayout(m_toolbar);
+    rootLayout->setContentsMargins(10, 7, 10, 7);
+    rootLayout->setSpacing(5);
+    // relayoutToolbar() owns the screen-width clamp; asynchronous label changes
+    // must not reset the toolbar to its unconstrained size hint.
+    rootLayout->setSizeConstraint(QLayout::SetNoConstraint);
+
+    auto* layout = new QHBoxLayout();
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(4);
+    rootLayout->addLayout(layout);
+
+    auto* group = new QButtonGroup(this);
+    const auto addMode = [&](const QString& tooltip, hyprcapture::CaptureMode mode, const QIcon& icon) {
+        auto* button = new QPushButton(m_toolbar);
+        button->setObjectName("captureModeButton");
+        button->setProperty("captureMode", qString(hyprcapture::toString(mode)));
+        button->setFlat(true);
+        button->setFocusPolicy(Qt::NoFocus);
+        button->setIcon(icon);
+        button->setIconSize(QSize(kModeIconSize, kModeIconSize));
+        button->setFixedSize(36, 32);
+        button->setToolTip(hyprcapture::ui::uiText(tooltip));
+        button->setAccessibleName(hyprcapture::ui::uiText(tooltip));
+        button->setCheckable(true);
+        button->setChecked(mode == m_mode);
+        group->addButton(button);
+        layout->addWidget(button);
+        if (m_defaults.fushionMode && mode != hyprcapture::CaptureMode::Fullscreen) {
+            button->hide();
+            button->setFixedSize(0, 0);
+            button->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        }
+        connect(button, &QPushButton::clicked, this, [this, mode] {
+            if (m_editing && m_mode == mode)
+                return;
+            const bool wasEditing = m_editing;
+            const bool wasActiveMode = m_mode == mode;
+            setMode(mode);
+            if (mode == hyprcapture::CaptureMode::Fullscreen && (m_defaults.fushionMode || wasActiveMode || wasEditing)) {
+                if (confirmBeforeCaptureEnabled())
+                    beginPendingConfirm(hyprcapture::CaptureMode::Fullscreen);
+                else
+                    finishCapture();
+            }
+        });
+    };
+    addMode("Fullscreen", hyprcapture::CaptureMode::Fullscreen, toolbarIcon("screenshot_monitor"));
+    addMode("Region", hyprcapture::CaptureMode::Region, toolbarIcon("select_all"));
+    addMode("Window", hyprcapture::CaptureMode::Window, toolbarIcon("select_window"));
+
+    m_dynamicRangeControl = new QWidget(m_toolbar);
+    m_dynamicRangeControl->setObjectName("dynamicRangeControl");
+    m_dynamicRangeControl->setAttribute(Qt::WA_StyledBackground);
+    const auto rangePalette = QApplication::palette();
+    const auto rangeWindow = rangePalette.color(QPalette::Window);
+    const auto rangeText = rangeWindow.lightness() < 128 ? QColor(Qt::white) : rangePalette.color(QPalette::WindowText);
+    m_dynamicRangeControl->setStyleSheet(QStringLiteral(
+        "#dynamicRangeControl { border: 1px solid palette(mid); border-radius: 7px; background: palette(window); }"
+        "#dynamicRangeControl QPushButton { color: %1; }"
+        "#dynamicRangeControl QPushButton:checked, #dynamicRangeControl QPushButton:pressed { color: %1; background: %2; }"
+        "#dynamicRangeControl QPushButton:disabled { color: %1; }")
+        .arg(cssRgba(rangeText), cssRgba(mixedColor(rangePalette.color(QPalette::WindowText), rangeWindow, 0.72))));
+    auto* dynamicRangeLayout = new QHBoxLayout(m_dynamicRangeControl);
+    dynamicRangeLayout->setContentsMargins(3, 3, 3, 3);
+    dynamicRangeLayout->setSpacing(2);
+    auto* dynamicRangeGroup = new QButtonGroup(m_dynamicRangeControl);
+    const bool hdrAvailable = m_hasHdrScreen && hyprcapture::ui::hdrHeicAvailable();
+    m_dynamicRangeControl->setEnabled(hdrAvailable);
+    if (!hdrAvailable) m_defaults.screenshotFormat = "png";
+    const auto addDynamicRange = [&](const char* text, const char* name, const char* format) {
+        auto* button = new QPushButton(QString::fromLatin1(text), m_dynamicRangeControl);
+        button->setObjectName(QString::fromLatin1(name));
+        button->setCheckable(true);
+        button->setChecked(m_defaults.screenshotFormat == format);
+        button->setAccessibleName(button->text());
+        button->setFocusPolicy(Qt::StrongFocus);
+        button->setFixedSize(48, 26);
+        dynamicRangeGroup->addButton(button);
+        dynamicRangeLayout->addWidget(button);
+        connect(button, &QPushButton::clicked, this, [this, format] {
+            if (m_hdrExportPending) return;
+            m_defaults.screenshotFormat = format;
+            if (m_editor) m_editor->setHdrEnabled(m_defaults.screenshotFormat == "heic");
+            m_hdrEditCacheKey = 0;
+            if (m_editing && m_defaults.screenshotFormat == "heic" && m_editHdrBase.isNull() && !m_hdrBasePending && !m_scrollResult) queueHdrEditBase();
+            updateHdrEditBackdrop();
+            update();
+        });
+        return button;
+    };
+    m_sdrButton = addDynamicRange("SDR", "screenshotSdr", "png");
+    m_hdrButton = addDynamicRange("HDR", "screenshotHdr", "heic");
+    m_hdrButton->setEnabled(hdrAvailable);
+    m_hdrButton->setToolTip(!m_hasHdrScreen ? tr("Enable HDR output on a display to enable HDR capture.") :
+        hdrAvailable ? tr("Preserve HDR highlights and wide-gamut colors.") : tr("HDR encoding is unavailable."));
+    layout->addWidget(m_dynamicRangeControl);
+
+    m_fullscreenScope = new InlineSelect(this, m_toolbar);
+    m_fullscreenScope->setPrefix("Full");
+    m_fullscreenScope->addItems(QStringList{"all", "current", "per-monitor"});
+    m_fullscreenScope->setCurrentText(qString(hyprcapture::toString(m_defaults.fullscreenScope)));
+        m_fullscreenScope->setOnChanged([this] {
+        if (m_editing) {
+            m_editImageRect = captureRectForMode();
+            if (!rect().contains(m_editImageRect))
+                m_editImageRect = {};
+            refreshInPlaceImage();
+        }
+        update();
+    });
+    layout->addWidget(m_fullscreenScope);
+
+    m_windowBackground = new InlineSelect(this, m_toolbar);
+    m_windowBackground->setObjectName("windowBackground");
+    m_windowBackground->setPrefix("Bg");
+    m_windowBackground->addItems(QStringList{"follow-system", "white", "black", "real", "transparent"});
+    m_windowBackground->setCurrentText(qString(hyprcapture::toString(m_defaults.windowBackground)));
+    m_windowBackground->setOnChanged([this] {
+        if (m_record)
+            applyRecordDefaultsForCurrentBackground();
+        updateRecordWarning();
+        if (m_editing)
+            refreshInPlaceImage();
+        updateStatus();
+    });
+    layout->addWidget(m_windowBackground);
+
+
+
+    m_recordToggle = new QPushButton(m_toolbar);
+    m_recordToggle->setObjectName(m_recordActive ? "recordActiveButton" : "recordToggleButton");
+    m_recordToggle->setFlat(true);
+    m_recordToggle->setFocusPolicy(Qt::NoFocus);
+    m_recordToggle->setIcon(toolbarIcon("radio_button_checked"));
+    m_recordToggle->setIconSize(QSize(kModeIconSize, kModeIconSize));
+    m_recordToggle->setFixedSize(36, 32);
+    m_recordToggle->setToolTip(hyprcapture::ui::uiText(m_recordActive ? "Stop recording" : "Record"));
+    m_recordToggle->setAccessibleName(hyprcapture::ui::uiText(m_recordActive ? "Stop recording" : "Record"));
+    m_recordToggle->setCheckable(true);
+    m_recordToggle->setChecked(m_record || m_recordActive);
+    layout->addWidget(m_recordToggle);
+    connect(m_recordToggle, &QPushButton::clicked, this, [this] {
+        if (m_recordActive) {
+            m_recordToggle->setChecked(true);
+            if (stopRecording()) {
+                emit finishingStarted();
+                fadeOutThen([this] {
+                    endHymissionCaptureInputSuppression();
+                    qApp->quit();
+                });
+            }
+            return;
+        }
+
+        m_recordError.clear();
+        if (m_editing)
+            leaveInPlaceEdit();
+        m_record = m_recordToggle->isChecked();
+        updateToolbarControlsForMode();
+        if (m_record)
+            applyRecordDefaultsForCurrentBackground();
+        updateRecordOptionsVisibility();
+        updateStatus();
+        update();
+    });
+
+    auto* cancel = new QPushButton(m_toolbar);
+    cancel->setObjectName("captureCancel");
+    cancel->setFlat(true);
+    cancel->setFocusPolicy(Qt::NoFocus);
+    cancel->setIcon(toolbarIcon("close"));
+    cancel->setIconSize(QSize(kCancelIconSize, kCancelIconSize));
+    cancel->setFixedSize(36, 32);
+    cancel->setToolTip(hyprcapture::ui::uiText("Cancel"));
+    cancel->setAccessibleName(hyprcapture::ui::uiText("Cancel"));
+    layout->addWidget(cancel);
+    connect(cancel, &QPushButton::clicked, this, &CaptureOverlay::cancelCapture);
+
+    m_confirmButton = new QPushButton(m_toolbar);
+    m_confirmButton->setFlat(true);
+    m_confirmButton->setFocusPolicy(Qt::NoFocus);
+    m_confirmButton->setIcon(toolbarIcon("check"));
+    m_confirmButton->setIconSize(QSize(kConfirmIconSize, kConfirmIconSize));
+    m_confirmButton->setFixedSize(36, 32);
+    m_confirmButton->setToolTip(hyprcapture::ui::uiText("Capture"));
+    m_confirmButton->setAccessibleName(hyprcapture::ui::uiText("Capture"));
+    layout->addWidget(m_confirmButton);
+    connect(m_confirmButton, &QPushButton::clicked, this, &CaptureOverlay::confirmPendingCapture);
+
+    m_status = new QLabel(m_toolbar);
+    m_status->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    layout->addWidget(m_status);
+
+    if (m_record && !m_recordActive)
+        applyRecordDefaultsForCurrentBackground();
+    updateToolbarControlsForMode();
+    updateRecordOptionsVisibility();
+    updateRecordWarning();
+    updateStatus();
+    relayoutToolbar();
+}
+
+void CaptureOverlay::ensureRecordControls() {
+    if (m_recordOptions)
+        return;
+    auto* rootLayout = qobject_cast<QVBoxLayout*>(m_toolbar->layout());
+    m_recordOptions = new QWidget(m_toolbar);
+    auto* recordLayout = new QHBoxLayout(m_recordOptions);
+    recordLayout->setContentsMargins(0, 0, 0, 0);
+    recordLayout->setSpacing(5);
+
+    const auto onRecordOptionChanged = [this] {
+        m_recordError.clear();
+        updateRecordOptionsVisibility();
+        updateStatus();
+    };
+
+    m_recordCodec = new InlineSelect(this, m_recordOptions);
+    m_recordCodec->setPrefix("Codec");
+    m_recordCodec->addItems(QStringList{"auto", "h264", "h265", "av1", "vp9", "ffv1"});
+    m_recordCodec->setCurrentText(defaultRecordCodecForBackground(m_defaults, currentRecordBackground()));
+    m_recordCodec->setOnChanged([this, onRecordOptionChanged] {
+        m_recordCodecAuto = false;
+        onRecordOptionChanged();
+    });
+    recordLayout->addWidget(m_recordCodec);
+
+    m_recordFormat = new InlineSelect(this, m_recordOptions);
+    m_recordFormat->setObjectName("recordFormat");
+    m_recordFormat->setPrefix("Format");
+    m_recordFormat->addItems(QStringList{"mp4", "mov", "webm", "mkv", "gif", "apng", "webp"});
+    m_recordFormat->setCurrentText(defaultRecordFormatForBackground(m_defaults, currentRecordBackground()));
+    m_recordFormat->setOnChanged([this, onRecordOptionChanged] {
+        m_recordFormatAuto = false;
+        if (isImageAnimationRecordFormat(currentRecordFormat())) {
+            if (m_recordDuration)
+                m_recordDuration->setCurrentText(animationDurationChoice(currentRecordMaxSeconds()));
+        } else if (currentRecordAlphaRequested() && m_recordCodec) {
+            const QString format = currentRecordFormat();
+            if (format == "webm" || format == "mkv") {
+                m_recordCodec->setCurrentText(transparentAutoChoiceForFormat(format).codec);
+                m_recordCodecAuto = true;
+            }
+        }
+        onRecordOptionChanged();
+    });
+    recordLayout->addWidget(m_recordFormat);
+
+    m_recordFps = new InlineSelect(this, m_recordOptions);
+    m_recordFps->setPrefix("FPS");
+    m_recordFps->addItems(recordFpsChoices(m_defaults));
+    m_recordFps->setCurrentText(QString::number(std::clamp<std::int64_t>(m_defaults.recordFps, 1, 240)));
+    m_recordFps->setOnChanged(onRecordOptionChanged);
+    recordLayout->addWidget(m_recordFps);
+
+    m_recordDuration = new InlineSelect(this, m_recordOptions);
+    m_recordDuration->setPrefix("Duration");
+    m_recordDuration->addItems(animationDurationChoices());
+    m_recordDuration->setCurrentText(animationDurationChoice(m_defaults.recordMaxSeconds));
+    m_recordDuration->setOnChanged(onRecordOptionChanged);
+    recordLayout->addWidget(m_recordDuration);
+
+    m_recordBackend = new InlineSelect(this, m_recordOptions);
+    m_recordBackend->setPrefix("Backend");
+    m_recordBackend->addItems(QStringList{"auto", "compositor", "gsr-visible"});
+    m_recordBackend->setCurrentText(qString(hyprcapture::toString(m_defaults.recordWindowBackend)));
+    m_recordBackend->setOnChanged(onRecordOptionChanged);
+    recordLayout->addWidget(m_recordBackend);
+
+    rootLayout->addWidget(m_recordOptions, 0, Qt::AlignHCenter);
+
+    m_soundOptions = new QWidget(m_toolbar);
+    m_soundOptions->setObjectName("soundOptions");
+    auto* soundLayout = new QHBoxLayout(m_soundOptions);
+    soundLayout->setContentsMargins(0, 0, 0, 0);
+    soundLayout->setSpacing(5);
+    m_soundMode = new InlineSelect(this, m_soundOptions);
+    m_soundMode->setObjectName("soundMode");
+    m_soundMode->setPrefix("Sound");
+    m_soundMode->addItems({"off", "system", "microphone", "mix"});
+    m_soundMode->setLabels({{"off", "Off"}, {"system", "System"}, {"microphone", "Microphone"}, {"mix", "Mix"}});
+    m_soundMode->setCurrentText(qString(hyprcapture::toString(m_defaults.recordAudio)));
+    m_soundMode->setOnChanged([this, onRecordOptionChanged] {
+        m_defaults.recordAudio = hyprcapture::parseRecordAudio(m_soundMode->currentText().toStdString());
+        onRecordOptionChanged();
+    });
+    soundLayout->addWidget(m_soundMode);
+    m_soundOutput = new InlineSelect(this, m_soundOptions);
+    m_soundOutput->setObjectName("soundOutput");
+    m_soundInput = new InlineSelect(this, m_soundOptions);
+    m_soundInput->setObjectName("soundInput");
+    m_soundOutput->setPrefix("Source");
+    m_soundInput->setPrefix("Mic");
+    for (auto* select : {m_soundOutput, m_soundInput}) {
+        select->setCompactWidth(210);
+        select->addItems({"default"});
+        select->setLabels({{"default", "System default"}});
+        select->setOnOpening([this] { refreshSoundDevices(); });
+        soundLayout->addWidget(select);
+    }
+    m_soundOutput->addItems({"auto", "default"});
+    m_soundOutput->setLabels({{"auto", "Auto"}, {"default", "System default"}});
+    m_soundOutput->setCurrentText(qString(m_defaults.recordAudioOutput));
+    m_soundInput->setCurrentText(qString(m_defaults.recordAudioInput));
+    m_soundOutput->setOnChanged([this, onRecordOptionChanged] {
+        m_defaults.recordAudioOutput = m_soundOutput->currentText().toStdString(); onRecordOptionChanged();
+    });
+    m_soundInput->setOnChanged([this, onRecordOptionChanged] {
+        m_defaults.recordAudioInput = m_soundInput->currentText().toStdString(); onRecordOptionChanged();
+    });
+    m_soundPreset = new InlineSelect(this, m_soundOptions);
+    m_soundPreset->setObjectName("soundPreset");
+    m_soundPreset->addItems({"manual", "auto-balance", "voice-priority"});
+    m_soundPreset->setLabels({{"manual", "Manual"}, {"auto-balance", "Auto balance"}, {"voice-priority", "Voice priority"}});
+    m_soundPreset->setCurrentText(qString(m_defaults.recordAudioMix));
+    m_soundPreset->setOnChanged([this, onRecordOptionChanged] {
+        m_defaults.recordAudioMix = m_soundPreset->currentText().toStdString(); onRecordOptionChanged();
+    });
+    soundLayout->addWidget(m_soundPreset);
+    rootLayout->addWidget(m_soundOptions);
+    m_aecOptions = new QWidget(m_toolbar);
+    m_aecOptions->setObjectName("aecOptions");
+    auto* aecLayout = new QHBoxLayout(m_aecOptions);
+    aecLayout->setContentsMargins(0,0,0,0); aecLayout->setSpacing(4);
+    aecLayout->addStretch();
+    m_echoCancellation = new InlineSelect(this, m_aecOptions);
+    m_echoCancellation->setObjectName("echoCancellation");
+    m_echoCancellation->setPrefix("AEC"); m_echoCancellation->setCompactWidth(110);
+    m_echoCancellation->addItems({"-1","1","0"});
+    m_echoCancellation->setLabels({{"-1","Auto"},{"1","Always on"},{"0","Always off"}});
+    m_echoCancellation->setCurrentText(QString::number(m_defaults.recordAudioEchoCancellation));
+    m_echoCancellation->setOnChanged([this] {
+        m_defaults.recordAudioEchoCancellation = m_echoCancellation->currentText().toInt();
+        hyprcapture::ui::saveAecPreferences(m_defaults); refreshAecStatus(); updateSoundMeter();
+    });
+    aecLayout->addWidget(m_echoCancellation);
+    m_echoBackend = new InlineSelect(this,m_aecOptions);
+    m_echoBackend->setObjectName("echoBackend"); m_echoBackend->setCompactWidth(75);
+    m_echoBackend->addItems({"cpu","npu"});m_echoBackend->setLabels({{"cpu","CPU"},{"npu","NPU*"}});
+    m_echoBackend->setSelectionHint("NPU is experimental and must pass correctness and speed checks. No NVIDIA GPU fallback.");
+    m_echoBackend->setCurrentText(qString(m_defaults.recordAudioEchoBackend));
+    m_echoBackend->setOnChanged([this] {
+        m_defaults.recordAudioEchoBackend=m_echoBackend->currentText().toStdString();
+        hyprcapture::ui::saveAecPreferences(m_defaults);refreshAecStatus();updateSoundMeter();
+    });
+    aecLayout->addWidget(m_echoBackend);
+    m_aecTest = new QPushButton("Test now",m_aecOptions);m_aecTest->setObjectName("aecRetest");
+    m_aecTest->setToolTip("Download missing models and test AEC on this computer. This test does not record the microphone.");
+    connect(m_aecTest,&QPushButton::clicked,this,[this]{refreshAecStatus(true);});aecLayout->addWidget(m_aecTest);
+    m_aecStatus = new QLabel("AEC · checking",m_aecOptions);m_aecStatus->setObjectName("aecStatus");
+    m_aecStatus->setMinimumWidth(1);m_aecStatus->setSizePolicy(QSizePolicy::Preferred,QSizePolicy::Preferred);
+    aecLayout->addWidget(m_aecStatus);
+    aecLayout->addStretch();
+    rootLayout->addWidget(m_aecOptions, 0, Qt::AlignHCenter);
+    QTimer::singleShot(0,this,[this]{refreshAecStatus();});
+    m_soundMixer = new QWidget(m_toolbar);
+    m_soundMixer->setObjectName("soundMixer");
+    auto* mixerLayout = new QHBoxLayout(m_soundMixer);
+    mixerLayout->setContentsMargins(0, 2, 0, 2); mixerLayout->setSpacing(14);
+    auto channel = [this, mixerLayout](const QString& name, QSlider*& slider, AudioMeter*& meter, std::int64_t& gain) {
+        auto* strip = new QWidget(m_soundMixer);
+        auto* layout = new QVBoxLayout(strip); layout->setContentsMargins(0, 0, 0, 0); layout->setSpacing(2);
+        auto* label = new QLabel(strip);
+        slider = new QSlider(Qt::Horizontal, strip);
+        slider->setObjectName(name.toLower() + "Gain"); slider->setAccessibleName(name + " gain in dB");
+        slider->setRange(-61, 24); slider->setValue(gain); slider->setMinimumWidth(90);
+        meter = new AudioMeter(strip); meter->setObjectName(name.toLower() + "Meter"); meter->setGain(gain);
+        auto updateGain = [label, meter, name, &gain](int value) {
+            gain = value; meter->setGain(value);
+            label->setText(name + "   " + (value == -61 ? QString("Mute") : QString::number(value) + " dB"));
+        };
+        updateGain(gain); connect(slider, &QSlider::valueChanged, this, updateGain);
+        auto* title = new QHBoxLayout; title->setSpacing(4); title->addWidget(label); title->addStretch();
+        layout->addLayout(title); layout->addWidget(slider); layout->addWidget(meter);
+        mixerLayout->addWidget(strip, 1);
+    };
+    channel("Sound", m_systemGain, m_systemMeter, m_defaults.recordAudioSystemGain);
+    channel("Mic", m_micGain, m_micMeter, m_defaults.recordAudioMicGain);
+    rootLayout->addWidget(m_soundMixer, 0, Qt::AlignHCenter);
+    auto* meterLifecycle = new QTimer(this);
+    connect(meterLifecycle, &QTimer::timeout, this, &CaptureOverlay::updateSoundMeter);
+    meterLifecycle->start(100);
+    refreshSoundDevices();
+
+
+    m_recordWarning = new QLabel(m_toolbar);
+    m_recordWarning->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    m_recordWarning->setStyleSheet(QStringLiteral("color: rgba(242, 170, 55, 255); padding: 2px 4px;"));
+    rootLayout->addWidget(m_recordWarning);
+
+}
+
+double CaptureOverlay::overlayOpacity() const {
+    return m_overlayOpacity;
+}
+
+void CaptureOverlay::setOverlayOpacity(double opacity) {
+    m_overlayOpacity = std::clamp(opacity, 0.0, 1.0);
+    if (m_toolbarOpacity)
+        m_toolbarOpacity->setOpacity(m_overlayOpacity);
+    update();
+}
+
+void CaptureOverlay::runOverlayFade(double start, double end, std::function<void()> finished) {
+    if (m_fadeAnimation) {
+        m_fadeAnimation->stop();
+        m_fadeAnimation->deleteLater();
+        m_fadeAnimation = nullptr;
+    }
+
+    setOverlayOpacity(start);
+
+    auto* animation = new QPropertyAnimation(this, "overlayOpacity", this);
+    m_fadeAnimation = animation;
+    animation->setDuration(kOverlayFadeDurationMs);
+    animation->setStartValue(start);
+    animation->setEndValue(end);
+    animation->setEasingCurve(QEasingCurve::InOutCubic);
+    connect(animation, &QPropertyAnimation::finished, this, [this, animation, finished = std::move(finished)]() mutable {
+        if (m_fadeAnimation == animation)
+            m_fadeAnimation = nullptr;
+        animation->deleteLater();
+        if (finished)
+            finished();
+    });
+    animation->start();
+}
+
+void CaptureOverlay::fadeOutThen(std::function<void()> finished) {
+    if (m_fadeOutStarted)
+        return;
+    m_fadeOutStarted = true;
+
+    hideOptionPopups();
+
+    runOverlayFade(m_overlayOpacity, 0.0, [this, finished = std::move(finished)]() mutable {
+        hide();
+        if (finished)
+            finished();
+    });
+}
+
+void CaptureOverlay::enterEvent(QEnterEvent* event) {
+    requestActivation();
+    QMainWindow::enterEvent(event);
+}
+
+bool CaptureOverlay::event(QEvent* event) {
+    const bool update = event->type() == QEvent::UpdateRequest;
+    const bool hadParentFrame = property("hdrFirstParentFrame").toBool();
+    std::optional<ScopedUiTiming> updateTiming;
+    if (m_firstUpdatePending && update) {
+        m_firstUpdatePending = false;
+        updateTiming.emplace(QStringLiteral("overlay.first_update.%1.%2").arg(x()).arg(y()));
+    }
+    const bool handled = QMainWindow::event(event);
+    if (update && !hadParentFrame && property("hdrFirstParentFrame").toBool())
+        traceTiming(QStringLiteral("overlay.first_parent_update_done.%1.%2").arg(x()).arg(y()));
+    // Qt backing-store completion is distinct from Wayland presentation.
+    return handled;
+}
+
+void CaptureOverlay::showEvent(QShowEvent* event) {
+    traceTiming(QStringLiteral("overlay.show.%1.%2").arg(x()).arg(y()));
+    QMainWindow::showEvent(event);
+    // Allow the layer configure/transparent buffer commits needed to create
+    // native children, but no frozen SDR desktop or controls during this gate.
+    if (m_hdrStartupWaiting && !m_hdrStartupTimer) {
+        m_hdrStartupDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+        traceTiming(QStringLiteral("overlay.hdr_gate.begin.%1.%2 max_wait_ms=100").arg(x()).arg(y()));
+        m_hdrStartupTimer = new QTimer(this);
+        m_hdrStartupTimer->setInterval(4);
+        connect(m_hdrStartupTimer, &QTimer::timeout, this, [this] {
+            prepareHdrBackdrops();
+            hdrStartupBlocked();
+            update();
+        });
+        m_hdrStartupTimer->start();
+    }
+    if (m_hdrStartupWaiting)
+        QTimer::singleShot(0, this, [this] { prepareHdrBackdrops(); update(); });
+    // A compositor session already initialized hit testing/status from its
+    // frozen cursor position. Do not schedule another full-screen repaint
+    // immediately after the first frame just to apply the same position.
+    if (!m_hasCursorLogicalPosition)
+        QTimer::singleShot(0, this, &CaptureOverlay::refreshInitialCursorPosition);
+}
+
+void CaptureOverlay::hideOptionPopups() {
+    if (m_fullscreenScope)
+        m_fullscreenScope->hidePopup();
+    if (m_windowBackground)
+        m_windowBackground->hidePopup();
+    for (auto* select : {m_soundMode, m_soundOutput, m_soundInput, m_soundPreset}) if (select) select->hidePopup();
+    if (m_recordCodec)
+        m_recordCodec->hidePopup();
+    if (m_recordFormat)
+        m_recordFormat->hidePopup();
+    if (m_recordFps)
+        m_recordFps->hidePopup();
+    if (m_recordDuration)
+        m_recordDuration->hidePopup();
+    if (m_recordBackend)
+        m_recordBackend->hidePopup();
+}
+
+bool CaptureOverlay::confirmBeforeCaptureEnabled() const {
+    return m_confirmBeforeCapture;
+}
+
+bool CaptureOverlay::pendingConfirmActive() const {
+    return confirmBeforeCaptureEnabled() && m_pendingConfirm;
+}
+
+bool CaptureOverlay::regionSelectionValid(const QRect& selection) const {
+    const QRect clipped = selection.normalized().intersected(regionCaptureBounds());
+    return clipped.width() > 4 && clipped.height() > 4;
+}
+
+void CaptureOverlay::setSelectionRect(const QRect& rect) {
+    const QRect clipped = rect.normalized().intersected(regionCaptureBounds());
+    m_dragStart = clipped.topLeft();
+    m_dragEnd = clipped.bottomRight();
+}
+
+void CaptureOverlay::updateConfirmButtonVisibility() {
+    if (!m_confirmButton)
+        return;
+
+    const bool targetValid = pendingConfirmActive() &&
+        (m_mode == hyprcapture::CaptureMode::Fullscreen ||
+         (m_mode == hyprcapture::CaptureMode::Region && regionSelectionValid(normalizedSelection())) ||
+         (m_mode == hyprcapture::CaptureMode::Window && selectedWindow()));
+
+    if (!targetValid) {
+        m_confirmButton->hide();
+        m_confirmButton->setFixedSize(0, 0);
+        m_confirmButton->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        return;
+    }
+
+    m_confirmButton->setVisible(true);
+    m_confirmButton->setFixedSize(36, 32);
+    m_confirmButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+}
+
+void CaptureOverlay::beginPendingConfirm(hyprcapture::CaptureMode mode) {
+    if (!confirmBeforeCaptureEnabled()) {
+        finishCapture();
+        return;
+    }
+
+    m_mode = mode;
+    if(m_scrollSessionVersion>=1 && !m_record && !m_recordActive) { beginInPlaceEdit(); return; }
+    m_pendingConfirm = true;
+    m_confirmDragMode = ConfirmDragMode::None;
+    m_dragging = false;
+    if (mode != hyprcapture::CaptureMode::Window) {
+        m_selectedWindowIndex = -1;
+        resetWindowCycle();
+    }
+    updateToolbarControlsForMode();
+    updateStatus();
+    update();
+}
+
+void CaptureOverlay::clearPendingConfirm() {
+    m_pendingConfirm = false;
+    m_confirmDragMode = ConfirmDragMode::None;
+    m_dragging = false;
+    m_selectedWindowIndex = -1;
+    resetWindowCycle();
+    setCursor(Qt::CrossCursor);
+    updateConfirmButtonVisibility();
+}
+
+void CaptureOverlay::confirmPendingCapture() {
+    if (!pendingConfirmActive())
+        return;
+
+    if (m_mode == hyprcapture::CaptureMode::Region && !regionSelectionValid(normalizedSelection()))
+        return;
+    if (m_mode == hyprcapture::CaptureMode::Window && !selectedWindow())
+        return;
+
+    m_pendingConfirm = false;
+    m_confirmDragMode = ConfirmDragMode::None;
+    updateConfirmButtonVisibility();
+    finishCapture();
+}
+
+CaptureOverlay::ConfirmDragMode CaptureOverlay::confirmRegionDragModeAt(const QPoint& point) const {
+    const QRect selection = normalizedSelection().intersected(regionCaptureBounds());
+    if (!regionSelectionValid(selection))
+        return ConfirmDragMode::NewSelection;
+
+    const int hit = kSelectionHandleHitRadius;
+    const bool nearLeft = std::abs(point.x() - selection.left()) <= hit && point.y() >= selection.top() - hit && point.y() <= selection.bottom() + hit;
+    const bool nearRight = std::abs(point.x() - selection.right()) <= hit && point.y() >= selection.top() - hit && point.y() <= selection.bottom() + hit;
+    const bool nearTop = std::abs(point.y() - selection.top()) <= hit && point.x() >= selection.left() - hit && point.x() <= selection.right() + hit;
+    const bool nearBottom = std::abs(point.y() - selection.bottom()) <= hit && point.x() >= selection.left() - hit && point.x() <= selection.right() + hit;
+
+    if (nearLeft && nearTop)
+        return ConfirmDragMode::ResizeTopLeft;
+    if (nearRight && nearTop)
+        return ConfirmDragMode::ResizeTopRight;
+    if (nearRight && nearBottom)
+        return ConfirmDragMode::ResizeBottomRight;
+    if (nearLeft && nearBottom)
+        return ConfirmDragMode::ResizeBottomLeft;
+    if (nearLeft)
+        return ConfirmDragMode::ResizeLeft;
+    if (nearTop)
+        return ConfirmDragMode::ResizeTop;
+    if (nearRight)
+        return ConfirmDragMode::ResizeRight;
+    if (nearBottom)
+        return ConfirmDragMode::ResizeBottom;
+    if (selection.contains(point))
+        return ConfirmDragMode::MoveSelection;
+    return ConfirmDragMode::NewSelection;
+}
+
+Qt::CursorShape CaptureOverlay::cursorForConfirmDragMode(ConfirmDragMode mode) const {
+    switch (mode) {
+        case ConfirmDragMode::MoveSelection: return Qt::SizeAllCursor;
+        case ConfirmDragMode::ResizeLeft:
+        case ConfirmDragMode::ResizeRight: return Qt::SizeHorCursor;
+        case ConfirmDragMode::ResizeTop:
+        case ConfirmDragMode::ResizeBottom: return Qt::SizeVerCursor;
+        case ConfirmDragMode::ResizeTopLeft:
+        case ConfirmDragMode::ResizeBottomRight: return Qt::SizeFDiagCursor;
+        case ConfirmDragMode::ResizeTopRight:
+        case ConfirmDragMode::ResizeBottomLeft: return Qt::SizeBDiagCursor;
+        case ConfirmDragMode::NewSelection:
+        case ConfirmDragMode::None: return Qt::CrossCursor;
+    }
+    return Qt::CrossCursor;
+}
+
+void CaptureOverlay::updateConfirmCursor(const QPoint& point) {
+    if (!pendingConfirmActive() || m_mode != hyprcapture::CaptureMode::Region) {
+        setCursor(Qt::CrossCursor);
+        return;
+    }
+
+    const ConfirmDragMode mode = m_dragging ? m_confirmDragMode : confirmRegionDragModeAt(point);
+    setCursor(cursorForConfirmDragMode(mode));
+}
+
+QRect CaptureOverlay::regionSelectionForDrag(const QPoint& point) const {
+    const QRect bounds = regionCaptureBounds();
+    const QPoint clamped = clampedToRect(point, bounds);
+    QRect selection = m_confirmDragStartSelection;
+
+    if (m_confirmDragMode == ConfirmDragMode::NewSelection)
+        return QRect(m_confirmDragStart, clamped).normalized().intersected(bounds);
+
+    if (m_confirmDragMode == ConfirmDragMode::MoveSelection) {
+        QRect moved = selection.translated(clamped - m_confirmDragStart);
+        if (moved.left() < bounds.left())
+            moved.moveLeft(bounds.left());
+        if (moved.top() < bounds.top())
+            moved.moveTop(bounds.top());
+        if (moved.right() > bounds.right())
+            moved.moveRight(bounds.right());
+        if (moved.bottom() > bounds.bottom())
+            moved.moveBottom(bounds.bottom());
+        return moved.intersected(bounds);
+    }
+
+    int left = selection.left();
+    int top = selection.top();
+    int right = selection.right();
+    int bottom = selection.bottom();
+    switch (m_confirmDragMode) {
+        case ConfirmDragMode::ResizeLeft:
+        case ConfirmDragMode::ResizeTopLeft:
+        case ConfirmDragMode::ResizeBottomLeft: left = clamped.x(); break;
+        default: break;
+    }
+    switch (m_confirmDragMode) {
+        case ConfirmDragMode::ResizeTop:
+        case ConfirmDragMode::ResizeTopLeft:
+        case ConfirmDragMode::ResizeTopRight: top = clamped.y(); break;
+        default: break;
+    }
+    switch (m_confirmDragMode) {
+        case ConfirmDragMode::ResizeRight:
+        case ConfirmDragMode::ResizeTopRight:
+        case ConfirmDragMode::ResizeBottomRight: right = clamped.x(); break;
+        default: break;
+    }
+    switch (m_confirmDragMode) {
+        case ConfirmDragMode::ResizeBottom:
+        case ConfirmDragMode::ResizeBottomRight:
+        case ConfirmDragMode::ResizeBottomLeft: bottom = clamped.y(); break;
+        default: break;
+    }
+
+    return QRect(QPoint(left, top), QPoint(right, bottom)).normalized().intersected(bounds);
+}
+
+void CaptureOverlay::setMode(hyprcapture::CaptureMode mode) {
+    hideOptionPopups();
+    if (m_editing)
+        leaveInPlaceEdit();
+
+    clearPendingConfirm();
+    m_fullscreenClientSelected = false;
+    m_mode = mode;
+    if (m_record)
+        applyRecordDefaultsForCurrentBackground();
+    updateToolbarControlsForMode();
+    updateStatus();
+    update();
+}
+
+void CaptureOverlay::updateToolbarControlsForMode() {
+    if (m_dynamicRangeControl) m_dynamicRangeControl->setVisible(m_defaults.showHdrControl && m_hasHdrScreen && !m_record && !m_recordActive);
+    if (m_hdrButton) {
+        m_hdrButton->setEnabled((!m_scrollResult || !m_scrollHdrOriginal.isNull()) && m_hasHdrScreen && hyprcapture::ui::hdrHeicAvailable());
+        m_hdrButton->setToolTip(m_scrollResult && m_scrollHdrOriginal.isNull() ? tr("HDR frames are unavailable for this scrolling screenshot") : QString{});
+    }
+    if (auto* cancel = m_toolbar->findChild<QPushButton*>("captureCancel"))
+        cancel->setVisible(!m_editing);
+    for (auto* button : m_toolbar->findChildren<QPushButton*>("captureModeButton")) {
+        const auto mode = hyprcapture::parseCaptureMode(button->property("captureMode").toString().toStdString());
+        const bool visible = !m_scrollResult && (m_editing || !m_defaults.fushionMode || mode == hyprcapture::CaptureMode::Fullscreen);
+        button->setVisible(visible);
+        button->setFixedSize(visible ? QSize(36, 32) : QSize(0, 0));
+        button->setChecked(mode == m_mode);
+    }
+    if (m_fullscreenScope) {
+        const bool visible = !m_scrollResult && hasMultipleMonitors() && (m_defaults.fushionMode || m_mode == hyprcapture::CaptureMode::Fullscreen);
+        m_fullscreenScope->setControlVisible(visible);
+    }
+
+    if (m_windowBackground) {
+        const bool visible = m_scrollResult ? !m_scrollOriginal.isNull() :
+            (m_defaults.fushionMode || m_mode == hyprcapture::CaptureMode::Window);
+        m_windowBackground->setControlVisible(visible);
+    }
+
+    if (m_recordToggle) {
+        m_recordToggle->setVisible(!m_scrollResult);
+        m_recordToggle->setFixedSize(m_scrollResult ? QSize(0, 0) : QSize(36, 32));
+    }
+    updateRecordOptionsVisibility();
+    updateConfirmButtonVisibility();
+    relayoutToolbar();
+}
+
+int CaptureOverlay::monitorCount() const {
+    const int qtScreens = QGuiApplication::screens().size();
+    if (qtScreens > 0)
+        return qtScreens;
+    return m_sessionMonitorCount;
+}
+
+bool CaptureOverlay::hasMultipleMonitors() const {
+    return monitorCount() > 1;
+}
+
+hyprcapture::FullscreenScope CaptureOverlay::currentFullscreenScope() const {
+    if (!m_fullscreenScope || !hasMultipleMonitors())
+        return hyprcapture::FullscreenScope::All;
+    return hyprcapture::parseFullscreenScope(m_fullscreenScope->currentText().toStdString(), m_defaults.fullscreenScope);
+}
+
+hyprcapture::WindowBackground CaptureOverlay::currentWindowBackground() const {
+    if (!m_windowBackground)
+        return m_defaults.windowBackground;
+    return hyprcapture::parseWindowBackground(m_windowBackground->currentText().toStdString(), m_defaults.windowBackground);
+}
+
+hyprcapture::WindowBackground CaptureOverlay::currentRecordBackground() const {
+    if (m_mode != hyprcapture::CaptureMode::Window)
+        return hyprcapture::WindowBackground::FollowSystem;
+    return currentWindowBackground();
+}
+
+bool CaptureOverlay::currentRecordTransparencyRequired() const {
+    return m_mode == hyprcapture::CaptureMode::Window && transparencyRequired(currentWindowBackground());
+}
+
+bool CaptureOverlay::currentRecordAlphaRequested() const {
+    return m_mode == hyprcapture::CaptureMode::Window && alphaRecordingRequested(m_defaults, currentWindowBackground());
+}
+
+QString CaptureOverlay::currentRecordFormat() const {
+    if (!m_recordFormat)
+        return defaultRecordFormatForBackground(m_defaults, currentRecordBackground());
+    return normalizedRecordFormat(m_recordFormat->currentText());
+}
+
+QString CaptureOverlay::currentRecordCodec() const {
+    if (!m_recordCodec)
+        return defaultRecordCodecForBackground(m_defaults, currentRecordBackground());
+    return normalizedChoice(m_recordCodec->currentText());
+}
+
+int CaptureOverlay::currentRecordFps() const {
+    if (!m_recordFps)
+        return std::clamp<std::int64_t>(m_defaults.recordFps, 1, 240);
+    bool ok = false;
+    const int fps = m_recordFps->currentText().toInt(&ok);
+    return ok ? std::clamp(fps, 1, 240) : std::clamp<std::int64_t>(m_defaults.recordFps, 1, 240);
+}
+
+int CaptureOverlay::currentRecordMaxSeconds() const {
+    if (isImageAnimationRecordFormat(currentRecordFormat()))
+        return animationDurationSeconds(m_recordDuration ? m_recordDuration->currentText() : animationDurationChoice(m_defaults.recordMaxSeconds));
+    return std::clamp<std::int64_t>(m_defaults.recordMaxSeconds, 0, 24 * 60 * 60);
+}
+
+int CaptureOverlay::currentRecordCountdownSeconds() const {
+    return std::clamp<std::int64_t>(m_defaults.recordCountdownSeconds, 0, kMaxRecordCountdownSeconds);
+}
+
+hyprcapture::RecordWindowBackend CaptureOverlay::currentRecordBackend() const {
+    if (!m_recordBackend)
+        return m_defaults.recordWindowBackend;
+    return hyprcapture::parseRecordWindowBackend(m_recordBackend->currentText().toStdString(), m_defaults.recordWindowBackend);
+}
+
+void CaptureOverlay::applyRecordDefaultsForCurrentBackground() {
+    ensureRecordControls();
+    const auto background = currentRecordBackground();
+
+    if (background != hyprcapture::WindowBackground::Transparent) {
+        if (m_recordFormatAuto && m_recordFormat)
+            m_recordFormat->setCurrentText(defaultRecordFormatForBackground(m_defaults, background));
+        if (m_recordCodecAuto && m_recordCodec)
+            m_recordCodec->setCurrentText(defaultRecordCodecForBackground(m_defaults, background));
+        return;
+    }
+
+    const QString configuredFormat = defaultRecordFormatForBackground(m_defaults, background);
+    const QString configuredCodec = defaultRecordCodecForBackground(m_defaults, background);
+    const QString targetFormat = m_recordFormatAuto ? configuredFormat : currentRecordFormat();
+    if (configuredCodec == "auto") {
+        const auto choice = transparentAutoChoiceForFormat(targetFormat);
+        if (m_recordFormatAuto && m_recordFormat)
+            m_recordFormat->setCurrentText(choice.format);
+        if (m_recordCodecAuto && m_recordCodec)
+            m_recordCodec->setCurrentText(choice.codec);
+        return;
+    }
+
+    if (m_recordFormatAuto && m_recordFormat)
+        m_recordFormat->setCurrentText(configuredFormat);
+    if (m_recordCodecAuto && m_recordCodec)
+        m_recordCodec->setCurrentText(configuredCodec);
+}
+
+QString CaptureOverlay::recordOptionsConflict() const {
+    if (!m_record)
+        return {};
+
+    const bool alphaRequested = currentRecordTransparencyRequired();
+    const QString format = currentRecordFormat();
+    const QString codec = currentRecordCodec();
+    const bool imageAnimation = isImageAnimationRecordFormat(format);
+
+    if (imageAnimation)
+        return {};
+
+    if (alphaRequested && currentRecordBackend() == hyprcapture::RecordWindowBackend::GsrVisible)
+        return QStringLiteral("selected backend does not support transparency");
+    if (alphaRequested && format == "mp4")
+        return QStringLiteral("mp4 does not support transparency");
+    if (alphaRequested && format == "mov")
+        return QStringLiteral("mov alpha is not supported by this encoder");
+    if (format == "webm" && alphaRequested && codec != "auto" && codec != "vp9")
+        return QStringLiteral("webm transparency requires vp9");
+    if (format == "webm" && codec != "auto" && codec != "vp9" && codec != "av1")
+        return QStringLiteral("webm requires vp9 or av1");
+    if (format == "mkv" && alphaRequested && codec != "auto" && codec != "ffv1")
+        return QStringLiteral("mkv transparency requires ffv1");
+    if ((format == "mp4" || format == "mov") && (codec == "vp9" || codec == "ffv1"))
+        return format + QStringLiteral(" requires h264, h265, or av1");
+    return {};
+}
+
+QString CaptureOverlay::recordOptionsWarning() const {
+    if (!m_record)
+        return {};
+
+    const QString format = currentRecordFormat();
+    const QString codec = currentRecordCodec();
+    if (isImageAnimationRecordFormat(format)) {
+        if (format == "apng") {
+            if (currentRecordMaxSeconds() >= 10)
+                return QStringLiteral("apng recordings of 10s or longer can create very large files");
+            return QStringLiteral("apng records a 60 fps mkv intermediate before transcoding");
+        }
+        if (format == "gif" && currentRecordAlphaRequested())
+            return QStringLiteral("gif has limited transparency; using compositor readback for a fixed-duration animation");
+        return QStringLiteral("animation formats use compositor readback; keep area and fps modest");
+    }
+
+    if (!currentRecordAlphaRequested())
+        return {};
+
+    if (format == "webm" && (codec == "auto" || codec == "vp9")) {
+        if (!alphaProbeSucceeded(format, QStringLiteral("vp9-vaapi")))
+            return QStringLiteral("no hardware alpha encoder detected; using CPU vp9");
+    }
+    if (format == "mkv" && (codec == "auto" || codec == "ffv1"))
+        return QStringLiteral("no hardware alpha encoder detected; using CPU ffv1");
+    return {};
+}
+
+void CaptureOverlay::updateRecordWarning() {
+    if (!m_recordWarning)
+        return;
+
+    const QString conflict = recordOptionsConflict();
+    const QString warning = conflict.isEmpty() ? recordOptionsWarning() : QString{};
+    if (conflict.isEmpty() && warning.isEmpty()) {
+        m_recordWarning->clear();
+        m_recordWarning->hide();
+        m_recordWarning->setFixedSize(0, 0);
+        m_recordWarning->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+        relayoutToolbar();
+        return;
+    }
+
+    m_recordWarning->setText(QStringLiteral("⚠️: ") + (conflict.isEmpty() ? warning : conflict));
+    m_recordWarning->setVisible(true);
+    m_recordWarning->setMinimumSize(0, 0);
+    m_recordWarning->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+    m_recordWarning->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    m_recordWarning->adjustSize();
+    relayoutToolbar();
+}
+
+void CaptureOverlay::refreshSoundDevices() {
+    if (m_soundDevicesLoading || !m_soundInput) return;
+    m_soundDevicesLoading = true;
+    auto* process = new QProcess(this);
+    connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [this, process](int code, QProcess::ExitStatus status) {
+        m_soundDevicesLoading = false;
+        const auto object = QJsonDocument::fromJson(process->readAllStandardOutput()).object();
+        if (code == 0 && status == QProcess::NormalExit) {
+            const auto fill = [](InlineSelect* select, const QJsonArray& devices, bool output) {
+                const auto current = select->currentText();
+                QStringList names{"default"};
+                std::map<QString, QString> labels{{"default", "System default"}};
+                if (output) { names.prepend("auto"); labels["auto"] = "Auto"; }
+                for (const auto& value : devices) {
+                    const auto device = value.toObject();
+                    const auto name = device.value("name").toString();
+                    if (name.isEmpty() || names.contains(name)) continue;
+                    names << name;
+                    auto description = device.value("description").toString();
+                    labels[name] = description.isEmpty() ? name : description;
+                }
+                if (!names.contains(current)) { names << current; labels[current] = current + " (unavailable)"; }
+                select->setLabels(labels); select->addItems(names); select->setCurrentText(current);
+            };
+            auto outputs = object.value("outputs").toArray();
+            for (const auto& window : object.value("windows").toArray()) outputs.append(window);
+            fill(m_soundOutput, outputs, true);
+            fill(m_soundInput, object.value("inputs").toArray(), false);
+            m_soundOptions->setToolTip({});
+        } else m_soundOptions->setToolTip("Audio devices unavailable; video recording remains available");
+        process->deleteLater();
+    });
+    connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart) { m_soundDevicesLoading = false; process->deleteLater(); }
+    });
+    QTimer::singleShot(4000, process, [process] { if (process->state() != QProcess::NotRunning) process->kill(); });
+    process->start(QCoreApplication::applicationFilePath(), {"--sound-list"});
+}
+
+void CaptureOverlay::refreshAecStatus(bool retest) {
+    if (!m_aecStatus || m_recordActive) return;
+    if (m_aecChecking) {
+        if (m_defaults.recordAudioEchoCancellation == 0)
+            for (auto* check : findChildren<QProcess*>())
+                if (check->property("aecCheck").toBool() && check->state() != QProcess::NotRunning) check->kill();
+        return;
+    }
+    m_aecChecking = true;
+    m_aecTestResult.clear();
+    updateSoundMeter();
+    m_aecStatus->setText(retest ? "AEC · testing…" : "AEC · checking");
+    m_aecTest->setEnabled(false);
+    m_aecTest->setText(retest ? "Testing…" : "Checking…");
+    const auto backend = qString(m_defaults.recordAudioEchoBackend);
+    auto* process = new QProcess(this);
+    process->setProperty("aecCheck", true);
+    // Inspect readiness when opening the controls; run installation and the
+    // benchmark only when the user chooses Test now / Retest.
+    QStringList args = retest ? QStringList{"--install", "--force"}
+                             : QStringList{"--status", QString::number(m_defaults.recordAudioEchoCancellation)};
+    if (backend == "npu") args << "--npu";
+    auto finish = [this, process, backend, retest] {
+        if (process->property("aecHandled").toBool()) return;
+        process->setProperty("aecHandled", true);
+        const auto test = QJsonDocument::fromJson(process->readAllStandardOutput()).object();
+        QString error;
+        if (process->property("aecTimedOut").toBool()) error = "test timed out";
+        else if (process->error() == QProcess::FailedToStart) error = "cannot start AEC tester";
+        else if (process->exitStatus() != QProcess::NormalExit || process->exitCode() != 0)
+            error = test["error"].toString("AEC tester exited unexpectedly");
+        else if (retest && test.isEmpty()) error = "AEC tester returned no result";
+        process->deleteLater();
+        if (backend != qString(m_defaults.recordAudioEchoBackend)) { m_aecChecking=false; refreshAecStatus(); return; }
+        auto* status = new QProcess(this);
+        auto done = [this, status, retest, test, error] {
+            if (status->property("aecHandled").toBool()) return;
+            status->setProperty("aecHandled", true);
+            const auto object=QJsonDocument::fromJson(status->readAllStandardOutput()).object();
+            auto text=object["description"].toString("AEC · cannot read test status");
+            if (retest) {
+                if (!error.isEmpty()) text = "Test failed · " + error;
+                else if (test["status"] == "pending") text = "Test not completed · " + test["reason"].toString("try again");
+                else if (test["status"] == "failed") text = "Test failed · " + test["reason"].toString("unknown error");
+                else if (object["model"].toInt() > 0) text = QString("Test passed · %1 %2").arg(object["backend"].toString().toUpper()).arg(object["model"].toInt());
+                else text = "Test failed · " + object["reason"].toString("cannot read test status");
+                m_aecTestResult = text;
+            }
+            m_aecStatus->setText(m_aecStatus->fontMetrics().elidedText(text, Qt::ElideRight, 270));m_aecStatus->setToolTip(text);m_aecChecking=false;
+            m_aecTest->setText(object["model"].toInt() > 0 ? "Retest" : "Test now");
+            m_aecTest->setEnabled(true);
+            m_meterKey.clear();status->deleteLater();updateSoundMeter();
+        };
+        connect(status,qOverload<int,QProcess::ExitStatus>(&QProcess::finished),this,[done](int,QProcess::ExitStatus){done();});
+        connect(status,&QProcess::errorOccurred,this,[done](QProcess::ProcessError e){if(e==QProcess::FailedToStart)done();});
+        const auto statusPolicy = retest && m_defaults.recordAudioEchoCancellation == 0 ? -1 : m_defaults.recordAudioEchoCancellation;
+        QStringList statusArgs{"--status",QString::number(statusPolicy)};
+        if(qString(m_defaults.recordAudioEchoBackend)=="npu")statusArgs<<"--npu";
+        status->start(hyprcapture::audio::aec::workerPath(),statusArgs);
+    };
+    connect(process,qOverload<int,QProcess::ExitStatus>(&QProcess::finished),this,[finish](int,QProcess::ExitStatus){finish();});
+    connect(process,&QProcess::errorOccurred,this,[finish](QProcess::ProcessError e){if(e==QProcess::FailedToStart)finish();});
+    QTimer::singleShot(180000,process,[process]{if(process->state()!=QProcess::NotRunning){process->setProperty("aecTimedOut",true);process->kill();}});
+    process->start(hyprcapture::audio::aec::workerPath(),args);
+}
+
+void CaptureOverlay::updateSoundMeter() {
+    const bool wanted = !m_aecChecking && isVisible() && m_overlayActive && m_soundMixer && m_soundMixer->isVisible();
+    const auto* target = selectedWindow();
+    if (!target) target = hoveredWindow();
+    const auto source = hyprcapture::audio::resolveOutput(m_defaults.recordAudioOutput, m_mode, target ? target->address.toStdString() : "");
+    if (m_soundOutput) {
+        const bool windowSource = source.starts_with("window:");
+        QString hint;
+        if (m_defaults.recordAudioOutput == "auto") hint = windowSource ? (target ? "Auto: " + target->title : "Auto: choose a window") : "Auto: system default output";
+        if (windowSource) hint += (hint.isEmpty() ? "" : "\n") + QString("Captures the window application's audio; windows sharing a process may share audio.");
+        m_soundOutput->setSelectionHint(hint);
+    }
+    // Preview both channels independently of which channels will be recorded.
+    const QStringList args{"--sound-meter", "mix",
+                           qString(source), qString(m_defaults.recordAudioInput), QString::number(m_defaults.recordAudioEchoCancellation), qString(m_defaults.recordAudioEchoBackend)};
+    const QString key = args.join(QChar(0x1f));
+    if (m_meterProcess && (!wanted || key != m_meterKey)) {
+        m_meterProcess->disconnect(this);
+        m_meterProcess->kill();
+        connect(m_meterProcess, &QProcess::finished, m_meterProcess, &QObject::deleteLater);
+        if (m_meterProcess->state() == QProcess::NotRunning) m_meterProcess->deleteLater();
+        m_meterProcess = nullptr; m_meterKey.clear();
+        m_systemMeter->reset(); m_micMeter->reset();
+    }
+    if (!wanted) { m_meterKey.clear(); return; }
+    if (m_meterProcess || m_meterKey == key) return;
+    m_meterKey = key;
+    auto* process = new QProcess(this); m_meterProcess = process;
+    auto buffer = std::make_shared<QByteArray>();
+    connect(process, &QProcess::readyReadStandardOutput, this, [this, process, buffer] {
+        buffer->append(process->readAllStandardOutput());
+        while (buffer->contains('\n')) {
+            const int end = buffer->indexOf('\n');
+            const auto object = QJsonDocument::fromJson(buffer->left(end)).object(); buffer->remove(0, end + 1);
+            if (object.contains("error")) m_systemMeter->setToolTip(object["error"].toString());
+            if (object.contains("aec") && m_aecStatus) {
+                const auto state = object["aec"].toString();
+                auto text = state == "unavailable" ? "AEC unavailable · raw mic" : object["description"].toString(
+                    hyprcapture::audio::aec::description(object,int(m_defaults.recordAudioEchoCancellation)));
+                if (state == "unavailable") m_aecTestResult.clear();
+                if (!m_aecTestResult.isEmpty()) text = m_aecTestResult;
+                m_aecStatus->setText(m_aecStatus->fontMetrics().elidedText(text, Qt::ElideRight, 270)); m_aecStatus->setToolTip(text);
+                if (!m_aecChecking && m_aecTest)
+                    m_aecTest->setText((state == "active" || state == "ready") ? "Retest" : "Test now");
+            }
+            if (!object.contains("levels")) continue;
+            const auto levels = object["levels"].toObject();
+            auto apply = [&levels](AudioMeter* meter, const char* role) {
+                const auto data = levels[role].toObject();
+                meter->setLevels(data["peak"].toDouble(), data["rms"].toDouble(), data["available"].toBool());
+            };
+            apply(m_systemMeter, "System"); apply(m_micMeter, "Microphone");
+        }
+        if (buffer->size() > 8192) buffer->clear();
+    });
+    auto failed = [this, process] {
+        if (m_meterProcess == process) { m_meterProcess = nullptr; m_systemMeter->reset(); m_micMeter->reset(); }
+        process->deleteLater();
+    };
+    connect(process, &QProcess::finished, this, [failed](int, QProcess::ExitStatus) { failed(); });
+    connect(process, &QProcess::errorOccurred, this, [failed](QProcess::ProcessError error) { if (error == QProcess::FailedToStart) failed(); });
+    process->start(QCoreApplication::applicationFilePath(), args);
+}
+
+void CaptureOverlay::updateRecordOptionsVisibility() {
+    if (m_record && !m_recordActive)
+        ensureRecordControls();
+    if (!m_recordOptions)
+        return;
+
+    const bool visible = m_record && !m_recordActive;
+    const bool imageAnimation = visible && isImageAnimationRecordFormat(currentRecordFormat());
+    if (imageAnimation && m_recordDuration)
+        m_recordDuration->setCurrentText(animationDurationChoice(currentRecordMaxSeconds()));
+
+    const auto updateSelect = [](InlineSelect* select, bool selectVisible) {
+        if (select)
+            select->setControlVisible(selectVisible);
+    };
+    updateSelect(m_recordCodec, visible && !imageAnimation);
+    updateSelect(m_recordFormat, visible);
+    updateSelect(m_recordFps, visible);
+    updateSelect(m_recordDuration, imageAnimation);
+    updateSelect(m_recordBackend, visible && !imageAnimation);
+    updateSelect(m_soundMode, visible);
+    updateSelect(m_soundOutput, visible);
+    updateSelect(m_soundInput, visible);
+    m_soundOutput->setEnabled(!imageAnimation);
+    m_soundInput->setEnabled(!imageAnimation);
+    m_soundOptions->setVisible(visible);
+    m_aecOptions->setVisible(visible && !imageAnimation);
+    updateSelect(m_soundPreset, visible);
+    m_soundPreset->setEnabled(!imageAnimation);
+    const bool manual = visible && !imageAnimation && m_defaults.recordAudioMix == "manual";
+    m_soundMixer->setVisible(manual);
+    m_systemGain->setEnabled(true);
+    m_micGain->setEnabled(true);
+    m_soundMode->setEnabled(!imageAnimation);
+    m_soundMode->setToolTip(imageAnimation ? "Animation formats do not support sound" : "Recording sound");
+    if (imageAnimation) m_soundMode->setCurrentText("Not supported");
+    else m_soundMode->setCurrentText(qString(hyprcapture::toString(m_defaults.recordAudio)));
+
+
+    m_recordOptions->setVisible(visible);
+    m_recordOptions->setSizePolicy(visible ? QSizePolicy::Fixed : QSizePolicy::Ignored, visible ? QSizePolicy::Fixed : QSizePolicy::Ignored);
+    if (!visible) {
+        m_recordOptions->setFixedSize(0, 0);
+    } else {
+        m_recordOptions->setMinimumSize(0, 0);
+        m_recordOptions->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        m_recordOptions->adjustSize();
+    }
+
+    updateRecordWarning();
+}
+
+hyprcapture::DecorationPolicy CaptureOverlay::currentWindowBorder() const {
+    return m_defaults.windowBorder;
+}
+
+hyprcapture::DecorationPolicy CaptureOverlay::currentWindowShadow() const {
+    return m_defaults.windowShadow;
+}
+
+bool CaptureOverlay::hasHdrBackdrop(const MonitorArtifact& artifact) const {
+    return std::ranges::any_of(m_hdrBackdrops,[&](const auto& b){return b.geometry==artifact.logicalGeometry && b.surface && b.surface->ready();});
+}
+bool CaptureOverlay::hdrStartupBlocked() {
+    if (!m_hdrStartupWaiting) return false;
+    const bool ready = std::ranges::all_of(m_monitorArtifacts, [this](const auto& a) {
+        return !a.hdrActive || !a.logicalGeometry.intersects(m_overlayLogicalGeometry) || hasHdrBackdrop(a);
+    });
+    if (!ready && (m_hdrStartupDeadline == std::chrono::steady_clock::time_point{} ||
+                  std::chrono::steady_clock::now() < m_hdrStartupDeadline)) return true;
+    m_hdrStartupWaiting = false;
+    setProperty("hdrFirstFrameMode", ready ? "hdr" : "deadline_fallback");
+    traceTiming(QStringLiteral("overlay.hdr_gate.release.%1.%2 mode=%3").arg(x()).arg(y()).arg(ready ? "hdr" : "sdr_timeout"));
+    if (m_hdrStartupTimer) m_hdrStartupTimer->stop();
+    if (m_toolbar) m_toolbar->setVisible(m_overlayActive);
+    return false;
+}
+
+void CaptureOverlay::queuePqBackdrop(const QRect& geometry) {
+    auto slot = std::ranges::find_if(m_hdrBackdrops, [&](const auto& b) { return b.geometry == geometry; });
+    if (slot == m_hdrBackdrops.end() || slot->pqQueued) return;
+    const auto artifact = std::ranges::find_if(m_monitorArtifacts, [&](const auto& a) { return a.logicalGeometry == geometry; });
+    if (artifact == m_monitorArtifacts.end() || artifact->hdrImage.isNull()) return;
+    slot->pqQueued = true;
+    QPointer<CaptureOverlay> overlay(this);
+    QThreadPool::globalInstance()->start(QRunnable::create(
+        [overlay, image = artifact->hdrImage, geometry, reference = artifact->referenceNits] {
+            ScopedUiTiming timing(QStringLiteral("overlay.hdr_backdrop_convert"));
+            float peak = 0;
+            const QImage pq = hyprcapture::ui::hdrToPq10(image, &peak, reference);
+            QMetaObject::invokeMethod(QCoreApplication::instance(), [overlay, pq, geometry, peak, reference] {
+                if (!overlay || pq.isNull() || !overlay->windowHandle()) return;
+                auto* self = overlay.data();
+                auto slot = std::ranges::find_if(self->m_hdrBackdrops, [&](const auto& b) { return b.geometry == geometry; });
+                if (slot == self->m_hdrBackdrops.end()) return;
+                ScopedUiTiming timing(QStringLiteral("overlay.hdr_backdrop_upload"));
+                // PQ must obey the same atomic parent/child commit rule as FP16.
+                auto surface = std::make_unique<hyprcapture::ui::HdrBackdrop>(self->windowHandle(), false, true);
+                surface->setVisible(false);
+                surface->setReadyCallback([overlay](bool) {
+                    if (!overlay) return;
+                    overlay->updateHdrEditBackdrop();
+                    overlay->update();
+                });
+                if (!surface->setPqImage(pq, self->globalToLocalRect(geometry), peak, reference))
+                    qWarning("HyprCapture: native HDR preview unavailable; using SDR preview");
+                slot->surface = std::move(surface);
+                self->update();
+            }, Qt::QueuedConnection);
+        }));
+}
+
+void CaptureOverlay::prepareHdrBackdrops() {
+    if (m_quick || !windowHandle() || !windowHandle()->isExposed()) return;
+    for (const auto& artifact : m_monitorArtifacts) {
+        if (!artifact.hdrActive || !artifact.logicalGeometry.intersects(m_overlayLogicalGeometry)) continue;
+        auto slot = std::ranges::find_if(m_hdrBackdrops, [&](const auto& b) { return b.geometry == artifact.logicalGeometry; });
+        if (slot == m_hdrBackdrops.end()) {
+            m_hdrBackdrops.push_back({artifact.logicalGeometry, {}});
+            slot = std::prev(m_hdrBackdrops.end());
+        }
+        if (slot->fp16Submitted || slot->pqQueued || artifact.hdrImage.isNull()) continue;
+        const auto frame = artifact.hdrUpload ? artifact.hdrUpload->result() : nullptr;
+        if (frame) {
+            slot->fp16Submitted = true;
+            QPointer<CaptureOverlay> overlay(this);
+            auto surface = std::make_unique<hyprcapture::ui::HdrBackdrop>(windowHandle(), false, true);
+            surface->setVisible(false);
+            surface->setReadyCallback([overlay, geometry = artifact.logicalGeometry](bool ready) {
+                if (!overlay) return;
+                if (!ready) overlay->queuePqBackdrop(geometry);
+                overlay->update();
+            });
+            if (!surface->setPreparedImage(frame, globalToLocalRect(artifact.logicalGeometry)))
+                queuePqBackdrop(artifact.logicalGeometry);
+            slot->surface = std::move(surface);
+        } else if (!artifact.hdrUpload || artifact.hdrUpload->state() == hyprcapture::ui::HdrUpload::State::Failed ||
+                   (m_hdrStartupDeadline != std::chrono::steady_clock::time_point{} &&
+                    std::chrono::steady_clock::now() >= m_hdrStartupDeadline)) {
+            // A stalled GPU cannot leave a polling timer running forever. PQ
+            // remains asynchronous and may recover HDR after the visible timeout.
+            queuePqBackdrop(artifact.logicalGeometry);
+        }
+    }
+}
+bool CaptureOverlay::canKeepHdrDesktopInEditor() const {
+    if (!m_editor || m_scrollResult || m_scrolling || !m_editImageRect.isValid() ||
+        m_editor->canvasGeometry() != m_editImageRect) return false;
+    if (m_mode == hyprcapture::CaptureMode::Window) {
+        const auto* window = selectedWindow();
+        if (!window || window->stagePreview || currentWindowBackground() != hyprcapture::WindowBackground::Real) return false;
+        for (const auto& other : m_windowArtifacts)
+            if (&other != window && !other.stagePreview && other.zIndex <= window->zIndex &&
+                other.fullGeometry.intersects(window->fullGeometry)) return false;
+    } else if (m_mode != hyprcapture::CaptureMode::Region && m_mode != hyprcapture::CaptureMode::Fullscreen) return false;
+    if (m_hdrBaseFailed) return false;
+    // The frozen desktop is a temporary display while the isolated HDR base is
+    // composed. Never substitute this preview for the HDR export pixels.
+    QRegion uncovered(m_editor->canvasGeometry());
+    for (const auto& backdrop : m_hdrBackdrops)
+        if (backdrop.surface && backdrop.surface->ready()) uncovered -= QRegion(globalToLocalRect(backdrop.geometry));
+    return uncovered.isEmpty();
+}
+
+void CaptureOverlay::updateHdrEditPresentation() {
+    if (!m_editor) return;
+    const bool enabled = m_editing && m_defaults.screenshotFormat == "heic" && !m_scrolling &&
+                         !m_hdrBaseFailed && !m_hdrBackdrops.empty();
+    const auto key = m_editHdrBase.cacheKey();
+    const bool base = enabled && !m_editHdrBase.isNull() && m_hdrEditCacheKey == key &&
+                      m_hdrEditBackdrop && m_hdrEditBackdrop->ready();
+    const bool composite = enabled && !m_editHdrBase.isNull() && m_editor->needsHdrAnnotationComposition() &&
+                           m_hdrCompositeBaseKey == key && m_hdrEditCompositeBackdrop && m_hdrEditCompositeBackdrop->ready();
+    const auto geometry = m_editor->canvasGeometry();
+    if (m_hdrEditCompositeBackdrop && m_hdrEditBackdrop)
+        m_hdrEditCompositeBackdrop->stackAbove(*m_hdrEditBackdrop);
+    if (m_hdrEditBackdrop) {
+        m_hdrEditBackdrop->setGeometry(geometry);
+        m_hdrEditBackdrop->setVisible(m_overlayActive && base);
+    }
+    if (m_hdrEditCompositeBackdrop) {
+        m_hdrEditCompositeBackdrop->setGeometry(geometry);
+        m_hdrEditCompositeBackdrop->setVisible(m_overlayActive && composite);
+    }
+    m_editor->setExternalImagePresentation(enabled && (base || composite || canKeepHdrDesktopInEditor()), composite);
+}
+
+void CaptureOverlay::updateHdrEditBackdrop() {
+    updateHdrEditPresentation();
+    if (!m_editing || m_defaults.screenshotFormat != "heic" || m_scrolling || !m_editor ||
+        m_hdrBackdrops.empty() || m_hdrBaseFailed || m_editHdrBase.isNull()) return;
+    const auto baseKey = m_editHdrBase.cacheKey();
+    const bool baseOnly = m_hdrEditCacheKey != baseKey;
+    const bool needsComposite = m_editor->needsHdrAnnotationComposition();
+    if (!baseOnly && (!needsComposite || (!m_hdrEditPreviewDirty && m_hdrCompositeBaseKey == baseKey))) return;
+    if (m_hdrEditPreviewBusy) return;
+    m_hdrEditPreviewBusy = true;
+    float reference = 203;
+    for (const auto& artifact : m_monitorArtifacts)
+        if (!artifact.hdrImage.isNull()) { reference = artifact.referenceNits; break; }
+    std::function<HdrAnnotationPreview()> render;
+    if (baseOnly) {
+        // Immutable captured background: no ink snapshot and no per-stroke
+        // conversion/upload. Qt ink is already visible over the frozen desktop
+        // (or immediate SDR base) while this one asynchronous conversion runs.
+        // Seed the same PQ cache used by exceptional HDR ink, so its first
+        // stroke does not trigger a second full-frame base conversion.
+        render = m_editor->pqPreviewFrameRendererOn(m_editHdrBase, reference, true);
+    } else {
+        m_hdrEditPreviewDirty = false;
+        render = m_editor->pqPreviewFrameRendererOn(m_editHdrBase, reference);
+    }
+    const auto queued = std::chrono::steady_clock::now();
+    QPointer<CaptureOverlay> overlay(this);
+    if (!m_hdrEditPreviewPool) m_hdrEditPreviewPool = QThreadPool::globalInstance();
+    m_hdrEditPreviewPool->start(QRunnable::create([overlay, render=std::move(render), baseKey, reference, baseOnly, queued] {
+        const auto began = std::chrono::steady_clock::now();
+        traceTiming("overlay.hdr_edit_worker_queue", -1, std::chrono::duration_cast<std::chrono::microseconds>(began-queued).count());
+        HdrAnnotationPreview frame;
+        { ScopedUiTiming timing(baseOnly ? "overlay.hdr_edit_base_convert" : "overlay.hdr_edit_render"); frame=render(); }
+        const auto rendered = std::chrono::steady_clock::now();
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [overlay, frame, baseKey, reference, baseOnly, rendered, queued] {
+            if (!overlay) return;
+            auto* self = overlay.data(); self->m_hdrEditPreviewBusy = false;
+            traceTiming("overlay.hdr_edit_main_queue", -1, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-rendered).count());
+            if (!self->m_editing || !self->m_editor || self->m_defaults.screenshotFormat != "heic" ||
+                self->m_editHdrBase.cacheKey() != baseKey || self->m_scrolling) {
+                self->updateHdrEditBackdrop(); return;
+            }
+            if (!baseOnly) {
+                // A snapshot may complete after undo/mode changes. Retain its
+                // damage even if we skip displaying it, so a later HDR update
+                // catches up from the last frame actually submitted.
+                self->m_hdrCompositePendingDamage |= frame.damage;
+                if (!self->m_editor->needsHdrAnnotationComposition()) {
+                    self->updateHdrEditBackdrop(); return;
+                }
+            }
+            auto& surface = baseOnly ? self->m_hdrEditBackdrop : self->m_hdrEditCompositeBackdrop;
+            if (!surface) {
+                surface = std::make_unique<hyprcapture::ui::HdrBackdrop>(self->windowHandle(), false, true);
+                surface->setReadyCallback([overlay](bool) {
+                    if (overlay) { overlay->updateHdrEditPresentation(); overlay->update(); }
+                });
+            }
+            ScopedUiTiming uploadTiming("overlay.hdr_edit_upload");
+            if (baseOnly) self->m_hdrEditCacheKey = baseKey;
+            else self->m_hdrCompositeBaseKey = baseKey;
+            const bool changed = baseOnly || self->m_hdrEditPqCacheKey != frame.pixels.cacheKey() || !self->m_hdrCompositePendingDamage.isEmpty();
+            if (changed) {
+                const QRegion damage = baseOnly ? frame.damage : self->m_hdrCompositePendingDamage;
+                if (surface->setPqImage(frame.pixels, self->m_editor->canvasGeometry(), frame.peakNits, reference, damage)) {
+                    if (!baseOnly) self->m_hdrCompositePendingDamage = {};
+                }
+                if (!baseOnly) self->m_hdrEditPqCacheKey = frame.pixels.cacheKey();
+            }
+            self->updateHdrEditPresentation(); self->update();
+            traceTiming("overlay.hdr_edit_cpu_submission", -1, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-queued).count());
+            self->updateHdrEditBackdrop();
+        }, Qt::QueuedConnection);
+    }));
+}
+
+void CaptureOverlay::paintDesktop(QPainter& painter, const QRect& target, bool preserveClip) const {
+    if (!target.isValid())
+        return;
+
+    if (!m_monitorArtifacts.empty()) {
+        painter.save();
+        QRegion rasterRegion(target);
+        for(const auto& artifact:m_monitorArtifacts)
+            if(hasHdrBackdrop(artifact)) rasterRegion-=QRegion(globalToLocalRect(artifact.logicalGeometry));
+        painter.setClipRegion(rasterRegion, preserveClip ? Qt::IntersectClip : Qt::ReplaceClip);
+        painter.fillRect(target, QColor(30, 34, 38));
+
+        const QRect globalTarget = localToDesktopLogicalRect(target);
+        for (const auto& artifact : m_monitorArtifacts) {
+            if (artifact.image.isNull() || !artifact.logicalGeometry.isValid() || hasHdrBackdrop(artifact))
+                continue;
+
+            if (!globalTarget.intersects(artifact.logicalGeometry))
+                continue;
+
+            const QRect destination = globalToLocalRect(artifact.logicalGeometry);
+            hyprcapture::ui::paintClippedImage(painter, target, destination, artifact.image);
+        }
+        painter.restore();
+        return;
+    }
+
+    if (m_desktopImage.isNull()) {
+        painter.fillRect(target, QColor(30, 34, 38));
+        return;
+    }
+
+    const QRect destination = globalToLocalRect(m_desktopGeometry);
+    if (destination.isValid())
+        hyprcapture::ui::paintClippedImage(painter, target, destination, m_desktopImage);
+    else
+        painter.fillRect(target, QColor(30, 34, 38));
+}
+
+void CaptureOverlay::paintCursorSnapshot(QPainter& painter, const QRect& outputRect, const QRect& globalRect, bool hdr,
+                                         const std::vector<MonitorArtifact>& monitors, bool includeCursor) {
+    if (!includeCursor || !outputRect.isValid() || !globalRect.isValid())
+        return;
+
+    for (const auto& artifact : monitors) {
+        if (artifact.cursorImage.isNull() || !artifact.logicalGeometry.isValid())
+            continue;
+
+        const QRect logicalPart = globalRect.intersected(artifact.logicalGeometry);
+        const QRect source =
+            hyprcapture::ui::mapLogicalRectToPixels(logicalPart, artifact.logicalGeometry, artifact.cursorImage.rect());
+        const QRect target = hyprcapture::ui::mapLogicalRectToPixels(logicalPart, globalRect, outputRect);
+        if (!source.isValid() || !target.isValid())
+            continue;
+        hyprcapture::ui::paintImageLayer(painter, target, hdr ? (artifact.hdrCursorImage.isNull() ? hyprcapture::ui::sdrToHdr(artifact.cursorImage) : artifact.hdrCursorImage) : artifact.cursorImage, source);
+    }
+}
+
+bool CaptureOverlay::eventFilter(QObject* watched, QEvent* event) {
+    if (m_firstEditorPaintPending && event->type() == QEvent::Paint && watched->objectName() == "annotationCanvas") {
+        m_firstEditorPaintPending = false;
+        traceTiming(QStringLiteral("overlay.editor_first_paint_begin native=%1 hdr_pending=%2")
+                    .arg(m_editor && m_editor->externalImagePresentation()).arg(m_hdrBasePending));
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
+void CaptureOverlay::paintEvent(QPaintEvent*) {
+    std::optional<ScopedUiTiming> paintTiming;
+    if (std::exchange(m_firstPaintPending, false) && hyprcapture::ui::timingEnabled())
+        paintTiming.emplace(QStringLiteral("overlay.first_paint.%1.%2").arg(x()).arg(y()));
+    prepareHdrBackdrops();
+    const bool startupBlocked = hdrStartupBlocked();
+    std::optional<ScopedUiTiming> visiblePaintTiming;
+    if (!startupBlocked && m_overlayActive && m_overlayOpacity > 0.0 && std::exchange(m_firstVisiblePaintPending, false) && hyprcapture::ui::timingEnabled())
+        visiblePaintTiming.emplace(QStringLiteral("overlay.first_visible_paint.%1.%2").arg(x()).arg(y()));
+    for(auto& b:m_hdrBackdrops) if (b.surface) b.surface->setVisible(!startupBlocked && m_overlayActive && !m_scrolling);
+    updateHdrEditBackdrop();
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setCompositionMode(QPainter::CompositionMode_Source);
+    painter.fillRect(rect(), Qt::transparent);
+    if (startupBlocked || !m_overlayActive || m_scrolling)
+        return;
+    m_paintedSelectionBounds = selectionPaintBounds();
+    if (!property("hdrFirstParentFrame").toBool()) {
+        setProperty("hdrFirstParentFrame", true);
+        traceTiming(QStringLiteral("overlay.first_parent_frame.%1.%2 mode=%3")
+                        .arg(x()).arg(y()).arg(property("hdrFirstFrameMode").toString()));
+    }
+    painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    painter.setOpacity(m_overlayOpacity);
+
+    paintDesktop(painter, rect());
+    struct WindowHighlight {
+        QRect target;
+        double radius;
+        QRect clip;
+    };
+    const auto windowHighlight = [this](const WindowArtifact& window, bool outline = false) {
+        const bool overview = hasOverviewSelectionGeometry(window);
+        const QRect geometry = overview || outline ?
+            hyprcapture::ui::selectionOutlineGeometry(window.selectionGeometry.isValid() ? window.selectionGeometry : windowFrameGeometry(window),
+                                                      window.selectionClipGeometry, m_overlayLogicalGeometry) : windowFrameGeometry(window);
+        return WindowHighlight{globalToLocalRect(geometry), windowFrameRadius(window, true),
+                               overview ? globalToLocalRect(window.selectionClipGeometry) : QRect{}};
+    };
+    painter.save();
+    QPainterPath dim;
+    dim.addRect(rect());
+    QPainterPath undimmed;
+    // The mask follows the selection, independently of asynchronous HDR upload.
+    if (m_editing && m_editor) {
+        undimmed.addRect(m_editor->canvasGeometry());
+        if (m_mode == hyprcapture::CaptureMode::Window && !m_scrollResult) {
+            if (const auto* window = selectedWindow()) {
+                const bool crop = (currentWindowBorder() == hyprcapture::DecorationPolicy::Remove ||
+                                   currentWindowShadow() == hyprcapture::DecorationPolicy::Remove) &&
+                                  window->fullGeometry.contains(window->visibleGeometry);
+                const QRect source = crop ? window->visibleGeometry : window->fullGeometry;
+                if (source.isValid()) {
+                    const QRect canvas = m_editor->canvasGeometry();
+                    QTransform transform;
+                    transform.translate(canvas.x(), canvas.y());
+                    transform.scale(double(canvas.width()) / source.width(), double(canvas.height()) / source.height());
+                    transform.translate(-source.x(), -source.y());
+                    const auto frame = roundedWindowFramePath(crop ? window->visibleGeometry : windowFrameGeometry(*window),
+                                                              crop ? window->rounding : windowFrameRadius(*window, false),
+                                                              window->roundingPower);
+                    undimmed = undimmed.intersected(transform.map(frame));
+                }
+            }
+        }
+    }
+    else if (m_mode == hyprcapture::CaptureMode::Fullscreen)
+        undimmed.addRect(fullscreenCaptureRect());
+    else if ((m_mode==hyprcapture::CaptureMode::Region || m_defaults.fushionMode) && normalizedSelection().width()>4 && normalizedSelection().height()>4)
+        undimmed.addRect(normalizedSelection().intersected(regionCaptureBounds()));
+    else if (m_mode==hyprcapture::CaptureMode::Window || m_defaults.fushionMode) {
+        if (const auto* window=hoveredWindow()) {
+            const auto highlight = windowHighlight(*window);
+            if (highlight.target.isValid()) {
+                undimmed = roundedWindowFramePath(highlight.target, highlight.radius, window->roundingPower);
+                if (highlight.clip.isValid()) {
+                    QPainterPath clip;
+                    clip.addRect(highlight.clip);
+                    undimmed = undimmed.intersected(clip);
+                }
+            }
+        }
+        else if (m_defaults.fushionMode && !pendingConfirmActive()) {
+            const QPoint localCursor = globalToLocalRect(QRect(cursorLogicalPosition(), QSize(1, 1))).topLeft();
+            undimmed.addRect(localScreenRectAt(localCursor));
+        }
+    }
+    painter.setClipPath(dim.subtracted(undimmed));
+    painter.fillRect(rect(), QColor(0, 0, 0, 80));
+    painter.restore();
+    if (m_editing)
+        return;
+
+    const bool fusionGesture = m_defaults.fushionMode && m_mode != hyprcapture::CaptureMode::Fullscreen;
+    const bool fusionTargetPreview = fusionGesture && !pendingConfirmActive();
+    const QRect sel = normalizedSelection().intersected(regionCaptureBounds());
+    const bool selectionLargeEnough = sel.width() > 4 && sel.height() > 4;
+    const bool selectionVisible = selectionLargeEnough || (m_dragging && !fusionTargetPreview);
+    const auto drawFullscreenPreview = [this, &painter](const QRect& cap) {
+        if (!cap.isValid())
+            return;
+        constexpr qreal penWidth = 2.0;
+        constexpr qreal inset = penWidth / 2.0;
+        auto            radii = fullscreenPreviewCornerRadii(cap);
+        radii.topLeft = std::max(0.0, radii.topLeft - inset);
+        radii.topRight = std::max(0.0, radii.topRight - inset);
+        radii.bottomRight = std::max(0.0, radii.bottomRight - inset);
+        radii.bottomLeft = std::max(0.0, radii.bottomLeft - inset);
+        painter.setPen(QPen(QColor(255, 255, 255, 230), penWidth));
+        painter.setBrush(Qt::NoBrush);
+        const QRectF frame = QRectF(cap).adjusted(inset, inset, -inset, -inset);
+        painter.drawPath(hyprcapture::ui::screenPreviewPath(frame, radii));
+    };
+    if ((m_mode == hyprcapture::CaptureMode::Region || fusionGesture) && selectionVisible) {
+        paintDesktop(painter, sel);
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 2));
+        painter.drawRect(sel.adjusted(0, 0, -1, -1));
+        if (pendingConfirmActive() && m_mode == hyprcapture::CaptureMode::Region && regionSelectionValid(sel)) {
+            painter.setPen(QPen(QColor(30, 34, 38, 220), 1));
+            painter.setBrush(QColor(255, 255, 255, 235));
+            const int half = kSelectionHandlePaintSize / 2;
+            const QPoint points[] = {sel.topLeft(), QPoint(sel.center().x(), sel.top()), sel.topRight(), QPoint(sel.right(), sel.center().y()),
+                                     sel.bottomRight(), QPoint(sel.center().x(), sel.bottom()), sel.bottomLeft(), QPoint(sel.left(), sel.center().y())};
+            for (const QPoint& point : points)
+                painter.drawRect(QRect(point - QPoint(half, half), QSize(kSelectionHandlePaintSize, kSelectionHandlePaintSize)));
+        }
+    } else if (pendingConfirmActive() && m_mode == hyprcapture::CaptureMode::Fullscreen) {
+        const QRect cap = fullscreenCaptureRect();
+        if (cap.isValid()) {
+            paintDesktop(painter, cap);
+            drawFullscreenPreview(cap);
+        }
+    } else if (fusionTargetPreview && !hoveredWindow()) {
+        const QPoint localCursor = globalToLocalRect(QRect(cursorLogicalPosition(), QSize(1, 1))).topLeft();
+        const QRect  cap = localScreenRectAt(localCursor);
+        drawFullscreenPreview(cap);
+    } else if (m_mode == hyprcapture::CaptureMode::Window || fusionGesture) {
+        const auto* window = hoveredWindow();
+        const auto* selected = selectedWindow();
+        if (window) {
+            const auto highlight = windowHighlight(*window);
+            painter.save();
+            painter.setClipPath(roundedWindowFramePath(highlight.target, highlight.radius, window->roundingPower), Qt::IntersectClip);
+            if (highlight.clip.isValid())
+                painter.setClipRect(highlight.clip, Qt::IntersectClip);
+            paintDesktop(painter, highlight.target, hasOverviewSelectionGeometry(*window));
+            painter.restore();
+        }
+        for (const auto& candidate : m_windowArtifacts) {
+            const auto highlight = windowHighlight(candidate, true);
+            if (!highlight.target.isValid())
+                continue;
+            const bool isSelected = &candidate == selected;
+            const bool isHovered = &candidate == window;
+            const int penWidth = isSelected ? 3 : (isHovered ? 2 : 1);
+            QPen pen(isSelected ? QColor(255, 255, 255, 245) : (isHovered ? QColor(255, 255, 255, 210) : QColor(255, 255, 255, 110)), penWidth);
+            pen.setJoinStyle(Qt::RoundJoin);
+            painter.save();
+            if (highlight.clip.isValid())
+                painter.setClipRect(highlight.clip, Qt::IntersectClip);
+            painter.setPen(pen);
+            painter.setBrush(Qt::NoBrush);
+            const QRectF alignedTarget = QRectF(highlight.target).adjusted(0.5, 0.5, -0.5, -0.5);
+            painter.drawPath(roundedWindowFramePath(alignedTarget, highlight.radius, candidate.roundingPower));
+            painter.restore();
+        }
+    }
+}
+
+void CaptureOverlay::mousePressEvent(QMouseEvent* event) {
+    if (m_editing || m_finishing)
+        return;
+    if (!requestActivation())
+        return;
+    if (m_toolbar->geometry().contains(event->pos()))
+        return;
+    rememberCursorLocalPosition(event->position());
+    hideOptionPopups();
+    if (event->button() != Qt::LeftButton)
+        return;
+
+    if (pendingConfirmActive()) {
+        if (m_mode == hyprcapture::CaptureMode::Region) {
+            m_confirmDragMode = confirmRegionDragModeAt(event->pos());
+            setCursor(cursorForConfirmDragMode(m_confirmDragMode));
+            m_confirmDragStart = clampedToRect(event->pos(), regionCaptureBounds());
+            m_confirmDragStartSelection = normalizedSelection().intersected(regionCaptureBounds());
+            m_dragging = true;
+            if (m_confirmDragMode == ConfirmDragMode::NewSelection) {
+                m_dragStart = m_confirmDragStart;
+                m_dragEnd = m_confirmDragStart;
+            }
+            updateStatus();
+            update();
+            return;
+        }
+
+        if (m_mode == hyprcapture::CaptureMode::Window) {
+            m_confirmDragMode = ConfirmDragMode::NewSelection;
+            m_confirmDragStart = clampedToRect(event->pos(), regionCaptureBounds());
+            m_confirmDragStartSelection = QRect{};
+            m_dragStart = m_confirmDragStart;
+            m_dragEnd = m_confirmDragStart;
+            m_dragging = true;
+            setCursor(Qt::CrossCursor);
+            updateStatus();
+            update();
+            return;
+        }
+
+        return;
+    }
+
+    if (m_defaults.fushionMode && m_mode != hyprcapture::CaptureMode::Fullscreen) {
+        if (m_record)
+            m_recordError.clear();
+        m_mode = hyprcapture::CaptureMode::Region;
+        m_dragging = true;
+        m_dragStart = event->pos();
+        m_dragEnd = clampedToRect(event->pos(), regionCaptureBounds());
+        updateStatus();
+        update();
+        return;
+    }
+
+    if (m_mode == hyprcapture::CaptureMode::Fullscreen) {
+        if (confirmBeforeCaptureEnabled())
+            beginPendingConfirm(hyprcapture::CaptureMode::Fullscreen);
+        else
+            finishCapture();
+        return;
+    }
+
+    if (m_mode == hyprcapture::CaptureMode::Window)
+        return;
+
+    m_dragging = true;
+    if (m_record)
+        m_recordError.clear();
+    m_dragStart = event->pos();
+    m_dragEnd = clampedToRect(event->pos(), regionCaptureBounds());
+    update();
+}
+
+void CaptureOverlay::mouseMoveEvent(QMouseEvent* event) {
+    if (m_editing || m_finishing)
+        return;
+    if (!requestActivation())
+        return;
+    rememberCursorLocalPosition(event->position());
+    if (pendingConfirmActive()) {
+        if (m_mode == hyprcapture::CaptureMode::Region) {
+            updateConfirmCursor(event->pos());
+            if (m_dragging)
+                setSelectionRect(regionSelectionForDrag(event->pos()));
+            updateStatus();
+            updateSelectionPaint();
+            return;
+        }
+        if (m_mode == hyprcapture::CaptureMode::Window) {
+            if (m_dragging) {
+                m_dragEnd = clampedToRect(event->pos(), regionCaptureBounds());
+                if (regionSelectionValid(normalizedSelection())) {
+                    m_mode = hyprcapture::CaptureMode::Region;
+                    m_selectedWindowIndex = -1;
+                    resetWindowCycle();
+                    updateToolbarControlsForMode();
+                    updateConfirmCursor(event->pos());
+                }
+            }
+            updateStatus();
+            // Leaving Window mode drops every candidate outline.
+            m_mode == hyprcapture::CaptureMode::Window ? updateSelectionPaint() : update();
+            return;
+        }
+    }
+
+    if (m_defaults.fushionMode && m_mode != hyprcapture::CaptureMode::Fullscreen) {
+        if (m_dragging)
+            m_dragEnd = clampedToRect(event->pos(), regionCaptureBounds());
+        updateStatus();
+        updateSelectionPaint();
+        return;
+    }
+
+    if (m_mode == hyprcapture::CaptureMode::Window) {
+        updateStatus();
+        updateSelectionPaint();
+        return;
+    }
+    if (!m_dragging)
+        return;
+    m_dragEnd = clampedToRect(event->pos(), regionCaptureBounds());
+    updateSelectionPaint();
+}
+
+void CaptureOverlay::mouseReleaseEvent(QMouseEvent* event) {
+    if (m_editing || m_finishing)
+        return;
+    if (!requestActivation())
+        return;
+    rememberCursorLocalPosition(event->position());
+    if (event->button() != Qt::LeftButton)
+        return;
+
+    if (pendingConfirmActive()) {
+        if (m_mode == hyprcapture::CaptureMode::Region && m_dragging) {
+            m_dragging = false;
+            setSelectionRect(regionSelectionForDrag(event->pos()));
+            m_confirmDragMode = ConfirmDragMode::None;
+            if (!regionSelectionValid(normalizedSelection()))
+                m_pendingConfirm = false;
+            updateConfirmCursor(event->pos());
+            updateStatus();
+            update();
+            return;
+        }
+
+        if (m_mode == hyprcapture::CaptureMode::Window) {
+            if (m_dragging) {
+                m_dragging = false;
+                m_dragEnd = clampedToRect(event->pos(), regionCaptureBounds());
+                if (regionSelectionValid(normalizedSelection())) {
+                    m_mode = hyprcapture::CaptureMode::Region;
+                    m_confirmDragMode = ConfirmDragMode::None;
+                    m_selectedWindowIndex = -1;
+                    resetWindowCycle();
+                    updateToolbarControlsForMode();
+                    updateConfirmCursor(event->pos());
+                    updateStatus();
+                    update();
+                    return;
+                }
+                m_confirmDragMode = ConfirmDragMode::None;
+            }
+
+            const int index = rawHoveredWindowIndex();
+            resetWindowCycle();
+            if (index >= 0)
+                m_selectedWindowIndex = index;
+            if (selectedWindowUsesOverviewSelection()) {
+                m_pendingConfirm = false;
+                finishCapture();
+                return;
+            }
+            updateStatus();
+            update();
+            return;
+        }
+
+        return;
+    }
+
+    if (m_defaults.fushionMode && m_mode != hyprcapture::CaptureMode::Fullscreen) {
+        if (!m_dragging)
+            return;
+
+        m_dragging = false;
+        m_dragEnd = clampedToRect(event->pos(), regionCaptureBounds());
+        const QRect selection = normalizedSelection().intersected(regionCaptureBounds());
+        if (selection.width() > 4 && selection.height() > 4) {
+            m_mode = hyprcapture::CaptureMode::Region;
+            resetWindowCycle(true);
+            if (confirmBeforeCaptureEnabled())
+                beginPendingConfirm(hyprcapture::CaptureMode::Region);
+            else
+                finishCapture();
+            return;
+        }
+
+        const int windowIndex = hoveredWindowIndex();
+        if (windowIndex >= 0) {
+            m_mode = hyprcapture::CaptureMode::Window;
+            m_selectedWindowIndex = windowIndex;
+            if (m_defaults.captureFullscreenClientsAsMonitor && !m_windowArtifacts[static_cast<std::size_t>(windowIndex)].stagePreview &&
+                m_windowArtifacts[static_cast<std::size_t>(windowIndex)].fullscreen) {
+                m_fullscreenClientSelected = true;
+                m_mode = hyprcapture::CaptureMode::Fullscreen;
+                if (m_fullscreenScope)
+                    m_fullscreenScope->setCurrentText(QStringLiteral("current"));
+                if (confirmBeforeCaptureEnabled())
+                    beginPendingConfirm(hyprcapture::CaptureMode::Fullscreen);
+                else
+                    finishCapture();
+                return;
+            }
+            if (confirmBeforeCaptureEnabled() && !selectedWindowUsesOverviewSelection())
+                beginPendingConfirm(hyprcapture::CaptureMode::Window);
+            else
+                finishCapture();
+            return;
+        }
+
+        m_fullscreenClientSelected = false;
+        m_selectedWindowIndex = -1;
+        m_mode = hyprcapture::CaptureMode::Fullscreen;
+        if (m_fullscreenScope)
+            m_fullscreenScope->setCurrentText(QStringLiteral("current"));
+        if (confirmBeforeCaptureEnabled())
+            beginPendingConfirm(hyprcapture::CaptureMode::Fullscreen);
+        else
+            finishCapture();
+        return;
+    }
+
+    if (m_mode == hyprcapture::CaptureMode::Window) {
+        const int windowIndex = hoveredWindowIndex();
+        if (windowIndex >= 0)
+            m_selectedWindowIndex = windowIndex;
+        if (windowIndex >= 0 && m_defaults.captureFullscreenClientsAsMonitor &&
+            !m_windowArtifacts[static_cast<std::size_t>(windowIndex)].stagePreview &&
+            m_windowArtifacts[static_cast<std::size_t>(windowIndex)].fullscreen) {
+            m_fullscreenClientSelected = true;
+            m_mode = hyprcapture::CaptureMode::Fullscreen;
+            if (m_fullscreenScope)
+                m_fullscreenScope->setCurrentText(QStringLiteral("current"));
+            if (confirmBeforeCaptureEnabled())
+                beginPendingConfirm(hyprcapture::CaptureMode::Fullscreen);
+            else
+                finishCapture();
+            return;
+        }
+        if (confirmBeforeCaptureEnabled() && !selectedWindowUsesOverviewSelection()) {
+            if (m_selectedWindowIndex >= 0)
+                beginPendingConfirm(hyprcapture::CaptureMode::Window);
+        } else {
+            finishCapture();
+        }
+        return;
+    }
+    m_dragging = false;
+    m_dragEnd = clampedToRect(event->pos(), regionCaptureBounds());
+    const QRect selection = normalizedSelection().intersected(regionCaptureBounds());
+    if (m_mode != hyprcapture::CaptureMode::Region || (selection.width() > 4 && selection.height() > 4)) {
+        if (confirmBeforeCaptureEnabled())
+            beginPendingConfirm(m_mode);
+        else
+            finishCapture();
+    }
+}
+
+void CaptureOverlay::wheelEvent(QWheelEvent* event) {
+    if (m_editing || m_finishing) {
+        event->accept();
+        return;
+    }
+    if (!requestActivation()) {
+        event->accept();
+        return;
+    }
+
+    const QPoint localPosition = event->position().toPoint();
+    if (m_toolbar && m_toolbar->geometry().contains(localPosition)) {
+        QMainWindow::wheelEvent(event);
+        return;
+    }
+
+    rememberCursorLocalPosition(event->position());
+    if (!windowWheelSelectionEnabled()) {
+        QMainWindow::wheelEvent(event);
+        return;
+    }
+
+    const QPoint angleDelta = event->angleDelta();
+    const QPoint pixelDelta = event->pixelDelta();
+    const QPoint effectiveDelta = angleDelta.y() != 0 ? angleDelta : pixelDelta;
+    if (effectiveDelta.y() == 0 || std::abs(effectiveDelta.x()) > std::abs(effectiveDelta.y())) {
+        QMainWindow::wheelEvent(event);
+        return;
+    }
+
+    const auto candidates = currentMonitorWindowCandidates();
+    if (candidates.size() < 2) {
+        resetWindowCycle(m_windowCycleActive);
+        QMainWindow::wheelEvent(event);
+        return;
+    }
+
+    if (candidates != m_windowCycleCandidates) {
+        const bool clearSelectedWindow = m_windowCycleActive;
+        resetWindowCycle(clearSelectedWindow);
+        m_windowCycleCandidates = candidates;
+    }
+    if (event->phase() == Qt::ScrollBegin)
+        m_windowWheelStepState = {};
+
+    const int steps = hyprcapture::ui::consumeWindowWheelSteps(angleDelta, pixelDelta, event->inverted(), m_windowWheelStepState);
+    event->accept();
+    if (steps == 0)
+        return;
+
+    if (!m_windowCycleActive) {
+        int focusedWindowIndex = -1;
+        for (const int candidate : m_windowCycleCandidates) {
+            if (candidate >= 0 && candidate < static_cast<int>(m_windowArtifacts.size()) &&
+                m_windowArtifacts[static_cast<std::size_t>(candidate)].focused) {
+                focusedWindowIndex = candidate;
+                break;
+            }
+        }
+        m_windowCyclePosition =
+            hyprcapture::ui::windowSelectionStartPosition(m_windowCycleCandidates, focusedWindowIndex);
+        m_windowCycleActive = m_windowCyclePosition >= 0;
+    }
+
+    m_windowCyclePosition = hyprcapture::ui::stepWindowSelectionPosition(
+        m_windowCyclePosition, steps, static_cast<int>(m_windowCycleCandidates.size()));
+    const int targetIndex = windowCycleTargetIndex();
+    if (targetIndex < 0) {
+        resetWindowCycle(true);
+        updateStatus();
+        update();
+        return;
+    }
+
+    m_selectedWindowIndex = targetIndex;
+    updateStatus();
+    update();
+}
+
+void CaptureOverlay::keyPressEvent(QKeyEvent* event) {
+    if (m_hdrStartupWaiting && event->key() != Qt::Key_Escape) {
+        event->accept();
+        return;
+    }
+    if (m_finishing)
+        return;
+    if (m_editing) {
+        if (event->key() == Qt::Key_Escape)
+            cancelCapture();
+        else if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)
+            exportInPlaceImage();
+        return;
+    }
+    if (event->key() == Qt::Key_Escape) {
+        cancelCapture();
+    } else if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+        if (pendingConfirmActive()) {
+            confirmPendingCapture();
+            return;
+        }
+
+        if (m_defaults.fushionMode && m_mode != hyprcapture::CaptureMode::Fullscreen) {
+            const QRect selection = normalizedSelection().intersected(regionCaptureBounds());
+            if (selection.width() > 4 && selection.height() > 4) {
+                m_mode = hyprcapture::CaptureMode::Region;
+                if (confirmBeforeCaptureEnabled()) {
+                    beginPendingConfirm(hyprcapture::CaptureMode::Region);
+                    return;
+                }
+            } else if (const int windowIndex = hoveredWindowIndex(); windowIndex >= 0) {
+                m_mode = hyprcapture::CaptureMode::Window;
+                m_selectedWindowIndex = windowIndex;
+                if (confirmBeforeCaptureEnabled()) {
+                    beginPendingConfirm(hyprcapture::CaptureMode::Window);
+                    return;
+                }
+            } else {
+                return;
+            }
+        } else if (confirmBeforeCaptureEnabled()) {
+            if (m_mode == hyprcapture::CaptureMode::Window) {
+                const int windowIndex = hoveredWindowIndex();
+                if (windowIndex < 0)
+                    return;
+                m_selectedWindowIndex = windowIndex;
+            } else if (m_mode == hyprcapture::CaptureMode::Region && !regionSelectionValid(normalizedSelection())) {
+                return;
+            }
+            beginPendingConfirm(m_mode);
+            return;
+        }
+        finishCapture();
+    }
+}
+
+void CaptureOverlay::resizeEvent(QResizeEvent* event) {
+    QMainWindow::resizeEvent(event);
+    relayoutToolbar();
+}
+
+QRect CaptureOverlay::normalizedSelection() const {
+    return QRect(m_dragStart, m_dragEnd).normalized();
+}
+
+QRect CaptureOverlay::captureRectForMode() const {
+    if (m_mode == hyprcapture::CaptureMode::Region && normalizedSelection().isValid())
+        return normalizedSelection().intersected(regionCaptureBounds());
+    if (m_mode == hyprcapture::CaptureMode::Window) {
+        const auto* window = selectedWindow() ? selectedWindow() : hoveredWindow();
+        if (window)
+            return globalToLocalRect(windowFrameGeometry(*window));
+        return {};
+    }
+    return fullscreenCaptureRect();
+}
+
+QRect CaptureOverlay::fullscreenCaptureRect() const {
+    if (currentFullscreenScope() == hyprcapture::FullscreenScope::Current)
+        return localScreenRectAt(globalToLocalRect(QRect(cursorLogicalPosition(), QSize(1, 1))).topLeft());
+    if (m_desktopGeometry.isValid())
+        return globalToLocalRect(m_desktopGeometry);
+    return rect();
+}
+
+hyprcapture::ui::ScreenCornerRadii CaptureOverlay::fullscreenPreviewCornerRadii(const QRect& localRect) const {
+    const QString configured = QString::fromStdString(m_defaults.fullscreenPreviewRounding).trimmed();
+    if (configured.compare(QStringLiteral("auto"), Qt::CaseInsensitive) != 0) {
+        bool ok = false;
+        const double radius = configured.toDouble(&ok);
+        if (ok && std::isfinite(radius)) {
+            const double bounded = std::clamp(radius, 0.0, 512.0);
+            return {.topLeft = bounded, .topRight = bounded, .bottomRight = bounded, .bottomLeft = bounded};
+        }
+    }
+
+    const QRect globalRect = localToDesktopLogicalRect(localRect);
+    const auto artifact = std::ranges::find_if(m_monitorArtifacts, [&globalRect](const MonitorArtifact& candidate) {
+        return candidate.logicalGeometry == globalRect;
+    });
+    return artifact == m_monitorArtifacts.end() ? hyprcapture::ui::ScreenCornerRadii{} : artifact->previewCornerRadii;
+}
+
+QRect CaptureOverlay::regionCaptureBounds() const {
+    return rect();
+}
+
+QRect CaptureOverlay::selectionPaintBounds() const {
+    if (m_editing)
+        return rect();
+    // Everything paintEvent draws that follows the cursor or selection; the
+    // dim mask elsewhere is static, so only this area needs repainting.
+    QRect bounds;
+    const auto addWindow = [&](const WindowArtifact* window) {
+        if (!window)
+            return;
+        const QRect selection = window->selectionGeometry.isValid() ? window->selectionGeometry : windowFrameGeometry(*window);
+        bounds |= globalToLocalRect(windowFrameGeometry(*window));
+        bounds |= globalToLocalRect(hyprcapture::ui::selectionOutlineGeometry(selection, window->selectionClipGeometry, m_overlayLogicalGeometry));
+    };
+    if (m_mode == hyprcapture::CaptureMode::Fullscreen)
+        bounds |= fullscreenCaptureRect();
+    else {
+        bounds |= normalizedSelection().intersected(regionCaptureBounds());
+        addWindow(hoveredWindow());
+        addWindow(selectedWindow());
+        if (m_defaults.fushionMode)
+            bounds |= localScreenRectAt(globalToLocalRect(QRect(cursorLogicalPosition(), QSize(1, 1))).topLeft());
+    }
+    const int margin = kSelectionHandlePaintSize / 2 + 3;
+    return bounds.isValid() ? bounds.adjusted(-margin, -margin, margin, margin) : QRect{};
+}
+
+void CaptureOverlay::updateSelectionPaint() {
+    const QRect next = selectionPaintBounds();
+    if (next == rect())
+        update();
+    else if (const QRegion dirty = QRegion(m_paintedSelectionBounds) | next; !dirty.isEmpty())
+        update(dirty);
+}
+
+QRect CaptureOverlay::localScreenRectAt(const QPoint& localPos) const {
+    if (!m_monitorArtifacts.empty()) {
+        const QPoint logicalPoint = localToDesktopLogicalPoint(localPos);
+        for (const auto& artifact : m_monitorArtifacts) {
+            if (artifact.logicalGeometry.contains(logicalPoint))
+                return globalToLocalRect(artifact.logicalGeometry).intersected(rect());
+        }
+    }
+
+    QScreen* screen = QGuiApplication::screenAt(mapToGlobal(localPos));
+    if (!screen)
+        screen = QGuiApplication::screenAt(cursorLogicalPosition());
+    if (!screen)
+        screen = QGuiApplication::primaryScreen();
+    return screen ? globalToLocalRect(screen->geometry()).intersected(rect()) : rect();
+}
+
+QPoint CaptureOverlay::clampedToRect(const QPoint& point, const QRect& bounds) const {
+    if (!bounds.isValid())
+        return point;
+    return QPoint(std::clamp(point.x(), bounds.left(), bounds.right()), std::clamp(point.y(), bounds.top(), bounds.bottom()));
+}
+
+QRect CaptureOverlay::globalToLocalRect(const QRect& rect) const {
+    if (m_overlayLogicalGeometry.isValid())
+        return QRect(rect.topLeft() - m_overlayLogicalGeometry.topLeft(), rect.size());
+    return QRect(mapFromGlobal(rect.topLeft()), rect.size());
+}
+
+QRect CaptureOverlay::localToDesktopLogicalRect(const QRect& rect) const {
+    if (m_overlayLogicalGeometry.isValid())
+        return QRect(m_overlayLogicalGeometry.topLeft() + rect.topLeft(), rect.size());
+    return QRect(QPoint(mapToGlobal(rect.topLeft())), rect.size());
+}
+
+QPoint CaptureOverlay::localToDesktopLogicalPoint(const QPoint& point) const {
+    if (m_overlayLogicalGeometry.isValid())
+        return m_overlayLogicalGeometry.topLeft() + point;
+    return mapToGlobal(point);
+}
+
+QRect CaptureOverlay::desktopSourceRectForGlobalRect(const QRect& rect) const {
+    if (m_desktopImage.isNull() || !m_desktopGeometry.isValid() || !rect.isValid())
+        return {};
+
+    const QRect clipped = rect.intersected(m_desktopGeometry);
+    if (!clipped.isValid())
+        return {};
+
+    const double scaleX = static_cast<double>(m_desktopImage.width()) / std::max(1, m_desktopGeometry.width());
+    const double scaleY = static_cast<double>(m_desktopImage.height()) / std::max(1, m_desktopGeometry.height());
+    return logicalRectToOutputRect(clipped, m_desktopGeometry, scaleX, scaleY).intersected(m_desktopImage.rect());
+}
+
+QRect CaptureOverlay::localToDesktopSourceRect(const QRect& rect) const {
+    return desktopSourceRectForGlobalRect(localToDesktopLogicalRect(rect));
+}
+
+QPoint CaptureOverlay::cursorLogicalPosition() const {
+    if (m_hasCursorLogicalPosition)
+        return m_cursorLogicalPosition;
+    const QPoint local = mapFromGlobal(QCursor::pos());
+    if (rect().contains(local))
+        return localToDesktopLogicalPoint(local);
+    return QCursor::pos();
+}
+
+void CaptureOverlay::rememberCursorPosition(const QPointF& globalPosition) {
+    int x = 0;
+    int y = 0;
+    if (!boundedDoubleToInt(globalPosition.x(), -kMaxLogicalCoordinate, kMaxLogicalCoordinate, false, x) ||
+        !boundedDoubleToInt(globalPosition.y(), -kMaxLogicalCoordinate, kMaxLogicalCoordinate, false, y))
+        return;
+
+    m_cursorLogicalPosition = QPoint(x, y);
+    m_hasCursorLogicalPosition = true;
+}
+
+void CaptureOverlay::rememberCursorLocalPosition(const QPointF& localPosition) {
+    rememberCursorPosition(localToDesktopLogicalPoint(QPoint(static_cast<int>(std::floor(localPosition.x())), static_cast<int>(std::floor(localPosition.y())))));
+}
+
+void CaptureOverlay::refreshInitialCursorPosition() {
+    if (!m_hasCursorLogicalPosition) {
+        const QPoint local = mapFromGlobal(QCursor::pos());
+        if (rect().contains(local))
+            rememberCursorLocalPosition(local);
+        else
+            rememberCursorPosition(QCursor::pos());
+    }
+    updateStatus();
+    update();
+}
+
+QRect CaptureOverlay::windowFrameGeometry(const WindowArtifact& window) const {
+    QRect frame = window.visibleGeometry.isValid() ? window.visibleGeometry : window.fullGeometry;
+    const int border = window.fullscreen ? 0 : std::max(0, static_cast<int>(std::lround(window.borderSize)));
+    if (border > 0)
+        frame = frame.adjusted(-border, -border, border, border);
+    return frame;
+}
+
+QRect CaptureOverlay::windowSelectionGeometry(const WindowArtifact& window) const {
+    const QRect selection = window.selectionGeometry.isValid() ? window.selectionGeometry : windowFrameGeometry(window);
+    return hyprcapture::ui::clippedSelectionGeometry(selection, window.selectionClipGeometry);
+}
+
+bool CaptureOverlay::hasOverviewSelectionGeometry(const WindowArtifact& window) const {
+    return window.stagePreview || (window.selectionGeometry.isValid() && window.selectionGeometry != windowFrameGeometry(window));
+}
+
+bool CaptureOverlay::selectedWindowUsesOverviewSelection() const {
+    const auto* window = selectedWindow();
+    return window && hasOverviewSelectionGeometry(*window);
+}
+
+void CaptureOverlay::beginHymissionCaptureInputSuppression() {
+    if ((!m_hymissionOverviewSession && !m_hymissionStageSession) || m_hymissionCaptureInputSuppressed || !m_hymissionCaptureInputToken.isEmpty())
+        return;
+
+    m_hymissionCaptureInputToken =
+        QStringLiteral("hyprcapture-%1-%2").arg(QCoreApplication::applicationPid()).arg(QDateTime::currentMSecsSinceEpoch());
+    const auto result = runHymissionCaptureInputCommand(QStringLiteral("begin"), m_hymissionCaptureInputToken);
+    if (result.success) {
+        m_hymissionCaptureInputSuppressed = true;
+        return;
+    }
+
+    m_hymissionCaptureInputToken.clear();
+}
+
+void CaptureOverlay::endHymissionCaptureInputSuppression() {
+    if (!m_hymissionCaptureInputSuppressed || m_hymissionCaptureInputToken.isEmpty())
+        return;
+
+    const QString token = m_hymissionCaptureInputToken;
+    m_hymissionCaptureInputSuppressed = false;
+    m_hymissionCaptureInputToken.clear();
+    (void)runHymissionCaptureInputCommand(QStringLiteral("end"), token);
+}
+
+double CaptureOverlay::windowFrameRadius(const WindowArtifact& window, bool selection) const {
+    if (selection && window.stagePreview && window.selectionRounding)
+        return *window.selectionRounding;
+    if (window.fullscreen || window.rounding <= 0.0)
+        return 0.0;
+
+    const double power = std::clamp(window.roundingPower, 1.0, 10.0);
+    const double border = std::max(0.0, window.borderSize);
+    const double correction = border * (std::sqrt(2.0) - 1.0) * std::max(2.0 - power, 0.0);
+    double radius = std::max(0.0, window.rounding + border - correction);
+    if (selection && window.stagePreview && window.selectionGeometry.isValid() && window.visibleGeometry.isValid()) {
+        // Use the un-clipped preview: clipping a card does not change its scale.
+        const double scale = std::min(double(window.selectionGeometry.width()) / window.visibleGeometry.width(),
+                                      double(window.selectionGeometry.height()) / window.visibleGeometry.height());
+        radius *= scale;
+    }
+    return radius;
+}
+
+int CaptureOverlay::rawHoveredWindowIndex() const {
+    const QPoint global = cursorLogicalPosition();
+    for (const int candidate : currentMonitorWindowCandidates()) {
+        if (candidate >= 0 && candidate < static_cast<int>(m_windowArtifacts.size()) &&
+            windowSelectionGeometry(m_windowArtifacts[static_cast<std::size_t>(candidate)]).contains(global))
+            return candidate;
+    }
+    return -1;
+}
+
+int CaptureOverlay::hoveredWindowIndex() const {
+    const int cycled = windowCycleTargetIndex();
+    return cycled >= 0 ? cycled : rawHoveredWindowIndex();
+}
+
+const CaptureOverlay::WindowArtifact* CaptureOverlay::hoveredWindow() const {
+    const int index = hoveredWindowIndex();
+    if (index < 0)
+        return nullptr;
+    return &m_windowArtifacts[static_cast<std::size_t>(index)];
+}
+
+CaptureOverlay::WindowArtifact* CaptureOverlay::hoveredWindow() {
+    return const_cast<WindowArtifact*>(std::as_const(*this).hoveredWindow());
+}
+
+const CaptureOverlay::WindowArtifact* CaptureOverlay::selectedWindow() const {
+    if (m_selectedWindowIndex < 0 || m_selectedWindowIndex >= static_cast<int>(m_windowArtifacts.size()))
+        return nullptr;
+    return &m_windowArtifacts[static_cast<std::size_t>(m_selectedWindowIndex)];
+}
+
+CaptureOverlay::WindowArtifact* CaptureOverlay::selectedWindow() {
+    return const_cast<WindowArtifact*>(std::as_const(*this).selectedWindow());
+}
+
+const CaptureOverlay::WindowArtifact* CaptureOverlay::filenameWindow() const {
+    if (const auto* selected = selectedWindow()) {
+        if (m_mode == hyprcapture::CaptureMode::Window || (m_mode == hyprcapture::CaptureMode::Fullscreen && m_fullscreenClientSelected))
+            return selected;
+    }
+    const auto focused = std::ranges::find_if(m_windowArtifacts, [](const WindowArtifact& window) { return window.focused; });
+    return focused == m_windowArtifacts.end() ? nullptr : &*focused;
+}
+
+hyprcapture::FilenameMetadata CaptureOverlay::resolvedFilenameMetadata() const {
+    const auto metadataForWindow = [](const WindowArtifact* window) {
+        return window ? hyprcapture::FilenameMetadata{.windowClass = window->appClass.toStdString(), .windowTitle = window->title.toStdString()}
+                      : hyprcapture::FilenameMetadata{};
+    };
+
+    const auto* selected = selectedWindow();
+    if (!selected && m_mode == hyprcapture::CaptureMode::Window)
+        selected = hoveredWindow();
+
+    std::size_t fullscreenWindowCount = 0;
+    hyprcapture::FilenameMetadata singleFullscreenWindow;
+    bool fullscreenMetadataComplete = true;
+    const QRect fullscreenGeometry =
+        m_mode == hyprcapture::CaptureMode::Fullscreen ? localToDesktopLogicalRect(fullscreenCaptureRect()) : QRect{};
+    if (m_mode == hyprcapture::CaptureMode::Fullscreen) {
+        bool matchedMonitor = false;
+        for (const auto& monitor : m_monitorArtifacts) {
+            if (!monitor.logicalGeometry.intersects(fullscreenGeometry))
+                continue;
+            matchedMonitor = true;
+            if (!monitor.workspaceWindowCount) {
+                fullscreenMetadataComplete = false;
+                break;
+            }
+            fullscreenWindowCount += static_cast<std::size_t>(*monitor.workspaceWindowCount);
+            if (*monitor.workspaceWindowCount == 1) {
+                singleFullscreenWindow = {
+                    .windowClass = monitor.singleWorkspaceWindowClass.toStdString(),
+                    .windowTitle = monitor.singleWorkspaceWindowTitle.toStdString(),
+                };
+            }
+        }
+        fullscreenMetadataComplete = fullscreenMetadataComplete && matchedMonitor;
+    }
+
+    if (!fullscreenMetadataComplete) {
+        fullscreenWindowCount = 0;
+        singleFullscreenWindow = {};
+    }
+
+    return hyprcapture::resolveFilenameMetadata(m_defaults.dynamicWindowMetadata,
+                                                m_mode,
+                                                metadataForWindow(selected),
+                                                metadataForWindow(filenameWindow()),
+                                                fullscreenWindowCount,
+                                                singleFullscreenWindow);
+}
+
+bool CaptureOverlay::hydrateWindowArtifact(WindowArtifact& window) {
+    ScopedUiTiming timing("overlay.render.hydrate");
+    const bool keepImage = !window.image.isNull();
+    const bool needsBackground = currentWindowBackground() == hyprcapture::WindowBackground::Real && window.realBackground.isNull();
+    if (keepImage && (!needsBackground || window.realBackgroundAttempted))
+        return true;
+    if (needsBackground)
+        window.realBackgroundAttempted = true;
+    if (window.address.isEmpty() || !window.visibleGeometry.isValid())
+        return false;
+
+    hyprcapture::RecordingRequest request;
+    request.id = hyprcapture::makeSessionId();
+    request.defaults = m_defaults;
+    request.defaults.mode = hyprcapture::CaptureMode::Window;
+    request.defaults.fullscreenScope = currentFullscreenScope();
+    request.defaults.windowBackground = currentWindowBackground();
+    request.defaults.windowBorder = currentWindowBorder();
+    request.defaults.windowShadow = currentWindowShadow();
+    request.mode = hyprcapture::CaptureMode::Window;
+    request.windowAddress = window.address.toStdString();
+
+    const QRect globalRect = windowFrameGeometry(window);
+    if (!globalRect.isValid())
+        return false;
+    request.targetGeometry = {.x = static_cast<double>(globalRect.x()),
+                              .y = static_cast<double>(globalRect.y()),
+                              .width = static_cast<double>(globalRect.width()),
+                              .height = static_cast<double>(globalRect.height())};
+
+    const QString requestPath = hyprcapture::ui::runtimeFile(QStringLiteral("window-capture-request"), QStringLiteral(".json"));
+    const std::string json = hyprcapture::encodeRecordingRequestJson(request);
+    if (!writePrivateTextFile(requestPath, QByteArray(json.data(), static_cast<qsizetype>(json.size()))))
+        return false;
+
+    const auto captured = [&] { ScopedUiTiming timing("overlay.render.hydrate_dispatch"); return dispatchWindowCapture(requestPath); }();
+    if (!captured.success) {
+        QFile::remove(requestPath);
+        return false;
+    }
+
+    QFile response(requestPath);
+    if (!hyprcapture::ui::isPrivateRuntimeFile(requestPath, kMaxSessionJsonBytes) || !response.open(QIODevice::ReadOnly)) {
+        QFile::remove(requestPath);
+        return false;
+    }
+    const QByteArray responseBytes = response.readAll();
+    response.close();
+    QFile::remove(requestPath);
+
+    const auto decoded =
+        hyprcapture::decodeSessionJson(std::string(responseBytes.constData(), static_cast<std::size_t>(responseBytes.size())));
+    if (!decoded)
+        return false;
+
+    QStringList artifactFiles;
+    qint64 remainingArtifactBytes = kMaxSessionArtifactBytes;
+    for (const auto& info : decoded->windows) {
+        if (qString(info.address) != window.address)
+            continue;
+
+        WindowArtifact capturedWindow;
+        capturedWindow.address = qString(info.address);
+        capturedWindow.title = qString(info.title);
+        capturedWindow.appClass = qString(info.appClass);
+        capturedWindow.zIndex = window.zIndex;
+        capturedWindow.focused = info.focused;
+        capturedWindow.fullscreen = info.fullscreen;
+        capturedWindow.visibleGeometry = protocolRect(info.visibleGeometry);
+        capturedWindow.fullGeometry = protocolRect(info.fullGeometry);
+        capturedWindow.stagePreview = window.stagePreview;
+        capturedWindow.selectionRounding = window.selectionRounding;
+        capturedWindow.selectionGeometry = window.selectionGeometry;
+        capturedWindow.selectionClipGeometry = window.selectionClipGeometry;
+        capturedWindow.rounding = info.rounding;
+        capturedWindow.roundingPower = info.roundingPower;
+        capturedWindow.borderSize = info.borderSize;
+
+        const QString artifactPath = qString(info.artifactPath);
+        const QString realBackgroundPath = qString(info.realBackgroundPath);
+        ScopedUiTiming loadTiming("overlay.render.hydrate_load");
+        capturedWindow.image = loadRawRgba(artifactPath, info.artifactWidth, info.artifactHeight, info.artifactTopDown, remainingArtifactBytes, info.artifactFormat, info.artifactReferenceNits, &capturedWindow.hdrImage);
+        capturedWindow.realBackground =
+            loadRawRgba(realBackgroundPath, info.realBackgroundWidth, info.realBackgroundHeight, info.realBackgroundTopDown, remainingArtifactBytes, info.artifactFormat, info.artifactReferenceNits, &capturedWindow.hdrRealBackground);
+        artifactFiles.push_back(artifactPath);
+        artifactFiles.push_back(realBackgroundPath);
+        cleanupArtifactFiles(artifactFiles);
+
+        if (capturedWindow.image.isNull() || !capturedWindow.fullGeometry.isValid())
+            return false;
+
+        if (keepImage) {
+            // Changing the background must not replace the frozen foreground or
+            // the geometry used by existing annotations / scrolling results.
+            window.hdrRealBackground = capturedWindow.hdrRealBackground.scaled(window.image.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            window.realBackground = capturedWindow.realBackground.scaled(window.image.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+        } else {
+            capturedWindow.realBackgroundAttempted = needsBackground;
+            window = std::move(capturedWindow);
+        }
+        return true;
+    }
+
+    cleanupArtifactFiles(artifactFiles);
+    return false;
+}
+
+bool CaptureOverlay::windowCaptureAvailable() const {
+    return !m_windowArtifacts.empty();
+}
+
+bool CaptureOverlay::windowWheelSelectionEnabled() const {
+    if (!m_defaults.windowWheelScroll)
+        return false;
+    if (pendingConfirmActive())
+        return m_mode == hyprcapture::CaptureMode::Window;
+    return m_mode == hyprcapture::CaptureMode::Window ||
+        (m_defaults.fushionMode && m_mode != hyprcapture::CaptureMode::Fullscreen);
+}
+
+std::vector<int> CaptureOverlay::currentMonitorWindowCandidates() const {
+    std::vector<hyprcapture::ui::WindowSelectionCandidate> windows;
+    windows.reserve(m_windowArtifacts.size());
+    for (std::size_t i = 0; i < m_windowArtifacts.size(); ++i) {
+        const auto& window = m_windowArtifacts[i];
+        windows.push_back({
+            .index = static_cast<int>(i),
+            .geometry = windowSelectionGeometry(window),
+            .zIndex = window.zIndex,
+        });
+    }
+    const std::optional<QPoint> cursor = m_defaults.windowWheelScope == hyprcapture::WindowWheelScope::UnderCursor ?
+        std::optional<QPoint>{cursorLogicalPosition()} : std::nullopt;
+    return hyprcapture::ui::orderedWindowSelectionCandidates(windows, m_overlayLogicalGeometry, cursor);
+}
+
+int CaptureOverlay::windowCycleTargetIndex() const {
+    if (!m_windowCycleActive || m_windowCyclePosition < 0 ||
+        m_windowCyclePosition >= static_cast<int>(m_windowCycleCandidates.size()))
+        return -1;
+    const int index = m_windowCycleCandidates[static_cast<std::size_t>(m_windowCyclePosition)];
+    return index >= 0 && index < static_cast<int>(m_windowArtifacts.size()) ? index : -1;
+}
+
+void CaptureOverlay::resetWindowCycle(bool clearSelectedWindow) {
+    if (clearSelectedWindow)
+        m_selectedWindowIndex = -1;
+    m_windowCycleActive = false;
+    m_windowCyclePosition = -1;
+    m_windowCycleCandidates.clear();
+    m_windowWheelStepState = {};
+}
+
+QString CaptureOverlay::windowCycleStatusText() const {
+    const int index = windowCycleTargetIndex();
+    if (!m_status || index < 0 || m_windowCycleCandidates.size() < 2)
+        return {};
+
+    const auto& window = m_windowArtifacts[static_cast<std::size_t>(index)];
+    QString title = window.title.trimmed();
+    if (title.isEmpty())
+        title = window.appClass.trimmed();
+    if (title.isEmpty())
+        title = QStringLiteral("unknown");
+
+    const QString prefix = QStringLiteral("%1/%2 · ").arg(m_windowCyclePosition + 1).arg(m_windowCycleCandidates.size());
+    const int availableWidth = std::clamp(width() / 3, 120, 320);
+    const int titleWidth = std::max(60, availableWidth - m_status->fontMetrics().horizontalAdvance(prefix));
+    return prefix + m_status->fontMetrics().elidedText(title, Qt::ElideRight, titleWidth);
+}
+
+void CaptureOverlay::updateStatus() {
+    if (!m_status)
+        return;
+
+    const auto setStatusText = [this](const QString& text) {
+        if (text.isEmpty()) {
+            m_status->clear();
+            m_status->hide();
+            m_status->setFixedSize(0, 0);
+            m_status->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+            return;
+        }
+
+        m_status->setVisible(true);
+        m_status->setMinimumSize(0, 0);
+        m_status->setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        m_status->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        const auto translated = hyprcapture::ui::uiText(text);
+        m_status->setToolTip(translated);
+        m_status->setAccessibleName(translated);
+        m_status->setText(m_status->fontMetrics().elidedText(translated, Qt::ElideRight, std::max(100, width() / 3)));
+        m_status->adjustSize();
+    };
+    const auto setMissingWindowCaptureStatus = [&] {
+        if (!m_sessionDecoded)
+            setStatusText("open via hyprcapture dispatcher");
+        else if (m_sessionMonitorCount == 0 && m_sessionWindowCount == 0)
+            setStatusText("plugin reload needed");
+        else if (m_sessionWindowCount > 0)
+            setStatusText("window artifact failed");
+        else
+            setStatusText("no visible windows");
+    };
+
+    if (m_recordActive) {
+        setStatusText(QString{});
+        relayoutToolbar();
+        return;
+    }
+
+    if (!m_recordError.isEmpty()) {
+        setStatusText(m_recordError);
+        relayoutToolbar();
+        return;
+    }
+
+    if (m_scrollResult) {
+        setStatusText("Long screenshot");
+        relayoutToolbar();
+        return;
+    }
+
+    if (pendingConfirmActive()) {
+        if (m_mode == hyprcapture::CaptureMode::Window && !windowCaptureAvailable()) {
+            setMissingWindowCaptureStatus();
+        } else if (m_mode == hyprcapture::CaptureMode::Window && !selectedWindow()) {
+            setStatusText("choose window");
+        } else if (m_mode == hyprcapture::CaptureMode::Region && !regionSelectionValid(normalizedSelection())) {
+            setStatusText("choose area");
+        } else if (const QString cycleStatus = windowCycleStatusText(); !cycleStatus.isEmpty()) {
+            setStatusText(cycleStatus);
+        } else {
+            setStatusText(QString{});
+        }
+        updateConfirmButtonVisibility();
+        relayoutToolbar();
+        return;
+    }
+
+    updateConfirmButtonVisibility();
+
+    if (const QString cycleStatus = windowCycleStatusText(); !cycleStatus.isEmpty()) {
+        setStatusText(cycleStatus);
+        relayoutToolbar();
+        return;
+    }
+
+    if (m_mode != hyprcapture::CaptureMode::Window) {
+        setStatusText(QString{});
+        relayoutToolbar();
+        return;
+    }
+
+    if (!windowCaptureAvailable()) {
+        setMissingWindowCaptureStatus();
+        relayoutToolbar();
+        return;
+    }
+
+    if (selectedWindow() || hoveredWindow())
+        setStatusText(QString{});
+    else
+        setStatusText("choose window");
+    relayoutToolbar();
+}
+
+void CaptureOverlay::relayoutToolbar() {
+    if (!m_toolbar)
+        return;
+
+    if (m_soundOptions && m_soundOutput && m_soundInput) {
+        const int count = (m_soundOutput->isVisible() ? 1 : 0) + (m_soundInput->isVisible() ? 1 : 0);
+        const int deviceWidth = std::clamp((width() - 64 - 220) / std::max(1, count), 45, 210);
+        m_soundMode->setPrefix(width() < 500 ? "" : "Sound");
+        m_soundOutput->setPrefix(width() < 500 ? "" : "Source");
+        m_soundInput->setPrefix(width() < 500 ? "" : "Mic");
+        m_soundMode->setCompactWidth(width() < 500 ? 75 : 155);
+        m_soundPreset->setCompactWidth(width() < 500 ? 85 : 130);
+        if (m_soundMixer) m_soundMixer->setFixedWidth(std::min(550, std::max(1, width() - 52)));
+        if (m_aecOptions) m_aecOptions->setFixedWidth(std::min(550, std::max(1, width() - 52)));
+        m_soundOutput->setCompactWidth(deviceWidth);
+        m_soundInput->setCompactWidth(deviceWidth);
+        m_soundOptions->setFixedWidth(std::min(m_soundOptions->sizeHint().width(), std::max(1, width() - 52)));
+    }
+    m_toolbar->setMinimumWidth(0);
+    m_toolbar->setMaximumWidth(QWIDGETSIZE_MAX);
+    m_toolbar->adjustSize();
+    const int maxWidth = std::max(1, width() - 32);
+    if (m_toolbar->width() > maxWidth)
+        m_toolbar->setFixedWidth(maxWidth);
+    else
+        m_toolbar->setFixedWidth(m_toolbar->sizeHint().width());
+    if (m_editing && m_editor) {
+        m_editor->setGeometry(rect());
+        m_editor->setImageDisplayRect(m_editImageRect);
+        m_editor->setCaptureToolbarSize(m_scrollResult && m_scrollOriginal.isNull() ? QSize{} : m_toolbar->size());
+        m_toolbar->move(m_editor->captureToolbarGeometry().topLeft());
+        m_toolbar->raise();
+    } else {
+        m_toolbar->move(std::max(16, (width() - m_toolbar->width()) / 2),
+                        std::max(16, height() - m_toolbar->height() - 40));
+    }
+}
+
+QImage CaptureOverlay::renderDesktopRectAtDisplayResolution(const QRect& globalRect, bool hdr) const {
+    return renderDesktopSnapshot(globalRect, hdr, m_monitorArtifacts, m_hasHdrScreen, m_defaults.includeCursor);
+}
+
+QImage CaptureOverlay::renderDesktopSnapshot(const QRect& globalRect, bool hdr, const std::vector<MonitorArtifact>& monitors,
+                                           bool hasHdrScreen, bool includeCursor) {
+    ScopedUiTiming timing(QStringLiteral("overlay.render.desktop hdr=%1").arg(hdr));
+    if (!globalRect.isValid() || monitors.empty())
+        return {};
+
+    struct DrawPart {
+        const MonitorArtifact* artifact = nullptr;
+        QRect                  logical;
+        QRect                  source;
+        QRect                  target;
+    };
+
+    std::vector<DrawPart> drawParts;
+    QRect                 outputBounds;
+    const auto artifactAxisScale = [](const MonitorArtifact& artifact, bool horizontal) {
+        if (artifact.image.isNull() || !artifact.logicalGeometry.isValid())
+            return 0.0;
+        const int logicalSize = horizontal ? artifact.logicalGeometry.width() : artifact.logicalGeometry.height();
+        const int imageSize = horizontal ? artifact.image.width() : artifact.image.height();
+        return logicalSize > 0 ? static_cast<double>(imageSize) / logicalSize : 0.0;
+    };
+    const auto nativeAxisOffsetForLogicalPosition = [&monitors, &artifactAxisScale](int axisStart, int logicalPosition, bool horizontal) {
+        if (logicalPosition <= axisStart)
+            return 0;
+
+        std::vector<int> points{axisStart, logicalPosition};
+        for (const auto& artifact : monitors) {
+            if (artifact.image.isNull() || !artifact.logicalGeometry.isValid())
+                continue;
+            const int start = horizontal ? artifact.logicalGeometry.left() : artifact.logicalGeometry.top();
+            const int end = horizontal ? artifact.logicalGeometry.right() + 1 : artifact.logicalGeometry.bottom() + 1;
+            if (start > axisStart && start < logicalPosition)
+                points.push_back(start);
+            if (end > axisStart && end < logicalPosition)
+                points.push_back(end);
+        }
+
+        std::sort(points.begin(), points.end());
+        points.erase(std::unique(points.begin(), points.end()), points.end());
+
+        double offset = 0.0;
+        for (std::size_t i = 0; i + 1 < points.size(); ++i) {
+            const int begin = points[i];
+            const int end = points[i + 1];
+            if (end <= begin)
+                continue;
+
+            const double midpoint = (static_cast<double>(begin) + static_cast<double>(end)) / 2.0;
+            double scale = 1.0;
+            bool covered = false;
+            for (const auto& artifact : monitors) {
+                if (artifact.image.isNull() || !artifact.logicalGeometry.isValid())
+                    continue;
+                const int artifactStart = horizontal ? artifact.logicalGeometry.left() : artifact.logicalGeometry.top();
+                const int artifactEnd = horizontal ? artifact.logicalGeometry.right() + 1 : artifact.logicalGeometry.bottom() + 1;
+                if (midpoint < artifactStart || midpoint >= artifactEnd)
+                    continue;
+
+                const double axisScale = artifactAxisScale(artifact, horizontal);
+                if (axisScale <= 0.0)
+                    continue;
+                scale = covered ? std::max(scale, axisScale) : axisScale;
+                covered = true;
+            }
+            offset += static_cast<double>(end - begin) * scale;
+        }
+
+        return static_cast<int>(std::floor(offset));
+    };
+    for (const auto& artifact : monitors) {
+        if (artifact.image.isNull() || !artifact.logicalGeometry.isValid())
+            continue;
+
+        const QRect logicalPart = globalRect.intersected(artifact.logicalGeometry);
+        if (!logicalPart.isValid())
+            continue;
+
+        const QRect source = logicalRectToImageRect(logicalPart, artifact.logicalGeometry, artifact.image.size());
+        if (!source.isValid())
+            continue;
+
+        const QPoint targetTopLeft(nativeAxisOffsetForLogicalPosition(globalRect.left(), logicalPart.left(), true),
+                                   nativeAxisOffsetForLogicalPosition(globalRect.top(), logicalPart.top(), false));
+        const QRect target(targetTopLeft, source.size());
+        outputBounds = outputBounds.isValid() ? outputBounds.united(target) : target;
+        drawParts.push_back({.artifact = &artifact, .logical = logicalPart, .source = source, .target = target});
+    }
+    if (hdr && !hasHdrScreen && std::ranges::none_of(drawParts, [](const auto& part) { return !part.artifact->hdrImage.isNull(); })) return {};
+    if (!outputBounds.isValid() || drawParts.empty())
+        return {};
+
+    QImage image = boundedImage(outputBounds.size(), hdr ? QImage::Format_RGBA16FPx4_Premultiplied : QImage::Format_ARGB32_Premultiplied);
+    if (image.isNull())
+        return {};
+    image.fill(Qt::transparent);
+    image.setColorSpace(hdr ? QColorSpace::SRgbLinear : QColorSpace::SRgb);
+
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    for (const auto& part : drawParts) {
+        const QRect target = part.target.translated(-outputBounds.topLeft()).intersected(image.rect());
+        if (target.isValid())
+            painter.drawImage(target, hdr ? (part.artifact->hdrImage.isNull() ? hyprcapture::ui::sdrToHdr(part.artifact->image) : part.artifact->hdrImage) : part.artifact->image, part.source);
+    }
+    if (includeCursor) {
+        for (const auto& part : drawParts) {
+            if (part.artifact->cursorImage.isNull())
+                continue;
+            const QRect source = logicalRectToImageRect(part.logical, part.artifact->logicalGeometry, part.artifact->cursorImage.size());
+            const QRect target = part.target.translated(-outputBounds.topLeft()).intersected(image.rect());
+            hyprcapture::ui::paintImageLayer(painter, target, hdr ? (part.artifact->hdrCursorImage.isNull() ? hyprcapture::ui::sdrToHdr(part.artifact->cursorImage) : part.artifact->hdrCursorImage) : part.artifact->cursorImage, source);
+        }
+    }
+
+    return image;
+}
+
+std::function<QImage()> CaptureOverlay::windowResultRenderer(const WindowArtifact& window, bool hdr) const {
+    // Capture only implicitly shared pixels and values. Workers never access widgets,
+    // style hints, IPC, mutable selection, or Wayland objects.
+    return [window, hdr, bg = currentWindowBackground(), border = currentWindowBorder(), shadow = currentWindowShadow(),
+            hasHdrScreen = m_hasHdrScreen, desktopImage = m_desktopImage, desktopGeometry = m_desktopGeometry,
+            monitors = m_monitorArtifacts, includeCursor = m_defaults.includeCursor, systemColor = followSystemColor()] -> QImage {
+        ScopedUiTiming timing(QStringLiteral("overlay.render_result_snapshot hdr=%1").arg(hdr));
+        const auto* windowArtifact = &window;
+        QRect artifactSource = windowArtifact->image.rect();
+        const bool cropDecorations = window.fullscreen || border == hyprcapture::DecorationPolicy::Remove || shadow == hyprcapture::DecorationPolicy::Remove;
+        if (cropDecorations && windowArtifact->visibleGeometry.isValid() && windowArtifact->fullGeometry.contains(windowArtifact->visibleGeometry)) {
+            const double scaleX = static_cast<double>(windowArtifact->image.width()) / std::max(1, windowArtifact->fullGeometry.width());
+            const double scaleY = static_cast<double>(windowArtifact->image.height()) / std::max(1, windowArtifact->fullGeometry.height());
+            artifactSource = QRect(QPoint(static_cast<int>(std::floor((windowArtifact->visibleGeometry.x() - windowArtifact->fullGeometry.x()) * scaleX)),
+                                          static_cast<int>(std::floor((windowArtifact->visibleGeometry.y() - windowArtifact->fullGeometry.y()) * scaleY))),
+                                   QSize(std::max(1, static_cast<int>(std::ceil(windowArtifact->visibleGeometry.width() * scaleX))),
+                                         std::max(1, static_cast<int>(std::ceil(windowArtifact->visibleGeometry.height() * scaleY)))))
+                                 .intersected(windowArtifact->image.rect());
+        }
+
+        if (hdr && windowArtifact->hdrImage.isNull() && !hasHdrScreen) return {};
+        QImage repairedArtifact;
+        { ScopedUiTiming timing(QStringLiteral("overlay.render.foreground_prepare hdr=%1").arg(hdr));
+          repairedArtifact = hdr ? (windowArtifact->hdrImage.isNull() ? hyprcapture::ui::sdrToHdr(windowArtifact->image) : windowArtifact->hdrImage) : windowArtifact->image; }
+        // Fully transparent rows of a transparent client look like a missing
+        // tail. An independent real background already fills them; patching
+        // from the monitor snapshot would cover it (issue #34).
+        const bool independentBackground = bg == hyprcapture::WindowBackground::Real && !windowArtifact->realBackground.isNull();
+        if (!hdr && !independentBackground)
+            repairMissingWindowTail(repairedArtifact, windowArtifact->fullGeometry, windowArtifact->visibleGeometry, desktopImage, desktopGeometry);
+
+        ScopedUiTiming compositionTiming(QStringLiteral("overlay.render.compose hdr=%1").arg(hdr));
+        QImage image = boundedImage(artifactSource.size().expandedTo(QSize(1, 1)), hdr ? QImage::Format_RGBA16FPx4_Premultiplied : QImage::Format_ARGB32_Premultiplied);
+        if (image.isNull())
+            return {};
+        image.fill(Qt::transparent);
+        image.setColorSpace(hdr ? QColorSpace::SRgbLinear : QColorSpace::SRgb);
+
+        QPainter painter(&image);
+        QImage background = boundedImage(image.size(), QImage::Format_RGBA8888);
+        if (background.isNull())
+            return {};
+        background.fill(Qt::transparent);
+        const QRect logicalSource = artifactRectToLogicalRect(artifactSource, repairedArtifact.size(), windowArtifact->fullGeometry);
+        bool         paintedBackground = false;
+        if (bg == hyprcapture::WindowBackground::Real && !windowArtifact->realBackground.isNull() && logicalSource.isValid()) {
+            const QRect backgroundSource = projectedImageRect(logicalSource, windowArtifact->fullGeometry, windowArtifact->realBackground.size());
+            if (backgroundSource.isValid()) {
+                QPainter backgroundPainter(&background);
+                backgroundPainter.drawImage(background.rect(), windowArtifact->realBackground, backgroundSource);
+                paintedBackground = true;
+            }
+        }
+        if (!paintedBackground && paintWindowBackground(background, bg, systemColor)) {
+            paintedBackground = true;
+        }
+        if (hdr && bg == hyprcapture::WindowBackground::Real && windowArtifact->hdrRealBackground.isNull() && !hasHdrScreen) return {};
+        if (paintedBackground) {
+            { ScopedUiTiming timing(QStringLiteral("overlay.render.background_clip hdr=%1").arg(hdr));
+            clipWindowBackgroundToFrame(background,
+                                        logicalSource,
+                                        windowArtifact->visibleGeometry,
+                                        windowArtifact->fullscreen ? 0.0 : windowArtifact->rounding,
+                                        windowArtifact->roundingPower); }
+            if (hdr) {
+                QImage linearBackground;
+                const bool nativeBackground = bg == hyprcapture::WindowBackground::Real && !windowArtifact->hdrRealBackground.isNull();
+                { ScopedUiTiming timing("overlay.render.background_sdr_to_hdr");
+                  // Native HDR pixels replace every RGB channel below; converting
+                  // the SDR background first only to erase it wastes a full pass.
+                  linearBackground = nativeBackground ? boundedImage(background.size(), QImage::Format_RGBA16FPx4)
+                                                      : hyprcapture::ui::sdrToHdr(background); }
+                if (linearBackground.isNull()) return {};
+                linearBackground.setColorSpace(QColorSpace::SRgbLinear);
+                if (nativeBackground) {
+                    ScopedUiTiming realTiming("overlay.render.real_background_compose");
+                    linearBackground.fill(Qt::transparent);
+                    QPainter lp(&linearBackground);
+                    const QRect src = projectedImageRect(logicalSource, windowArtifact->fullGeometry, windowArtifact->hdrRealBackground.size());
+                    lp.drawImage(linearBackground.rect(), windowArtifact->hdrRealBackground, src);
+                    lp.setCompositionMode(QPainter::CompositionMode_DestinationIn);
+                    lp.drawImage(QPoint(0, 0), background);
+                }
+                painter.drawImage(QPoint(0, 0), linearBackground);
+            } else
+                painter.drawImage(QPoint(0, 0), background);
+        }
+
+        { ScopedUiTiming timing(QStringLiteral("overlay.render.foreground_compose hdr=%1").arg(hdr));
+          painter.drawImage(image.rect(), repairedArtifact, artifactSource); }
+        { ScopedUiTiming timing(QStringLiteral("overlay.render.cursor hdr=%1").arg(hdr));
+            paintCursorSnapshot(painter, image.rect(), logicalSource, hdr, monitors, includeCursor); }
+        return image;
+    };
+}
+
+std::function<QImage()> CaptureOverlay::hdrResultRenderer() const {
+    if (m_mode == hyprcapture::CaptureMode::Window) {
+        const auto* window = selectedWindow() ? selectedWindow() : hoveredWindow();
+        if (window && !window->image.isNull()) return windowResultRenderer(*window, true);
+        if (!window || hasOverviewSelectionGeometry(*window)) return [] { return QImage{}; };
+        const auto geometry = windowFrameGeometry(*window);
+        return [geometry, monitors = m_monitorArtifacts, hasHdr = m_hasHdrScreen, cursor = m_defaults.includeCursor] {
+            return renderDesktopSnapshot(geometry, true, monitors, hasHdr, cursor);
+        };
+    }
+    const auto geometry = localToDesktopLogicalRect(captureRectForMode());
+    return [geometry, monitors = m_monitorArtifacts, hasHdr = m_hasHdrScreen, cursor = m_defaults.includeCursor] {
+        return renderDesktopSnapshot(geometry, true, monitors, hasHdr, cursor);
+    };
+}
+
+QImage CaptureOverlay::renderResultImage(bool hdr) {
+    ScopedUiTiming timing(QStringLiteral("overlay.render_result hdr=%1").arg(hdr));
+    const auto bg = currentWindowBackground();
+    if (m_mode == hyprcapture::CaptureMode::Window) {
+        auto* windowArtifact = selectedWindow() ? selectedWindow() : hoveredWindow();
+        if (!windowArtifact)
+            return {};
+        if (!hydrateWindowArtifact(*windowArtifact) && windowArtifact->image.isNull()) {
+            if (hasOverviewSelectionGeometry(*windowArtifact))
+                return {};
+            return renderDesktopRectAtDisplayResolution(windowFrameGeometry(*windowArtifact), hdr);
+        }
+
+        ensureDesktopImage();
+        return windowResultRenderer(*windowArtifact, hdr)();
+    }
+
+    const QRect cap = captureRectForMode();
+    if (!cap.isValid())
+        return {};
+
+    if (!m_monitorArtifacts.empty()) {
+        const QImage highResolution = renderDesktopRectAtDisplayResolution(localToDesktopLogicalRect(cap), hdr);
+        if (!highResolution.isNull())
+            return highResolution;
+    }
+
+    if (hdr) return {}; // No HDR synthesis from an SDR/grim fallback.
+    ensureDesktopImage();
+    const QRect desktopSource = localToDesktopSourceRect(cap);
+    const QSize outputSize = desktopSource.isValid() ? desktopSource.size() : cap.size();
+    QImage image = boundedImage(outputSize.expandedTo(QSize(1, 1)), hdr ? QImage::Format_RGBA16FPx4_Premultiplied : QImage::Format_ARGB32_Premultiplied);
+    if (image.isNull())
+        return {};
+    image.fill(Qt::transparent);
+
+    QPainter painter(&image);
+
+    if (m_mode != hyprcapture::CaptureMode::Window && !m_desktopImage.isNull() && desktopSource.isValid()) {
+        painter.drawImage(image.rect(), m_desktopImage, desktopSource);
+    } else if (m_mode == hyprcapture::CaptureMode::Window && bg == hyprcapture::WindowBackground::Real && !m_desktopImage.isNull()) {
+        painter.drawImage(image.rect(), m_desktopImage, desktopSource);
+    } else if (m_mode == hyprcapture::CaptureMode::Window && bg != hyprcapture::WindowBackground::Transparent) {
+        if (bg == hyprcapture::WindowBackground::White)
+            painter.fillRect(image.rect(), Qt::white);
+        else if (bg == hyprcapture::WindowBackground::Black)
+            painter.fillRect(image.rect(), Qt::black);
+        else if (bg == hyprcapture::WindowBackground::FollowSystem)
+            painter.fillRect(image.rect(), followSystemColor());
+        else
+            painter.fillRect(image.rect(), QColor(30, 34, 38));
+    } else {
+        painter.fillRect(image.rect(), QColor(30, 34, 38));
+    }
+
+    return image;
+}
+
+QString CaptureOverlay::prepareRecordingRequest() {
+    m_recordError.clear();
+    QRect cap = captureRectForMode();
+    if (!cap.isValid()) {
+        m_recordError = QStringLiteral("invalid record target");
+        return {};
+    }
+
+    hyprcapture::RecordingRequest request;
+    request.id = hyprcapture::makeSessionId();
+    request.defaults = m_defaults;
+    request.defaults.mode = m_mode;
+    request.defaults.fullscreenScope = currentFullscreenScope();
+    request.defaults.windowBackground = currentRecordBackground();
+    if (m_mode != hyprcapture::CaptureMode::Window)
+        request.defaults.recordSolidAlpha = false;
+    request.defaults.windowBorder = currentWindowBorder();
+    request.defaults.windowShadow = currentWindowShadow();
+    const QString recordFormat = currentRecordFormat();
+    const bool imageAnimation = isImageAnimationRecordFormat(recordFormat);
+    request.defaults.recordFormat = recordFormat.toStdString();
+    request.defaults.recordFilenameTemplate = recordTemplateWithFormat(m_defaults.recordFilenameTemplate, recordFormat).toStdString();
+    request.defaults.recordAudio = imageAnimation ? hyprcapture::RecordAudio::Off : m_defaults.recordAudio;
+    request.defaults.recordAudioOutput = m_defaults.recordAudioOutput;
+    request.defaults.recordAudioInput = m_defaults.recordAudioInput;
+    request.defaults.recordCodec = imageAnimation ? recordFormat.toStdString() : codecConfigFromChoice(currentRecordCodec()).toStdString();
+    request.defaults.recordFps = currentRecordFps();
+    request.defaults.recordMaxSeconds = currentRecordMaxSeconds();
+    request.defaults.recordWindowBackend = imageAnimation ? hyprcapture::RecordWindowBackend::Compositor : currentRecordBackend();
+    request.mode = m_mode;
+
+    const QString conflict = recordOptionsConflict();
+    if (!conflict.isEmpty()) {
+        updateRecordWarning();
+        return {};
+    }
+
+    if (m_mode == hyprcapture::CaptureMode::Window) {
+        const auto* window = selectedWindow() ? selectedWindow() : hoveredWindow();
+        if (!window || window->address.isEmpty()) {
+            m_recordError = QStringLiteral("invalid record window");
+            return {};
+        }
+        request.windowAddress = window->address.toStdString();
+        cap = globalToLocalRect(windowFrameGeometry(*window));
+    }
+
+    const QRect globalRect = localToDesktopLogicalRect(cap);
+    if (!globalRect.isValid()) {
+        m_recordError = QStringLiteral("invalid record geometry");
+        return {};
+    }
+    request.targetGeometry = {.x = static_cast<double>(globalRect.x()),
+                              .y = static_cast<double>(globalRect.y()),
+                              .width = static_cast<double>(globalRect.width()),
+                              .height = static_cast<double>(globalRect.height())};
+
+    const QString requestPath = hyprcapture::ui::runtimeFile(QStringLiteral("record-request"), QStringLiteral(".json"));
+    const std::string json = hyprcapture::encodeRecordingRequestJson(request);
+    if (!writePrivateTextFile(requestPath, QByteArray(json.data(), static_cast<qsizetype>(json.size())))) {
+        m_recordError = QStringLiteral("record request write failed");
+        return {};
+    }
+
+    return requestPath;
+}
+
+bool CaptureOverlay::startRecording(const QString& requestPath) {
+    if (requestPath.isEmpty()) {
+        m_recordError = QStringLiteral("invalid record request");
+        return false;
+    }
+
+    const auto started = dispatchRecordingStart(requestPath);
+    if (!started.success) {
+        m_recordError = started.error.isEmpty() ? QStringLiteral("record start failed") : started.error;
+        QFile::remove(requestPath);
+    }
+    return started.success;
+}
+
+void CaptureOverlay::startPreparedRecording(const QString& requestPath) {
+    hide();
+    qApp->processEvents(QEventLoop::ExcludeUserInputEvents);
+    QTimer::singleShot(120, this, [this, requestPath] {
+        if (!startRecording(requestPath)) {
+            show();
+            if (m_toolbar) {
+                m_toolbar->setEnabled(true);
+                m_toolbar->show();
+            }
+            setCursor(Qt::CrossCursor);
+            m_finishing = false;
+            updateRecordOptionsVisibility();
+            updateStatus();
+            return;
+        }
+        traceTiming(QStringLiteral("record_start"));
+        endHymissionCaptureInputSuppression();
+        qApp->quit();
+    });
+}
+
+void CaptureOverlay::launchRecordingCountdown(const QString& requestPath) {
+    const int countdownSeconds = currentRecordCountdownSeconds();
+    if (countdownSeconds <= 0) {
+        startPreparedRecording(requestPath);
+        return;
+    }
+
+    hide();
+    qApp->processEvents(QEventLoop::ExcludeUserInputEvents);
+    const QStringList args{QStringLiteral("--record-countdown-request"), requestPath, QStringLiteral("--record-countdown-seconds"), QString::number(countdownSeconds)};
+    if (!QProcess::startDetached(QCoreApplication::applicationFilePath(), args)) {
+        show();
+        QFile::remove(requestPath);
+        m_recordError = QStringLiteral("record countdown start failed");
+        m_finishing = false;
+        updateRecordOptionsVisibility();
+        updateStatus();
+        return;
+    }
+
+    traceTiming(QStringLiteral("record_countdown_start"));
+    endHymissionCaptureInputSuppression();
+    qApp->quit();
+}
+
+bool CaptureOverlay::stopRecording() {
+    return dispatchRecordingStop().success;
+}
+
+QImage CaptureOverlay::scrollWindowBackground(const QImage& frame, const QRect& geometry) {
+    auto* window = selectedWindow();
+    const auto backgroundMode = currentWindowBackground();
+    if (!window || backgroundMode == hyprcapture::WindowBackground::Transparent)
+        return QImage{};
+    if (backgroundMode == hyprcapture::WindowBackground::Real)
+        hydrateWindowArtifact(*window);
+    QImage background(frame.size(), QImage::Format_RGBA8888);
+    background.fill(Qt::transparent);
+    bool painted = false;
+    if (backgroundMode == hyprcapture::WindowBackground::Real && !window->realBackground.isNull()) {
+        const QRect source = projectedImageRect(geometry, window->fullGeometry, window->realBackground.size());
+        if (source.isValid()) {
+            QPainter painter(&background);
+            painter.drawImage(background.rect(), window->realBackground, source);
+            painted = true;
+        }
+    }
+    if (!painted && paintWindowBackground(background, backgroundMode)) {
+        painted = true;
+    }
+    if (!painted)
+        return QImage{};
+    clipWindowBackgroundToFrame(background, geometry, window->visibleGeometry,
+                                window->fullscreen ? 0.0 : window->rounding, window->roundingPower);
+    return background;
+}
+
+QImage CaptureOverlay::renderScrollResultImage(bool hdr) {
+    const auto& original = hdr ? m_scrollHdrOriginal : m_scrollOriginal.isNull() ? m_scrollSdrImage : m_scrollOriginal;
+    if (original.isNull())
+        return {};
+    auto background = scrollWindowBackground(m_scrollFirstFrame, m_scrollGeometry);
+    if (background.isNull()) return original;
+    if (hdr) {
+        background = hyprcapture::ui::sdrToHdr(background, m_scrollReferenceNits);
+    }
+    QImage image(original.size(), hdr ? QImage::Format_RGBA16FPx4_Premultiplied : QImage::Format_ARGB32);
+    image.fill(Qt::transparent);
+    QPainter painter(&image);
+    const int top = m_scrollLayout.content.top();
+    const int bottom = m_scrollLayout.content.bottom() + 1;
+    const int footer = background.height() - bottom;
+    // Extend only the content band; keep the original top/bottom clipping and
+    // rounded corners at native size. The window pixels remain unmodified.
+    painter.drawImage(QRect(0, 0, image.width(), top), background,
+                      QRect(0, 0, background.width(), top));
+    painter.drawImage(QRect(0, top, image.width(), image.height() - top - footer), background,
+                      QRect(0, top, background.width(), bottom - top));
+    painter.drawImage(QRect(0, image.height() - footer, image.width(), footer), background,
+                      QRect(0, bottom, background.width(), footer));
+    painter.drawImage(QPoint{}, original);
+    return image;
+}
+
+void CaptureOverlay::beginScrollCapture() {
+    ScopedUiTiming timing("overlay.scroll_prepare");
+    if(m_scrollController || m_scrolling || !m_editing || !m_editor || m_scrollResult || m_scrollSessionVersion<1 || m_hymissionOverviewSession ||
+       (selectedWindow() && selectedWindow()->stagePreview)) return;
+    auto beforeCapture=std::make_shared<QRect>(m_editImageRect);
+    QRect capture=m_editImageRect;
+    QString address;
+    if(m_mode==hyprcapture::CaptureMode::Window) {
+        const auto* window=selectedWindow(); if(!window) return;
+        capture=globalToLocalRect(window->fullGeometry); address=window->address;
+    }
+    if(capture.isEmpty()) return;
+    auto* controller=new hyprcapture::ui::ScrollCaptureController(this);
+    QString error;
+    if(!controller->prepare(localToDesktopLogicalRect(capture),error,address)) { delete controller; m_recordError=error; return; }
+    m_scrollController=controller; controller->setEditor(m_editor);
+    controller->setHdrCapture(m_hasHdrScreen && m_scrollSessionVersion >= 2);
+    controller->setHdrPreview(m_defaults.screenshotFormat == "heic");
+    for (const auto& artifact : m_monitorArtifacts)
+        if (artifact.logicalGeometry.intersects(localToDesktopLogicalRect(capture))) {
+            m_scrollReferenceNits = artifact.referenceNits; break;
+        }
+    if (!address.isEmpty()) {
+        controller->setWindowBackgroundProvider([this](const QImage& frame, const QRect& geometry) {
+            return scrollWindowBackground(frame, geometry);
+        });
+    }
+    connect(controller,&hyprcapture::ui::ScrollCaptureController::began,this,[this,controller,beforeCapture] {
+        *beforeCapture=m_editImageRect;
+        const QRect capture=QRect(mapFromGlobal(controller->captureGeometry().topLeft()),controller->captureGeometry().size());
+        traceTiming("overlay.scroll_began");
+        m_scrolling=true; m_pendingConfirm=false; m_dragging=false;
+        hideOptionPopups(); m_toolbar->hide();
+        m_editor->setRegionResizeBounds({}); m_editImageRect=capture;
+        endHymissionCaptureInputSuppression(); emit scrollingChanged(true); update(); controller->raise();
+    });
+    connect(controller,&hyprcapture::ui::ScrollCaptureController::completed,this,[this,controller](const QImage& image) {
+        const QRect start=QRect(mapFromGlobal(controller->previewGeometry().topLeft()),controller->previewGeometry().size());
+        m_scrolling=false; m_scrollResult=true; m_scrollController=nullptr;
+        m_scrollHdrOriginal = controller->hdrResult();
+        m_scrollSdrImage = image;
+        m_editedHdrOutput = {};
+        if (m_scrollHdrOriginal.isNull()) {
+            m_defaults.screenshotFormat = "png";
+            if (m_sdrButton) m_sdrButton->setChecked(true);
+        }
+        m_editor->setHdrEnabled(m_defaults.screenshotFormat == "heic");
+        m_scrollOriginal=controller->originalResult(); m_scrollFirstFrame=controller->originalFirstFrame();
+        m_scrollGeometry=controller->originalGeometry(); m_scrollLayout=controller->resultLayout();
+        invalidateHdrEditBase();
+        m_editHdrBase = m_scrollOriginal.isNull() ? m_scrollHdrOriginal : renderScrollResultImage(true);
+        applyHdrWatermark(m_editHdrBase, m_defaults);
+        m_hdrEditCacheKey = 0;
+        m_editor->setScrollEnabled(false);
+        auto result=image; hyprcapture::ui::applyWatermark(result,m_defaults);
+        m_editor->setScrollImage(result,controller->resultLayout(),false);
+        m_editor->setAnnotationPresentation(true); m_editor->setImageDisplayRect({});
+        const QRect destination=m_editor->canvasGeometry();
+        m_editImageRect={}; emit scrollingChanged(false); updateToolbarControlsForMode(); updateStatus();
+        m_editor->setEnabled(false); m_editor->toolbarWidget()->hide(); m_toolbar->hide();
+        auto* animation=new QVariantAnimation(this); animation->setDuration(260); animation->setEasingCurve(QEasingCurve::OutCubic); animation->setStartValue(start); animation->setEndValue(destination);
+        connect(animation,&QVariantAnimation::valueChanged,m_editor,[this](const QVariant& v) { m_editor->setImageDisplayRect(v.toRect()); });
+        connect(animation,&QVariantAnimation::finished,this,[this,animation] { m_editor->setImageDisplayRect({}); m_editor->setEnabled(true); m_editor->toolbarWidget()->show(); m_toolbar->setVisible(!m_scrollOriginal.isNull()); m_editor->setFocus(); animation->deleteLater(); });
+        animation->start(); controller->deleteLater(); update();
+    });
+    connect(controller,&hyprcapture::ui::ScrollCaptureController::cancelled,this,[this,controller,beforeCapture] {
+        m_scrolling=false; m_scrollController=nullptr; m_editImageRect=*beforeCapture; m_editor->setScrollEnabled(false);
+        m_editor->setImageDisplayRect(m_editImageRect); m_editor->setAnnotationPresentation(true);
+        m_editor->setRegionResizeBounds(m_mode==hyprcapture::CaptureMode::Region?regionCaptureBounds():QRect{});
+        emit scrollingChanged(false); m_toolbar->show(); m_editor->toolbarWidget()->show(); updateToolbarControlsForMode(); updateStatus(); update();
+        controller->deleteLater();
+    });
+    connect(controller,&hyprcapture::ui::ScrollCaptureController::failed,this,[this](const QString& reason) { m_recordError=reason; updateStatus(); });
+    controller->start(); m_editor->setScrollEnabled(true);
+    controller->exclude({QRect(m_editor->toolbarWidget()->mapToGlobal(QPoint{}),m_editor->toolbarWidget()->size()),QRect(m_toolbar->mapToGlobal(QPoint{}),m_toolbar->size())});
+}
+
+void CaptureOverlay::invalidateHdrEditBase() {
+    if (m_hdrBaseCancelled) m_hdrBaseCancelled->store(true);
+    m_hdrBaseLatest = {};
+    m_hdrBaseFailed = false;
+    ++m_hdrBaseGeneration;
+    m_hdrBasePending = false;
+    m_hdrExportPending = false;
+    m_editHdrBase = {};
+    m_editedHdrOutput = {};
+    m_hdrEditCacheKey = 0;
+    m_hdrEditPreviewDirty = true;
+    m_hdrEditPqCacheKey = 0;
+    m_hdrCompositeBaseKey = 0;
+    m_hdrCompositePendingDamage = {};
+}
+
+void CaptureOverlay::queueHdrEditBase() {
+    if (m_hdrExportPending) return;
+    invalidateHdrEditBase();
+    if (m_defaults.screenshotFormat != "heic") return;
+    // Replace the waiting snapshot instead of submitting a task per resize.
+    auto render = hdrResultRenderer();
+    const auto defaults = m_defaults;
+    m_hdrBaseLatest = [render = std::move(render), defaults] {
+        auto image = render();
+        applyHdrWatermark(image, defaults);
+        return image;
+    };
+    m_hdrBasePending = true;
+    startHdrEditBase();
+}
+
+void CaptureOverlay::startHdrEditBase() {
+    if (m_hdrBaseRunning || !m_hdrBaseLatest) return;
+    auto render = std::exchange(m_hdrBaseLatest, {});
+    const auto generation = m_hdrBaseGeneration;
+    const auto cancelled = m_hdrBaseCancelled = std::make_shared<std::atomic_bool>(false);
+    m_hdrBaseRunning = true;
+    traceTiming(QStringLiteral("overlay.hdr_base_queued generation=%1").arg(generation));
+    QPointer<CaptureOverlay> overlay(this);
+    QThreadPool::globalInstance()->start(QRunnable::create([overlay, render = std::move(render), generation, cancelled] {
+        QImage image;
+        if (!cancelled->load()) {
+            ScopedUiTiming timing("overlay.hdr_base_build");
+            image = render();
+        }
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [overlay, image, generation] {
+            if (!overlay) return;
+            auto* self = overlay.data();
+            self->m_hdrBaseRunning = false;
+            if (!self->m_editing || self->m_hdrBaseGeneration != generation) {
+                self->startHdrEditBase();
+                return;
+            }
+            self->m_editHdrBase = image;
+            self->m_hdrBaseFailed = image.isNull();
+            self->m_hdrBasePending = false;
+            traceTiming(QStringLiteral("overlay.hdr_base_ready generation=%1").arg(generation));
+            self->updateHdrEditBackdrop();
+            self->update();
+            if (std::exchange(self->m_hdrExportPending, false)) self->exportInPlaceImage();
+        }, Qt::QueuedConnection);
+    }));
+}
+
+void CaptureOverlay::beginInPlaceEdit(const QImage& capturedImage) {
+    traceTiming("overlay.begin_edit_requested");
+    ScopedUiTiming timing("overlay.begin_edit");
+    if (m_editing || m_record || m_recordActive)
+        return;
+    // Once a window is chosen, toolbar pointer movement must not retarget it.
+    if (m_mode == hyprcapture::CaptureMode::Window && !selectedWindow())
+        m_selectedWindowIndex = hoveredWindowIndex();
+    auto image = capturedImage.isNull() ? renderResultImage() : capturedImage;
+    if (image.isNull()) {
+        m_recordError = tr("Could not capture the selected target");
+        updateStatus();
+        return;
+    }
+    invalidateHdrEditBase();
+    m_editedHdrOutput = {};
+    hyprcapture::ui::applyWatermark(image, m_defaults);
+    hideOptionPopups();
+    m_editImageRect = captureRectForMode();
+    if (m_mode == hyprcapture::CaptureMode::Window) {
+        if (const auto* window = selectedWindow()) {
+            const bool crop = window->fullscreen || currentWindowBorder() == hyprcapture::DecorationPolicy::Remove ||
+                currentWindowShadow() == hyprcapture::DecorationPolicy::Remove;
+            m_editImageRect = globalToLocalRect(crop && window->fullGeometry.contains(window->visibleGeometry)
+                                                   ? window->visibleGeometry : window->fullGeometry);
+        }
+    }
+    // Stage previews open centered at a usable scale; their source geometry
+    // belongs to another workspace, not the sidebar thumbnail. Desktop windows
+    // retain their original position, including those crossing output edges.
+    const bool stageWindow = m_mode == hyprcapture::CaptureMode::Window && selectedWindow() && selectedWindow()->stagePreview;
+    if (stageWindow || m_scrollResult || (m_mode != hyprcapture::CaptureMode::Window && !rect().contains(m_editImageRect)))
+        m_editImageRect = {};
+    if (!m_editor) {
+        m_editor = new AnnotationEditor(this);
+        m_editor->setObjectName("inPlaceEditor");
+        if (auto* canvas = m_editor->findChild<QWidget*>("annotationCanvas")) canvas->installEventFilter(this);
+        connect(m_editor, &AnnotationEditor::previewChanged, this, [this] {
+            m_hdrEditPreviewDirty = true;
+            // Painting/input only capture a snapshot; conversion runs off-thread.
+            updateHdrEditBackdrop();
+        });
+        connect(m_editor, &AnnotationEditor::imageDisplayGeometryChanged, this, [this] {
+            updateHdrEditBackdrop();
+            update(); // Repaint the mask when the editor moves/resizes its HDR surface.
+        });
+        connect(m_editor, &AnnotationEditor::captureRectChangeRequested, this, [this](const QRect& requested) {
+            if (!m_editing || m_finishing || m_hdrExportPending || m_scrollResult || m_mode != hyprcapture::CaptureMode::Region) return;
+            const QRect target = requested.intersected(regionCaptureBounds());
+            if (!regionSelectionValid(target)) return;
+            const QPoint previousStart = m_dragStart, previousEnd = m_dragEnd;
+            m_dragStart = target.topLeft();
+            m_dragEnd = target.bottomRight();
+            auto image = renderResultImage();
+            if (image.isNull()) { m_dragStart = previousStart; m_dragEnd = previousEnd; return; }
+            queueHdrEditBase();
+            hyprcapture::ui::applyWatermark(image, m_defaults);
+            m_editImageRect = target;
+            m_editor->replaceCaptureImage(image, target);
+            if(m_scrollController) m_scrollController->updateTarget(localToDesktopLogicalRect(target));
+            updateStatus();
+            update();
+        });
+        connect(m_editor,&AnnotationEditor::scrollRequested,this,[this](const QPointF& p,double d,int discrete,bool finger,bool inverted) {
+            if(m_scrollController) m_scrollController->scroll(p,d,discrete,finger,inverted);
+        });
+        connect(m_editor, &AnnotationEditor::saveRequested, this, [this] {
+            if (m_finishing) return;
+            const bool previousSave = std::exchange(m_defaults.save, true);
+            if (m_scrolling && m_scrollController) m_scrollController->finish();
+            else {
+                exportInPlaceImage();
+                // Nothing started: Capture stays clipboard-only for a retry.
+                if (!m_finishing && !m_hdrExportPending) m_defaults.save = previousSave;
+            }
+        });
+        connect(m_editor, &AnnotationEditor::confirmRequested, this,
+                [this] { if(m_scrolling && m_scrollController) m_scrollController->finish(); else exportInPlaceImage(); });
+        connect(m_editor,&AnnotationEditor::cancelRequested,this,[this] { if(m_scrolling && m_scrollController) m_scrollController->cancel(); else cancelCapture(); });
+        connect(m_editor, &AnnotationEditor::pinRequested, this, &CaptureOverlay::pinInPlaceImage);
+        connect(m_editor, &AnnotationEditor::reselectRequested, this, &CaptureOverlay::leaveInPlaceEdit);
+        connect(m_editor, &AnnotationEditor::toolbarGeometryChanged, this, [this] {
+            if (m_editing && m_toolbar) {
+                m_toolbar->move(m_editor->captureToolbarGeometry().topLeft());
+                m_toolbar->raise();
+                if(m_scrolling) m_toolbar->hide();
+                if(m_scrollController) m_scrollController->exclude({QRect(m_editor->toolbarWidget()->mapToGlobal(QPoint{}),m_editor->toolbarWidget()->size()),QRect(m_toolbar->mapToGlobal(QPoint{}),m_toolbar->size())});
+            }
+        });
+    }
+    m_firstEditorPaintPending = true;
+    m_editing = true;
+    m_pendingConfirm = false;
+    m_dragging = false;
+    m_recordError.clear();
+    m_editor->setGeometry(rect());
+    m_editor->setRegionResizeBounds(!m_scrollResult && m_mode == hyprcapture::CaptureMode::Region ? regionCaptureBounds() : QRect());
+    m_editor->setHdrEnabled(m_defaults.screenshotFormat == "heic");
+    m_editor->setSaveActionVisible(!m_defaults.save);
+    m_editor->setImage(image, false);
+    m_editor->setImageDisplayRect(m_editImageRect);
+    m_editor->show();
+    m_editor->raise();
+    m_editor->setFocus();
+    updateToolbarControlsForMode();
+    updateStatus();
+    update();
+    emit editingChanged(true);
+    traceTiming("overlay.editor_ready");
+    if (capturedImage.isNull()) queueHdrEditBase();
+    updateHdrEditBackdrop();
+    beginScrollCapture();
+}
+
+void CaptureOverlay::refreshInPlaceImage() {
+    if (!m_editing || !m_editor || m_hdrExportPending)
+        return;
+    auto image = m_scrollResult ? renderScrollResultImage() : renderResultImage();
+    if (image.isNull()) {
+        m_recordError = tr("Could not capture the selected target");
+        updateStatus();
+        return;
+    }
+    if (m_scrollResult) {
+        invalidateHdrEditBase();
+        m_editHdrBase = renderScrollResultImage(true);
+        applyHdrWatermark(m_editHdrBase, m_defaults);
+    } else queueHdrEditBase();
+    hyprcapture::ui::applyWatermark(image, m_defaults);
+    if (m_scrollResult)
+        m_editor->setScrollImage(image, m_scrollLayout, false);
+    else
+        m_editor->setImage(image, true);
+    m_editor->setImageDisplayRect(m_editImageRect);
+    m_recordError.clear();
+}
+
+void CaptureOverlay::leaveInPlaceEdit() {
+    if(m_scrolling) return;
+    if(m_scrollController) { auto* controller=m_scrollController; m_scrollController=nullptr; controller->disconnect(this); delete controller; }
+    if (!m_editing)
+        return;
+    m_editing = false;
+    invalidateHdrEditBase();
+    m_scrollResult = false;
+    m_scrollOriginal = {}; m_scrollFirstFrame = {};
+    m_scrollHdrOriginal = {}; m_scrollSdrImage = {};
+    m_toolbar->show();
+    m_editor->hide();
+    m_hdrEditBackdrop.reset();
+    m_hdrEditCompositeBackdrop.reset();
+    m_editedOutput = {};
+    m_fullscreenClientSelected = false;
+    m_dragStart = {};
+    m_dragEnd = {};
+    clearPendingConfirm();
+    m_recordError.clear();
+    updateToolbarControlsForMode();
+    updateStatus();
+    setFocus();
+    update();
+    emit editingChanged(false);
+}
+
+void CaptureOverlay::exportInPlaceImage() {
+    if (!m_editing || m_finishing || !m_editor || m_scrolling)
+        return;
+    if(m_scrollController) { auto* controller=m_scrollController; m_scrollController=nullptr; controller->disconnect(this); delete controller; }
+    if (m_defaults.screenshotFormat == "heic" && m_hdrBasePending) {
+        m_hdrExportPending = true;
+        traceTiming("overlay.hdr_export_wait");
+        // Freeze annotation and capture options for this deferred request.
+        hideOptionPopups();
+        m_editor->setEnabled(false);
+        m_toolbar->setEnabled(false);
+        // Cancel remains available through the overlay Escape handler.
+        return;
+    }
+    m_editedOutput = m_editor->resultImage();
+    m_editedHdrOutput = m_defaults.screenshotFormat == "heic" ? m_editor->resultImageOn(m_editHdrBase) : QImage{};
+    if (m_editedOutput.isNull())
+        return;
+    m_finishing = true;
+    m_editor->setEnabled(false);
+    m_toolbar->setEnabled(false);
+    renderAndSaveCapture();
+}
+
+void CaptureOverlay::pinInPlaceImage() {
+    if (!m_editing || m_finishing || !m_editor)
+        return;
+    const auto image = m_editor->resultImage();
+    const auto path = hyprcapture::ui::runtimeFile("pin", ".png");
+    if (image.isNull() || !hyprcapture::ui::savePrivatePng(image, path)) {
+        m_recordError = tr("Could not prepare the pinned image");
+        updateStatus();
+        return;
+    }
+    const auto socketPath = hyprcapture::ui::runtimeFile("pin-ready", ".socket");
+    auto* server = new QLocalServer(this);
+    server->setSocketOptions(QLocalServer::UserAccessOption);
+    if (socketPath.isEmpty() || !server->listen(socketPath)) {
+        server->deleteLater();
+        QFile::remove(path);
+        m_recordError = tr("Could not open the pinned image");
+        updateStatus();
+        return;
+    }
+    struct PendingPin {
+        bool finished = false;
+        QPointer<QLocalSocket> socket;
+        QByteArray reply;
+        QMetaObject::Connection destroyedConnection;
+    };
+    auto pending = std::make_shared<PendingPin>();
+    auto* timeout = new QTimer(this);
+    timeout->setSingleShot(true);
+    const auto complete = [this, pending, server, timeout, path, socketPath](bool success, const QString& error) {
+        if (pending->finished)
+            return;
+        pending->finished = true;
+        QObject::disconnect(pending->destroyedConnection);
+        timeout->stop();
+        server->close();
+        if (pending->socket) {
+            if (success) {
+                pending->socket->write("accepted\n");
+                pending->socket->flush();
+                success = pending->socket->bytesToWrite() == 0 || pending->socket->waitForBytesWritten(250);
+            }
+            if (!success)
+                pending->socket->abort();
+            pending->socket->deleteLater();
+        }
+        QFile::remove(path);
+        QFile::remove(socketPath);
+        server->deleteLater();
+        timeout->deleteLater();
+        m_finishing = false;
+        if (m_editor)
+            m_editor->setEnabled(true);
+        if (m_toolbar)
+            m_toolbar->setEnabled(true);
+        if (success) {
+            // Pin adds a desktop reference; it still completes the same
+            // configured save, clipboard and thumbnail pipeline as Confirm.
+            exportInPlaceImage();
+        } else {
+            m_recordError = error.isEmpty() ? tr("Could not open the pinned image") : error;
+            updateStatus();
+        }
+    };
+    pending->destroyedConnection = connect(this, &QObject::destroyed, qApp, [pending, path, socketPath] {
+        if (!pending->finished) {
+            pending->finished = true;
+            QFile::remove(path);
+            QFile::remove(socketPath);
+        }
+    });
+    connect(timeout, &QTimer::timeout, this, [complete] { complete(false, {}); });
+    connect(server, &QLocalServer::newConnection, this, [this, pending, server, complete] {
+        while (server->hasPendingConnections()) {
+            auto* socket = server->nextPendingConnection();
+            if (pending->finished || pending->socket) {
+                socket->abort();
+                socket->deleteLater();
+                continue;
+            }
+            pending->socket = socket;
+            const auto readReply = [pending, socket, complete] {
+                pending->reply += socket->readAll();
+                if (pending->reply.size() > 4096) {
+                    complete(false, {});
+                    return;
+                }
+                const auto newline = pending->reply.indexOf('\n');
+                if (newline < 0)
+                    return;
+                const auto reply = pending->reply.left(newline);
+                if (reply == "ready")
+                    complete(true, {});
+                else
+                    complete(false, reply.startsWith("error:") ? QString::fromUtf8(reply.mid(6)) : QString{});
+            };
+            connect(socket, &QLocalSocket::readyRead, this, readReply);
+            connect(socket, &QLocalSocket::disconnected, this, [pending, complete] {
+                if (!pending->finished)
+                    complete(false, {});
+            });
+            readReply();
+        }
+    });
+    m_recordError.clear();
+    m_finishing = true;
+    m_editor->setEnabled(false);
+    if (m_toolbar)
+        m_toolbar->setEnabled(false);
+    timeout->start(5000);
+    QStringList args{"--pin-image", path, "--pin-consume-source", "--pin-ready-socket", socketPath,
+                     "--language", qString(m_defaults.language)};
+    const QRect pinGeometry = localToDesktopLogicalRect(m_editor->canvasGeometry().translated(m_editor->pos()));
+    args << "--pin-geometry" << QStringLiteral("%1,%2,%3,%4")
+        .arg(pinGeometry.x()).arg(pinGeometry.y()).arg(pinGeometry.width()).arg(pinGeometry.height());
+    if (auto* screen = overlayScreen())
+        args << "--pin-monitor" << screen->name();
+    if (!QProcess::startDetached(QCoreApplication::applicationFilePath(), args)) {
+        complete(false, {});
+        return;
+    }
+}
+
+void CaptureOverlay::finishCapture() {
+    if (m_finishing || m_scrolling)
+        return;
+    if (m_defaults.inPlaceEditToolbar && !m_record && !m_recordActive) {
+        beginInPlaceEdit();
+        return;
+    }
+    m_finishing = true;
+
+    if (m_record) {
+        const QString requestPath = prepareRecordingRequest();
+        if (requestPath.isEmpty()) {
+            m_finishing = false;
+            updateStatus();
+            return;
+        }
+        emit finishingStarted();
+        launchRecordingCountdown(requestPath);
+        return;
+    }
+
+    emit finishingStarted();
+    if (m_mode == hyprcapture::CaptureMode::Window) {
+        traceTiming(QStringLiteral("fade_start"));
+        fadeOutThen([this] { renderAndSaveCapture(); });
+        return;
+    }
+
+    renderAndSaveCapture();
+}
+
+void CaptureOverlay::renderAndSaveCapture() {
+    QElapsedTimer renderTimer;
+    renderTimer.start();
+    const bool edited = !m_editedOutput.isNull();
+    auto image = edited ? m_editedOutput : renderResultImage();
+    traceTiming(QStringLiteral("render_result"), renderTimer.elapsed());
+    if (image.isNull()) {
+        m_finishing = false;
+        endHymissionCaptureInputSuppression();
+        if (isVisible())
+            updateStatus();
+        else
+            qApp->quit();
+        return;
+    }
+
+    QImage hdrImage;
+    if (m_defaults.screenshotFormat == "heic" && (m_defaults.save || m_defaults.clipboard || m_defaults.showThumbnail)) {
+        hdrImage = edited ? m_editedHdrOutput : renderResultImage(true);
+        if (hdrImage.isNull() || !hyprcapture::ui::hdrHeicAvailable()) {
+            m_finishing = false;
+            m_recordError = tr("HDR capture data or an encoder is unavailable. Choose SDR output.");
+            if (m_editor) m_editor->setEnabled(true);
+            if (m_toolbar) m_toolbar->setEnabled(true);
+            show(); updateStatus();
+            return;
+        }
+        if (!edited && !m_defaults.watermark.empty()) {
+            QImage layer(image.size(), QImage::Format_ARGB32_Premultiplied);
+            layer.fill(Qt::transparent);
+            hyprcapture::ui::applyWatermark(layer, m_defaults);
+            QPainter p(&hdrImage);
+            p.drawImage(QPoint(0, 0), hyprcapture::ui::sdrToHdr(layer));
+        }
+    }
+
+    QElapsedTimer watermarkTimer;
+    watermarkTimer.start();
+    if (!edited)
+        hyprcapture::ui::applyWatermark(image, m_defaults);
+    traceTiming(QStringLiteral("apply_watermark"), watermarkTimer.elapsed());
+
+    const auto filenameMetadata = resolvedFilenameMetadata();
+    const QString plannedOutputPath = plannedCaptureOutputPath(m_defaults,
+                                                               QString::fromStdString(filenameMetadata.windowClass),
+                                                               QString::fromStdString(filenameMetadata.windowTitle));
+    const QString targetPath = thumbnailTargetPath(m_defaults, plannedOutputPath);
+    const QString restoreClipboardPath =
+        (m_defaults.clipboard && m_defaults.showThumbnail) ? hyprcapture::ui::runtimeFile("clipboard", ".json") : QString{};
+    bool thumbnailStarted = false;
+    if (m_defaults.showThumbnail && m_defaults.save && !edited) {
+        const QString previewPath = saveThumbnailPreview(image);
+        if (!previewPath.isEmpty()) {
+            showThumbnail(previewPath, targetPath, restoreClipboardPath, hdrImage);
+            thumbnailStarted = true;
+        }
+    }
+
+    if (!m_fadeOutStarted && !edited) {
+        traceTiming(QStringLiteral("fade_start"));
+        fadeOutThen({});
+    }
+
+    hyprcapture::ui::ClipboardSnapshotData clipboardSnapshot;
+    if (m_defaults.clipboard && m_defaults.showThumbnail && !restoreClipboardPath.isEmpty()) {
+        QElapsedTimer snapshotTimer;
+        snapshotTimer.start();
+        clipboardSnapshot = hyprcapture::ui::captureClipboardSnapshotData();
+        traceTiming(QStringLiteral("clipboard_snapshot_collect"), snapshotTimer.elapsed());
+    }
+
+    saveImage(image,
+              hdrImage,
+              clipboardSnapshot,
+              m_defaults.save ? plannedOutputPath : targetPath,
+              restoreClipboardPath,
+              thumbnailStarted,
+              m_mode,
+              filenameMetadata);
+}
+
+void CaptureOverlay::saveImage(const QImage& image,
+                               const QImage& hdrImage,
+                               hyprcapture::ui::ClipboardSnapshotData clipboardSnapshot,
+                               const QString& outputPath,
+                               const QString& restoreClipboardPath,
+                               bool thumbnailStarted,
+                               hyprcapture::CaptureMode mode,
+                               hyprcapture::FilenameMetadata filenameMetadata) {
+    const auto defaults = m_defaults;
+    const bool edited = !m_editedOutput.isNull();
+    auto*      worker = QThread::create([this,
+                                         image,
+                                         hdrImage,
+                                         defaults,
+                                         edited,
+                                         outputPath,
+                                         restoreClipboardPath,
+                                         thumbnailStarted,
+                                         mode,
+                                         filenameMetadata,
+                                         clipboardSnapshot = std::move(clipboardSnapshot)] {
+        QElapsedTimer totalTimer;
+        totalTimer.start();
+        const CaptureOutputResult result = writeCaptureOutput(image, hdrImage, defaults, clipboardSnapshot, outputPath, restoreClipboardPath);
+        traceTiming(QStringLiteral("output_worker_total"), totalTimer.elapsed());
+        QMetaObject::invokeMethod(
+            this,
+            [this, image, hdrImage, result, thumbnailStarted, defaults, mode, filenameMetadata, edited, outputPath] {
+                traceTiming(QStringLiteral("output_ready"));
+                if ((defaults.save && result.savedPath != outputPath) || !result.saveError.isEmpty()) {
+                    m_finishing = false;
+                    if (m_editor) m_editor->setEnabled(true);
+                    if (m_toolbar) m_toolbar->setEnabled(true);
+                    m_recordError = result.saveError.isEmpty() ? tr("Could not save the image. Check the output directory and try again.") : result.saveError;
+                    show(); updateStatus();
+                    return;
+                }
+                const auto complete = [this, image, hdrImage, result, thumbnailStarted, defaults, mode, filenameMetadata] {
+                    endHymissionCaptureInputSuppression();
+                    if (result.clipboardRequested && !result.clipboardCopied &&
+                        !(defaults.screenshotFormat == "heic" && defaults.hdrClipboardFormat == "heic"))
+                        hyprcapture::ui::copyImageToClipboard(image);
+                    if (defaults.save)
+                        hyprcapture::ui::showScreenshotNotification(defaults, mode, filenameMetadata, result.savedPath);
+                    if (result.showThumbnail && !thumbnailStarted)
+                        showThumbnail(defaults.screenshotFormat == "heic" ? saveThumbnailPreview(image) : result.savedPath,
+                                      result.savedPath, result.restoreClipboardPath, hdrImage, image);
+                    qApp->quit();
+                };
+                if (edited) {
+                    emit finishingStarted();
+                    fadeOutThen(complete);
+                } else {
+                    complete();
+                }
+            },
+            Qt::QueuedConnection);
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->start();
+}
+
+void CaptureOverlay::showThumbnail(const QString& previewPath, const QString& targetPath, const QString& restoreClipboardPath, const QImage& hdrPreview, const QImage& fullImage) {
+    if (previewPath.isEmpty())
+        return;
+
+    QStringList args{"--thumbnail-window", previewPath, "--thumbnail-timeout-ms", QString::number(m_defaults.thumbnailTimeoutMs)};
+    const QString hdrPath = hyprcapture::ui::saveHdrThumbnail(hdrPreview);
+    if (!hdrPath.isEmpty()) args << "--thumbnail-hdr-preview" << hdrPath;
+    args << "--thumbnail-monitor" << qString(m_defaults.thumbnailMonitor);
+    args << "--language" << qString(m_defaults.language);
+    hyprcapture::CaptureSession saveSession;
+    saveSession.id = "thumbnail-save";
+    saveSession.defaults = m_defaults;
+    saveSession.defaults.mode = m_mode;
+    const auto metadata = resolvedFilenameMetadata();
+    saveSession.filenameMetadata = metadata;
+    // Expand metadata and time once, at capture time. Escape percent signs so
+    // strftime does not interpret a title containing percent on manual save.
+    QString filename = QString::fromStdString(hyprcapture::makeTimestampedFilename(
+        m_defaults.filenameTemplate, metadata.windowClass, metadata.windowTitle));
+    filename.replace("%", "%%");
+    saveSession.defaults.filenameTemplate = filename.toStdString();
+    const auto requestPath = hyprcapture::ui::runtimeFile("thumbnail-save", ".json");
+    QString fullSdrPath, fullHdrPath;
+    if (!m_defaults.save && m_defaults.screenshotFormat == "heic") {
+        fullSdrPath = hyprcapture::ui::runtimeFile("thumbnail-save-sdr", ".png");
+        if (!hyprcapture::ui::savePrivatePng(fullImage, fullSdrPath)) fullSdrPath.clear();
+        fullHdrPath = hyprcapture::ui::saveHdrThumbnail(hdrPreview, true);
+    }
+    if (writePrivateTextFile(requestPath, QByteArray::fromStdString(hyprcapture::encodeSessionJson(saveSession)))) {
+        args << "--thumbnail-save-session" << requestPath;
+        if (!fullSdrPath.isEmpty()) args << "--thumbnail-save-sdr" << fullSdrPath;
+        if (!fullHdrPath.isEmpty()) args << "--thumbnail-save-hdr" << fullHdrPath;
+    }
+    if (!targetPath.isEmpty()) {
+        args << "--thumbnail-target" << targetPath;
+        if (m_defaults.screenshotFormat == "heic" && m_defaults.hdrDragFormat == "sdr") {
+            const QString dragPath = sdrCaptureOutputPath(m_defaults, targetPath);
+            args << "--thumbnail-drag-target" << dragPath;
+        }
+    }
+    const QString deleteRoot = thumbnailDeleteRoot(m_defaults);
+    if (!deleteRoot.isEmpty())
+        args << "--thumbnail-delete-root" << deleteRoot;
+    if (!restoreClipboardPath.isEmpty())
+        args << "--restore-clipboard" << restoreClipboardPath;
+    if (!QProcess::startDetached(QCoreApplication::applicationFilePath(), args)) {
+        for (const auto& path : {hdrPath, requestPath, fullSdrPath, fullHdrPath})
+            if (!path.isEmpty()) QFile::remove(path);
+    }
+    traceTiming(QStringLiteral("thumbnail_started"));
+    endHymissionCaptureInputSuppression();
+}
+
+void CaptureOverlay::cancelCapture() {
+    invalidateHdrEditBase();
+    m_finishing = true;
+    if (m_editing && m_editor) {
+        m_editor->setEnabled(false);
+        m_toolbar->setEnabled(false);
+    }
+    emit finishingStarted();
+    fadeOutThen([this] {
+        endHymissionCaptureInputSuppression();
+        qApp->quit();
+    });
+}

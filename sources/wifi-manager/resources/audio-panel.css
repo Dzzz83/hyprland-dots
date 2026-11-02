@@ -1,0 +1,51 @@
+/* Match ~/.config/wifi-manager/style.css, with a warm accent for Sound. */
+window.background { background: transparent; }
+.audio-panel {
+    font-family: "JetBrainsMono Nerd Font";
+    color: #cdd6f4;
+    background: rgba(30, 30, 46, 0.88);
+    border: 1px solid rgba(88, 91, 112, 0.8);
+    border-radius: 20px;
+}
+.audio-header { padding: 18px 20px; }
+.header-title { font-size: 16px; font-weight: 700; }
+.header-icon, .percentage { color: #f9e2af; }
+.subtitle { color: #a6adc8; font-size: 11px; }
+.audio-section { padding: 16px 20px; }
+.section-title { font-size: 13px; font-weight: 600; }
+.percentage { font-size: 12px; }
+separator { min-height: 1px; background: rgba(88, 91, 112, 0.35); }
+button {
+    color: #cdd6f4;
+    background: rgba(88, 91, 112, 0.18);
+    border: none;
+    box-shadow: none;
+    text-shadow: none;
+    border-radius: 10px;
+}
+button:hover { background: rgba(88, 91, 112, 0.35); }
+button:focus-visible { outline: 2px solid #f9e2af; outline-offset: 2px; }
+.mute-button { min-width: 34px; min-height: 34px; padding: 0; }
+.mute-button.muted { background: rgba(243, 139, 168, 0.15); color: #f38ba8; }
+dropdown > button { padding: 8px 10px; }
+dropdown popover contents {
+    color: #cdd6f4;
+    background: #1e1e2e;
+    border: 1px solid #585b70;
+    border-radius: 12px;
+    padding: 4px;
+}
+dropdown popover row { border-radius: 8px; padding: 7px; }
+dropdown popover row:selected { color: #f9e2af; background: rgba(249, 226, 175, 0.12); }
+scale { padding: 10px 0; }
+scale trough { min-height: 6px; background: #45475a; border-radius: 99px; }
+scale highlight { background: #f9e2af; border-radius: 99px; }
+scale slider {
+    background: #f9e2af;
+    min-width: 14px; min-height: 14px;
+    border-radius: 50%; border: none; box-shadow: none;
+}
+.audio-status { color: #f38ba8; font-size: 11px; margin: 0 20px 12px; }
+.advanced-button { margin: 0 20px 18px; padding: 10px; font-size: 12px; }
+:disabled { opacity: 0.45; }
+tooltip { background: #1e1e2e; color: #cdd6f4; border: 1px solid #585b70; border-radius: 8px; }

@@ -1,0 +1,25 @@
+/* Keep upstream layout; match the desktop palette and font. */
+.wifi-panel {
+    font-family: "JetBrainsMono Nerd Font";
+    color: #cdd6f4;
+    background: rgba(30, 30, 46, 0.88);
+    border-color: rgba(88, 91, 112, 0.8);
+    border-radius: 20px;
+}
+.header-title, .ssid-label, .device-name, .password-title { color: #cdd6f4; }
+.status-label, .network-subtitle, .device-subtitle { color: #a6adc8; }
+.tab-button:checked {
+    color: #a6e3a1;
+    background: rgba(166, 227, 161, 0.12);
+}
+switch:checked { background: #a6e3a1; }
+.network-row.connected { background: rgba(166, 227, 161, 0.10); }
+.network-row.connected .ssid-label, .saved-icon, .signal-strong { color: #a6e3a1; }
+.signal-good { color: #f9e2af; }
+.signal-fair { color: #fab387; }
+.signal-weak { color: #f38ba8; }
+.connect-button { background: #a6e3a1; color: #1e1e2e; }
+.connect-button:hover { background: #b7ebb3; }
+.password-entry { color: #cdd6f4; background: #181825; }
+.password-entry:focus { border-color: #a6e3a1; box-shadow: none; }
+.network-popover, .device-popover { background: #1e1e2e; }

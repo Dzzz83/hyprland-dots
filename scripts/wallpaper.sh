@@ -1,5 +1,5 @@
 #!/bin/sh
-WALLPAPER_DIR="$HOME/Pictures/Wallpapers"
+WALLPAPER_DIR="$HOME/.config/hypr/assets/wallpapers"
 STATE_FILE="/tmp/last_wallpaper.txt"
 
 # Read the last chosen wallpaper

@@ -1,0 +1,18 @@
+[Added Associations]
+application/x-bat=micro.desktop;com.usebottles.bottles.desktop;
+application/vnd.microsoft.portable-executable=com.usebottles.bottles.desktop;wine.desktop;protontricks-launch.desktop;
+application/x-msdownload=com.usebottles.bottles.desktop;wine.desktop;protontricks-launch.desktop;
+application/x-powershell=org.kde.kate.desktop;
+application/x-zerosize=code.desktop;
+text/markdown=code.desktop;
+application/pdf=onlyoffice-desktopeditors.desktop;
+
+[Default Applications]
+application/vnd.openxmlformats-officedocument.wordprocessingml.document=onlyoffice-desktopeditors.desktop
+application/msword=onlyoffice-desktopeditors.desktop
+application/x-zerosize=code.desktop
+x-scheme-handler/unityhub=unityhub.desktop
+x-scheme-handler/codex=chatgpt.desktop
+x-scheme-handler/http=firefox.desktop
+x-scheme-handler/https=firefox.desktop
+text/html=firefox.desktop

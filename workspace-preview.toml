@@ -1,0 +1,18 @@
+[appearance]
+font = "JetBrainsMono Nerd Font 10"
+label_font = "JetBrainsMono Nerd Font Bold 13"
+card_padding = 20.0
+card_radius = 20.0
+max_card_width = 480.0
+max_card_height = 270.0
+window_label_position = "below"
+
+[colors]
+background = "#11111bd9"
+card = "#1e1e2ee0"
+selection = "#a6e3a1ff"
+label = "#cdd6f4ff"
+empty_label = "#7f849cff"
+window_label = "#bac2deff"
+active_window = "#00000000"
+

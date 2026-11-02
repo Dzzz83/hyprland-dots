@@ -1,0 +1,25 @@
+[repository]
+name = "HyprCapture"
+authors = ["wilf"]
+
+[hyprcapture]
+description = "Hyprland-only screenshot overlay"
+authors = ["wilf"]
+output = "build-hyprpm/libhyprcapture.so"
+build = [
+    "cmake -S . -B build-hyprpm -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF",
+    "cmake --build build-hyprpm --parallel 8",
+    "install -Dm755 build-hyprpm/hyprcapture-ui \"$HOME/.local/bin/hyprcapture-ui\"",
+    "install -Dm644 resources/licenses/libultrahdr-LICENSE.txt \"$HOME/.local/share/licenses/hyprcapture/libultrahdr-LICENSE.txt\"",
+    "install -Dm644 resources/licenses/libheif-COPYING.txt \"$HOME/.local/share/licenses/hyprcapture/libheif-COPYING.txt\"",
+    "install -Dm644 resources/licenses/libjpeg-turbo-LICENSE.md \"$HOME/.local/share/licenses/hyprcapture/libjpeg-turbo-LICENSE.md\"",
+    "install -Dm755 build-hyprpm/hyprcapture-aec \"$HOME/.local/bin/hyprcapture-aec\"",
+    "install -Dm755 build-hyprpm/libspa-aec-dtln.so \"$HOME/.local/lib/hyprcapture/libspa-aec-dtln.so\"",
+    "sh -c 'if test -f build-hyprpm/libhyprcapture-aec-openvino.so; then install -Dm755 build-hyprpm/libhyprcapture-aec-openvino.so \"$HOME/.local/lib/hyprcapture/libhyprcapture-aec-openvino.so\"; fi'",
+    "install -Dm755 scripts/build-aec-runtime.sh \"$HOME/.local/bin/hyprcapture-build-aec-runtime\"",
+    "install -Dm644 nix/aec-sources.json \"$HOME/.local/bin/hyprcapture-aec-sources.json\"",
+    "install -Dm644 scripts/prepare-aec-sources.cmake \"$HOME/.local/bin/hyprcapture-prepare-aec-sources.cmake\"",
+    "install -Dm755 scripts/install-aec.sh \"$HOME/.local/bin/hyprcapture-install-aec\"",
+    "install -Dm644 resources/aec/DTLN-LICENSE.txt \"$HOME/.local/share/licenses/hyprcapture/DTLN-LICENSE.txt\"",
+    "bash scripts/install-aec.sh"
+]
