@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Back up existing desktop files and install links to this checkout."""
 import argparse
+import configparser
 from datetime import datetime
+import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
@@ -48,6 +51,29 @@ def main():
             backup(target)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.symlink_to(source, target_is_directory=source.is_dir())
+
+    def write_setting_file(path, contents):
+        if path.exists() and path.read_text() == contents:
+            return
+        print(f'UPDATE {path}')
+        if not args.dry_run:
+            backup(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(contents)
+
+    def merge_ini(path, settings):
+        # Keep unrelated associations/preferences and preserve case-sensitive keys.
+        document = configparser.ConfigParser(interpolation=None, delimiters=('=',))
+        document.optionxform = str
+        if path.exists():
+            document.read(path)
+        for section, values in settings.items():
+            if not document.has_section(section):
+                document.add_section(section)
+            document[section].update(values)
+        output = io.StringIO()
+        document.write(output, space_around_delimiters=False)
+        write_setting_file(path, output.getvalue())
 
     if not args.dry_run:
         runtime.mkdir(parents=True, exist_ok=True)
@@ -98,6 +124,27 @@ def main():
         link(REPO / 'pavucontrol.ini', config / 'pavucontrol.ini')
     link(REPO / 'scripts/screen-record', home / '.local/bin/screen-record')
     link(REPO / 'assets/wallpapers', home / 'Desktop/Wallpapers')
+    link(REPO / 'assets/icons/default', home / '.icons/default')
+    link(REPO / 'desktop/org.freedesktop.FileManager1.service',
+         home / '.local/share/dbus-1/services/org.freedesktop.FileManager1.service')
+    merge_ini(config / 'mimeapps.list', {'Default Applications': {
+        'inode/directory': 'thunar.desktop;',
+        'application/x-directory': 'thunar.desktop;',
+    }})
+    merge_ini(config / 'kcminputrc', {'Mouse': {
+        'cursorTheme': 'breeze_cursors', 'cursorSize': '24',
+    }})
+    # Update an existing Xsettings daemon config without changing its other settings.
+    xsettings = config / 'xsettingsd/xsettingsd.conf'
+    if xsettings.exists():
+        contents = xsettings.read_text()
+        for key, value in [('Gtk/CursorThemeName', '"breeze_cursors"'),
+                           ('Gtk/CursorThemeSize', '24')]:
+            contents, count = re.subn(r'^' + re.escape(key) + r'[ \t]+[^\n]*$',
+                                      f'{key} {value}', contents, flags=re.MULTILINE)
+            if not count:
+                contents = contents.rstrip() + f'\n{key} {value}\n'
+        write_setting_file(xsettings, contents)
 
     # xfconfd owns and rewrites its XML. Import preferences instead of linking its database.
     thunar_xml = REPO / 'xfce4/xfconf/xfce-perchannel-xml/thunar.xml'

@@ -10,6 +10,7 @@ apply_themes() {
     ${SCHEMA} color-scheme "$SCHEME"
     ${SCHEMA} gtk-theme "$THEME"
     ${SCHEMA} icon-theme "$ICONS"
+    "$(dirname "$0")/setcursor.sh"
 }
 
 apply_themes

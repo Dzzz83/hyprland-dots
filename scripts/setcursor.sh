@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cursor_theme="${1:-breeze_cursors}"
-gsettings set org.gnome.desktop.interface cursor-theme "$cursor_theme"
+gsettings set org.gnome.desktop.interface cursor-theme breeze_cursors
+gsettings set org.gnome.desktop.interface cursor-size 24

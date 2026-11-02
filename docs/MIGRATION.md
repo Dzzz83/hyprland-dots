@@ -23,12 +23,22 @@ are preserved in the README.
 | `xfce4/.../thunar.xml` | Preferences imported through `xfconf-query`, not a linked live database |
 | `build/cargo/release/{wifi-manager,audio-panel}` | `~/.local/bin` links after building |
 | `scripts/screen-record` | `~/.local/bin/screen-record` |
+| `desktop/org.freedesktop.FileManager1.service` | Per-user D-Bus file-manager activation override for Thunar |
+
+Deployment merges Thunar folder associations into `~/.config/mimeapps.list`,
+preserving other application defaults. `Super + E` launches Thunar, and the
+per-user D-Bus override selects it for applications' “Show in folder” requests.
+Breeze cursors (`breeze_cursors`) at size 24 are configured in GTK, the Hyprland
+environment, KDE's `kcminputrc`, and any existing Xsettings daemon config.
+The default icon theme inherits Breeze cursors; GSettings is synchronized at
+session startup. Reopen existing apps or log in again if they cache old cursors.
 
 `gtk-3.0/bookmarks.template` and `swaync/config.json.in` generate ignored local
 files in `build/runtime`. Their installed names are links to those generated
 files. `config/local.lua` records the chosen machine profile and is ignored.
 Never commit secrets, cache, `fish_variables`, generated build output, compiled
-plugins, or screenshot/recording output.
+plugins, or personal screenshot/recording output. The reviewed README gallery
+under `docs/screenshots/` is included intentionally.
 
 ## Hardware and optional components
 
@@ -41,6 +51,9 @@ backlight exists. Lenovo fast/conservation charging requires compatible
 firmware, UPower support and `legion_cli`; it is not a universal laptop feature.
 
 Package-owned files under `/usr` are not moved. Install matching packages instead.
+The package list lives in `requirements.txt`; `install/packages-arch.txt` is a
+compatibility link. `scripts/install_archpkg.sh` is a legacy installer and is
+not used by the README's installation steps.
 Plasma Login Manager needs system-readable wallpapers before login; its optional
 installer is under `optional/login-wallpaper`. It is not applied by deployment.
 Optional MIME associations, autostart overrides and reminder units are examples

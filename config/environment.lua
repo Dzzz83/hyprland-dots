@@ -1,6 +1,7 @@
 -- config/environment.lua
 
--- Cursor size
+-- Breeze provides Xcursor images; Hyprland falls back to these for its cursor.
+hl.env("XCURSOR_THEME", "breeze_cursors")
 hl.env("XCURSOR_SIZE", "24")
 hl.env("HYPRCURSOR_SIZE", "24")
 
