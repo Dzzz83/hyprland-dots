@@ -1,6 +1,6 @@
 # Hyprland Dotfiles
 
-My daily CachyOS desktop, kept here so I can bring it to another machine.
+My CachyOS desktop with Hyprland.
 Hyprland with Lua config, Catppuccin Mocha, translucent panels, and a workspace for music, Cava, rain, and a clock.
 
 ![Workspace 9 dashboard](docs/screenshots/dashboard.png)
