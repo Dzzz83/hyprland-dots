@@ -15,7 +15,7 @@ hl.bind(mainMod .. " + J", hl.dsp.layout("togglesplit"))
 -- App Launchers
 hl.bind(mainMod .. " + Space", hl.dsp.exec_cmd("rofi -show drun"))
 hl.bind(mainMod .. " + E", hl.dsp.exec_cmd("thunar"))
-hl.bind(mainMod .. " + B", hl.dsp.exec_cmd("brave"))
+hl.bind(mainMod .. " + B", hl.dsp.exec_cmd("firefox"))
 hl.bind(mainMod .. " + V", hl.dsp.exec_cmd("~/.config/hypr/scripts/clipboard_launcher.sh"))
 hl.bind(mainMod .. " + Period", hl.dsp.exec_cmd("~/.config/hypr/scripts/emoji_launcher.sh"))
 hl.bind(mainMod .. " + SHIFT + W", hl.dsp.exec_cmd("~/.config/hypr/scripts/wallpaper_random.sh"))

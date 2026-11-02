@@ -47,7 +47,7 @@ Captured from this setup. Click an image to view it at full size.
 - Hyprspace and HyprCapture must be rebuilt when Hyprland changes.
 - HyprCapture also needs rebuilding after relevant Qt upgrades.
 - Lenovo charging controls require compatible firmware and `legion_cli`.
-- Brave, `btop`, and `rofi-emoji` are needed for their optional shortcuts.
+- `btop` and `rofi-emoji` are needed for their optional shortcuts.
 
 Package names and availability depend on your enabled repositories.
 Other distributions and a second physical machine have not been tested.
@@ -130,7 +130,7 @@ See [deployment and rollback](docs/MIGRATION.md) for the file mapping and recove
 | `Super + Return` | Ghostty |
 | `Super + Space` | Rofi app launcher |
 | `Super + E` | Thunar |
-| `Super + B` | Brave |
+| `Super + B` | Firefox |
 | `Super + V` | Clipboard history |
 | `Super + Period` | Emoji picker |
 | `Super + H` | Key hints |
