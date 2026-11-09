@@ -17,7 +17,7 @@ Hyprland with Lua config, Catppuccin Mocha, translucent panels, and a workspace 
 | Part | Choice |
 | --- | --- |
 | System | CachyOS / Arch Linux |
-| Compositor | Hyprland 0.57.0, Lua configuration |
+| Compositor | Hyprland 0.57.1, Lua configuration |
 | Terminal / shell | Ghostty / Fish |
 | Bar / launcher / notifications | Waybar / Rofi / SwayNC |
 | Files | Thunar with Papirus-Dark icons |
@@ -43,7 +43,7 @@ Captured from this setup. Click an image to view it at full size.
 
 [requirements.txt](requirements.txt) lists system packages, build tools, and optional input packages. It is an Arch package list, not a pip file.
 
-- Tested with **Hyprland 0.57.0** and matching installed headers.
+- Tested with **Hyprland 0.57.1** and matching installed headers.
 - Hyprspace and HyprCapture must be rebuilt when Hyprland changes.
 - HyprCapture also needs rebuilding after relevant Qt upgrades.
 - Lenovo charging controls require compatible firmware and `legion_cli`.
@@ -56,7 +56,9 @@ Other distributions and a second physical machine have not been tested.
 
 ### 1. Clone
 
-Keep the checkout: installed config locations will link back to it.
+Keep the checkout outside `~/.config/hypr`, since deployment backs up that
+location and links it to the checkout. This also works when the machine already
+has a Hyprland configuration.
 
 ```bash
 git clone https://github.com/Dzzz83/hyprland-dots.git ~/hyprland-dots
@@ -73,7 +75,9 @@ sudo pacman -Syu --needed $(grep -vE '^#|^$' requirements.txt)
 ```
 
 If a package is unavailable, check your repositories or AUR before continuing.
-Log into the matching Hyprland version before building the plugins.
+After an upgrade, log out of the old Hyprland session before building. Build
+from a TTY or from a session running the same Hyprland version as the installed
+package.
 
 ### 3. Build
 
@@ -82,6 +86,7 @@ install/build-native.sh all
 ```
 
 This builds the workspace plugin, capture tool, and Wi-Fi/audio panels.
+The first build needs network access to download the Rust dependencies.
 For later rebuilds, unload the affected plugin first; never replace a loaded library.
 
 ### 4. Deploy
@@ -95,6 +100,8 @@ python3 install/deploy.py --profile generic
 
 The deployer backs up existing files, then links the checkout at `~/.config/hypr`.
 Backups go to `~/.local/state/hypr-dots-backups/<timestamp>`.
+Run deployment inside a desktop session so `xfconf-query` can apply the Thunar
+preferences. From a TTY, add `--skip-thunar`, then rerun without it after login.
 
 | Option | Use |
 | --- | --- |
@@ -115,9 +122,13 @@ uv tool install git+https://github.com/rmaake1/terminal-rain-lightning.git
 
 ### 5. Start the desktop
 
-Log into Hyprland, or reload it and restart the affected desktop apps.
+Log out and back into Hyprland to start the new bar, panels and session services.
 The active entry point is `hyprland.lua`; `conf/` holds legacy configuration.
-See [deployment and rollback](docs/MIGRATION.md) for the file mapping and recovery steps.
+Run `hyprctl configerrors` and `hyprctl plugin list` after login. Hyprspace and
+HyprCapture should be listed, and the network and sound buttons should open
+their panels. Per-app volume is under **Sound → Advanced settings → Playback**.
+See [deployment and rollback](docs/MIGRATION.md) for the file mapping, optional
+Steam menu, GTK archive picker and recovery steps.
 
 ## Shortcuts
 

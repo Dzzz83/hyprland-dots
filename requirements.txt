@@ -10,11 +10,15 @@ wlogout
 ghostty
 thunar
 thunar-volman
+thunar-archive-plugin
 xfconf
 gvfs
 gvfs-mtp
-file-roller
+engrampa
+7zip
+unrar
 firefox
+xorg-xwayland
 cava
 tty-clock
 awww
@@ -43,6 +47,7 @@ xdg-utils
 uv
 python
 python-gobject
+gsettings-desktop-schemas
 libnm
 upower
 gtk4-layer-shell

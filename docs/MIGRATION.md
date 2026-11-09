@@ -28,6 +28,15 @@ are preserved in the README.
 Deployment merges Thunar folder associations into `~/.config/mimeapps.list`,
 preserving other application defaults. `Super + E` launches Thunar, and the
 per-user D-Bus override selects it for applications' “Show in folder” requests.
+To use Engrampa's GTK extraction dialog in Thunar, set it as the default for
+common archives on the new machine after installing the package list:
+
+```bash
+xdg-mime default engrampa.desktop application/zip application/x-7z-compressed \
+  application/vnd.rar application/x-rar application/x-tar application/x-compressed-tar \
+  application/x-bzip-compressed-tar application/x-xz-compressed-tar application/x-zstd-compressed-tar
+```
+
 Breeze cursors (`breeze_cursors`) at size 24 are configured in GTK, the Hyprland
 environment, KDE's `kcminputrc`, and any existing Xsettings daemon config.
 The default icon theme inherits Breeze cursors; GSettings is synchronized at
@@ -49,6 +58,8 @@ another machine before enabling it. Backlight selection is detected or can be
 specified with `--backlight DEVICE`; no brightness widget is generated when no
 backlight exists. Lenovo fast/conservation charging requires compatible
 firmware, UPower support and `legion_cli`; it is not a universal laptop feature.
+Switching power profiles requires `powerprofilesctl` and a compatible power
+profiles service. Use the service already configured on your machine.
 
 Package-owned files under `/usr` are not moved. Install matching packages instead.
 The package list lives in `requirements.txt`; `install/packages-arch.txt` is a
@@ -64,7 +75,7 @@ of the active Hyprland desktop.
 ## Building and updates
 
 Native plugins must match the running Hyprland revision and dependency ABI.
-This source snapshot was verified with Hyprland 0.57.0. The capture helper also
+This source snapshot was verified with Hyprland 0.57.1. The capture helper also
 uses Qt private headers, so rebuild after Qt upgrades. Start with matching
 installed/running Hyprland versions. Build before the first config reload.
 
@@ -77,10 +88,11 @@ The capture source includes a local nlohmann/json 3.12.0 header-only dependency
 and its license. Rust uses Cargo.lock; rain uses the upstream installation
 recipe. Build caches and third-party compiler outputs are intentionally absent.
 
-The optional Steam menu uses a local Waybar build with tray filtering. To
-rebuild it from the tested revision, run these commands from the checkout:
+The optional Steam menu uses a local Waybar build with tray filtering. Install
+the additional build tools and build the tested revision from the checkout:
 
 ```bash
+sudo pacman -S --needed meson ninja glib2-devel wayland-protocols
 git init build/waybar-steam-source
 git -C build/waybar-steam-source fetch --depth 1 https://github.com/Alexays/Waybar.git 567368cbd3ef0fc02ffdcb7085e1618014432aab
 git -C build/waybar-steam-source checkout --detach FETCH_HEAD
@@ -92,6 +104,11 @@ install -D -m 755 build/waybar-steam/waybar build/runtime/waybar-steam
 At login, Hyprland uses that binary with `waybar/steam.jsonc` when available.
 The Steam button offers Library, Store and Friends. Without the local binary,
 Hyprland starts the packaged Waybar with its standard tray configuration.
+
+On the second machine, join Wi-Fi, pair Bluetooth devices, and sign into apps
+using their normal setup. Account data, audio levels and saved Bluetooth bonds
+are machine state. Use the existing WirePlumber and NetworkManager services on
+CachyOS, and check that `bluetooth.service` is running if you use Bluetooth.
 
 ## Rollback
 
