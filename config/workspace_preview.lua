@@ -38,10 +38,28 @@ local function has_other_modifier_down()
     return false
 end
 
+local function is_game_focused()
+    local window = hl.get_active_window()
+    if not window then
+        return false
+    end
+    -- Steam games expose an app ID as their class, including windowed games.
+    for _, class in ipairs({ window.class, window.initial_class }) do
+        if class:lower():match("^steam_app_%d+$") then
+            return true
+        end
+    end
+    -- Also cover games advertising their content type and WuWa's own title.
+    return window.content_type == "game" or window.title:lower() == "wuthering waves"
+end
+
 -- A repeat timer can be disabled and restarted; native one-shot timers expire.
 local hold_timer
 hold_timer = hl.timer(function()
     hold_timer:set_enabled(false)
+    if is_game_focused() then
+        is_canceled = true
+    end
     if (pressed[64] or pressed[108]) and not pressed[23] and not is_canceled then
         local overview = hl.plugin.overview
         if overview and overview.begin_selection then
@@ -71,7 +89,7 @@ hl.on("input.keyboard.key", function(key, _, state)
     end
 
     if state == 1 and alt_keys[key] and not was_alt_down and not is_preview_active and not is_canceled then
-        if has_other_modifier_down() then
+        if has_other_modifier_down() or is_game_focused() then
             is_canceled = true
         elseif not pressed[23] then
             hold_timer:set_enabled(true)

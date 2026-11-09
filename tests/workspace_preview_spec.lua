@@ -8,7 +8,9 @@ local function new_preview()
     local did_selection_move = true
     local can_begin_selection = true
     local other_modifier_down = false
+    local active_window
     local api = {
+        get_active_window = function() return active_window end,
         on = function(event, callback) callbacks[event] = callback end,
         is_key_down = function() return other_modifier_down end,
         dsp = {
@@ -70,6 +72,7 @@ local function new_preview()
             end
         end,
         set_other_modifier = function(value) other_modifier_down = value end,
+        set_active_window = function(value) active_window = value end,
     }
 end
 
@@ -262,4 +265,40 @@ preview.key(64, 0)
 assert_commands(preview, "show")
 assert(#preview.focuses == 0)
 
-print("Alt hold, Tab reset, preview navigation, Super navigation, cancellation, reload, and fallback checks passed.")
+-- Games suppress the whole Alt hold, even after Alt+Tab or a focus change.
+for _, window in ipairs({
+    { class = "steam_app_12345", initial_class = "", title = "A game" },
+    { class = "changed", initial_class = "steam_app_12345", title = "A game" },
+    { class = "game", initial_class = "game", title = "A game", content_type = "game" },
+    { class = "wine", initial_class = "wine", title = "Wuthering Waves" },
+}) do
+    for _, during_countdown in ipairs({ false, true }) do
+        preview = new_preview()
+        if not during_countdown then preview.set_active_window(window) end
+        preview.key(64, 1)
+        preview.advance(500)
+        preview.set_active_window(window)
+        preview.advance(500)
+        assert_commands(preview, "")
+        preview.set_active_window(nil)
+        preview.key(23, 1)
+        preview.key(23, 0)
+        preview.advance(1000)
+        assert_commands(preview, "")
+        preview.key(64, 0)
+        preview.key(64, 1)
+        preview.advance(1000)
+        assert_commands(preview, "show")
+    end
+end
+
+-- Steam's launcher and normal desktop windows retain the shortcut.
+for _, class in ipairs({ "steam", "firefox", "steam_app_invalid" }) do
+    preview = new_preview()
+    preview.set_active_window({ class = class, initial_class = class, title = "Desktop" })
+    preview.key(64, 1)
+    preview.advance(1000)
+    assert_commands(preview, "show")
+end
+
+print("Alt hold, game exclusion, Tab reset, preview navigation, Super navigation, cancellation, reload, and fallback checks passed.")

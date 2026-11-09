@@ -111,6 +111,10 @@ plugin with a centered, rounded horizontal strip of sharp desktop previews over
 a blurred, dimmed desktop. It floats without resizing windows. Catppuccin Mocha
 styling is in `config/workspace_overview.lua`. Empty workspaces are excluded,
 including persistent ones. The one-second delay starts on the first Alt press.
+The hold shortcut is disabled while a Steam game (class `steam_app_<id>`), a
+window reporting game content, or a window titled `Wuthering Waves` is focused.
+If a game is focused when Alt is pressed or the delay expires, release Alt
+before using the shortcut again on the desktop. The Steam launcher is unaffected.
 Pressing Tab resets it; a fresh countdown starts after Tab is released while Alt
 remains held. Alt+Tab still toggles the two most recent workspaces, closing any
 open preview first. Releasing both Alt keys cancels the countdown. Arrow keys do
