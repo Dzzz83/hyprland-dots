@@ -2,7 +2,14 @@
 
 hl.on("hyprland.start", function()
     -- Core Bars and System Indicators
-    hl.exec_cmd("waybar")
+    -- The local Waybar build can hide Steam's original tray menu.
+    hl.exec_cmd([[
+        waybar_dir="$HOME/.config/hypr"
+        if [ -x "$waybar_dir/build/runtime/waybar-steam" ]; then
+            exec "$waybar_dir/build/runtime/waybar-steam" -c "$waybar_dir/waybar/steam.jsonc"
+        fi
+        exec waybar
+    ]])
     hl.exec_cmd("python3 $HOME/.config/hypr/scripts/proton-tray-watch.py")
     hl.exec_cmd("swaync")
     -- Use the tested rendering path for Lenovo's system-authentication dialog.

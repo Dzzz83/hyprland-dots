@@ -50,6 +50,7 @@ tooltip {
 
 #custom-power,
 #tray,
+#custom-steam,
 #bluetooth,
 #custom-network,
 #custom-battery,
@@ -61,12 +62,17 @@ tooltip {
 }
 
 #custom-power:hover,
+#custom-steam:hover,
 #bluetooth:hover,
 #custom-network:hover,
 #custom-battery:hover,
 #pulseaudio:hover,
 #clock:hover {
     background-color: alpha(@select, 0.6);
+}
+
+#custom-steam {
+    font-size: 18px;
 }
 
 #bluetooth {

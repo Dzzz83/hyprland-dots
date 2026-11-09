@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <object class="GtkMenu" id="menu">
+    <child>
+      <object class="GtkMenuItem" id="library">
+        <property name="visible">True</property>
+        <property name="label">Library</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="store">
+        <property name="visible">True</property>
+        <property name="label">Store</property>
+      </object>
+    </child>
+    <child>
+      <object class="GtkMenuItem" id="friends">
+        <property name="visible">True</property>
+        <property name="label">Friends</property>
+      </object>
+    </child>
+  </object>
+</interface>

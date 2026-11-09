@@ -77,6 +77,22 @@ The capture source includes a local nlohmann/json 3.12.0 header-only dependency
 and its license. Rust uses Cargo.lock; rain uses the upstream installation
 recipe. Build caches and third-party compiler outputs are intentionally absent.
 
+The optional Steam menu uses a local Waybar build with tray filtering. To
+rebuild it from the tested revision, run these commands from the checkout:
+
+```bash
+git init build/waybar-steam-source
+git -C build/waybar-steam-source fetch --depth 1 https://github.com/Alexays/Waybar.git 567368cbd3ef0fc02ffdcb7085e1618014432aab
+git -C build/waybar-steam-source checkout --detach FETCH_HEAD
+meson setup build/waybar-steam build/waybar-steam-source --buildtype=release --wrap-mode=nodownload -Ddbusmenu-gtk=enabled -Dpulseaudio=enabled -Dtests=disabled -Dman-pages=disabled
+meson compile -C build/waybar-steam -j 5
+install -D -m 755 build/waybar-steam/waybar build/runtime/waybar-steam
+```
+
+At login, Hyprland uses that binary with `waybar/steam.jsonc` when available.
+The Steam button offers Library, Store and Friends. Without the local binary,
+Hyprland starts the packaged Waybar with its standard tray configuration.
+
 ## Rollback
 
 Backups preserve each replaced file at its original path relative to HOME.

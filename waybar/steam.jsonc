@@ -1,0 +1,18 @@
+{
+    "include": "$HOME/.config/hypr/waybar/config",
+    "modules-right": ["tray", "custom/steam", "custom/network", "custom/battery", "pulseaudio", "clock"],
+    "tray": {
+        "ignore-list": ["/org/ayatana/NotificationItem/steam"]
+    },
+    "custom/steam": {
+        "format": "",
+        "tooltip-format": "Steam",
+        "menu": "on-click",
+        "menu-file": "$HOME/.config/hypr/waybar/steam-menu.ui",
+        "menu-actions": {
+            "library": "steam steam://open/games",
+            "store": "steam steam://store",
+            "friends": "steam steam://open/friends"
+        }
+    }
+}
