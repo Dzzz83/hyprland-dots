@@ -125,9 +125,9 @@ impl BluetoothManager {
     // Device enumeration
     // ========================================================================
 
-    /// Get a list of all known Bluetooth devices (paired + discovered).
+    /// Get paired and connected devices, plus discoveries with a name.
     ///
-    /// Devices are sorted: connected first, then paired, then by name.
+    /// Devices are sorted by paired status, connection status, then name.
     pub async fn get_devices(&self) -> zbus::Result<Vec<BluetoothDevice>> {
         let obj_manager = BluezObjectManagerProxy::new(&self.connection).await?;
         let objects = obj_manager.get_managed_objects().await?;
@@ -145,8 +145,9 @@ impl BluetoothManager {
                 continue;
             };
 
-            let device = self.parse_device_properties(path_str, props);
-            devices.push(device);
+            if let Some(device) = Self::parse_device_properties(path_str, props) {
+                devices.push(device);
+            }
         }
 
         devices.sort_by_cached_key(|a| a.sort_key());
@@ -259,12 +260,11 @@ impl BluetoothManager {
             .await
     }
 
-    /// Parse a Device1's properties from ObjectManager into a BluetoothDevice.
+    /// Parse a Device1 for the panel, omitting unnamed discoveries.
     fn parse_device_properties(
-        &self,
         path: &str,
         props: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
-    ) -> BluetoothDevice {
+    ) -> Option<BluetoothDevice> {
         let address = props
             .get("Address")
             .and_then(|v| <String>::try_from(v.clone()).ok())
@@ -295,36 +295,75 @@ impl BluetoothManager {
             .and_then(|v| <bool>::try_from(v.clone()).ok())
             .unwrap_or(false);
 
-        let trusted = props
-            .get("Trusted")
-            .and_then(|v| <bool>::try_from(v.clone()).ok())
-            .unwrap_or(false);
-
         let rssi = props
             .get("RSSI")
             .and_then(|v| <i16>::try_from(v.clone()).ok())
             .unwrap_or(0);
 
-        // Display name: prefer alias, then name, then address
-        let display_name = if !alias.is_empty() {
-            alias
-        } else if !name.is_empty() {
-            name
-        } else {
-            address.clone()
+        // BlueZ can use a dash-separated address as the default alias.
+        let friendly_name = [alias.trim(), name.trim()].into_iter().find(|label| {
+            !label.is_empty() && !label.replace('-', ":").eq_ignore_ascii_case(&address)
+        });
+        let display_name = match friendly_name {
+            Some(label) => label.to_owned(),
+            None if paired || connected => address.clone(),
+            None => return None,
         };
 
         let category = DeviceCategory::from_icon_hint(&icon_hint);
 
-        BluetoothDevice {
+        Some(BluetoothDevice {
             address,
             display_name,
             category,
             paired,
             connected,
-            trusted,
             rssi,
             device_path: path.to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BluetoothManager;
+    use std::collections::HashMap;
+    use zbus::zvariant::{OwnedValue, Str};
+
+    #[test]
+    fn address_only_devices_are_listed_only_if_paired_or_connected() {
+        let address = "AA:BB:CC:DD:EE:FF";
+        for alias in ["", address, "aa-bb-cc-dd-ee-ff"] {
+            let mut props = HashMap::from([
+                ("Address".to_owned(), OwnedValue::from(Str::from(address))),
+                ("Alias".to_owned(), OwnedValue::from(Str::from(alias))),
+            ]);
+            assert!(BluetoothManager::parse_device_properties("/device", &props).is_none());
+
+            for property in ["Paired", "Connected"] {
+                props.insert(property.to_owned(), OwnedValue::from(true));
+                let device =
+                    BluetoothManager::parse_device_properties("/device", &props).unwrap();
+                assert_eq!(device.display_name, address);
+                props.remove(property);
+            }
         }
+    }
+
+    #[test]
+    fn an_address_alias_does_not_hide_a_real_name() {
+        let props = HashMap::from([
+            (
+                "Address".to_owned(),
+                OwnedValue::from(Str::from("AA:BB:CC:DD:EE:FF")),
+            ),
+            (
+                "Alias".to_owned(),
+                OwnedValue::from(Str::from("AA-BB-CC-DD-EE-FF")),
+            ),
+            ("Name".to_owned(), OwnedValue::from(Str::from("Headphones"))),
+        ]);
+        let device = BluetoothManager::parse_device_properties("/device", &props).unwrap();
+        assert_eq!(device.display_name, "Headphones");
     }
 }

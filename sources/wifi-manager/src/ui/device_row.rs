@@ -78,13 +78,12 @@ pub fn build_device_row(
     hbox.append(&icon_label);
     hbox.append(&info_vbox);
 
-    // Trusted icon (if trusted but not connected)
-    if device.trusted && !device.connected {
-        let trusted_label = Label::new(Some("󰄬"));
-        trusted_label.add_css_class("trusted-icon");
-        trusted_label.set_valign(gtk4::Align::Center);
-        trusted_label.set_tooltip_text(Some("Trusted"));
-        hbox.append(&trusted_label);
+    if device.connected {
+        let connected_icon = Label::new(Some("󰄬"));
+        connected_icon.add_css_class("device-connected-icon");
+        connected_icon.set_valign(gtk4::Align::Center);
+        connected_icon.set_tooltip_text(Some("Connected"));
+        hbox.append(&connected_icon);
     }
 
     // Menu button (for paired or connected devices)
@@ -136,7 +135,7 @@ fn device_subtitle(device: &BluetoothDevice, pending: Option<&str>) -> String {
     if device.connected {
         parts.push("Connected".to_string());
     } else if device.paired {
-        parts.push("Paired".to_string());
+        parts.push("Paired · Not connected".to_string());
     }
 
     if let Some(pending) = pending {

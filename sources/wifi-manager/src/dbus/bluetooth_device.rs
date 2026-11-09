@@ -83,8 +83,6 @@ pub struct BluetoothDevice {
     pub paired: bool,
     /// Whether this device is currently connected.
     pub connected: bool,
-    /// Whether this device is trusted (auto-connect).
-    pub trusted: bool,
     /// RSSI signal strength (only valid during discovery, 0 otherwise).
     pub rssi: i16,
     /// D-Bus object path for this device.

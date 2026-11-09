@@ -71,6 +71,8 @@ Hover for the Wi-Fi network and VPN connection name; clicking opens the
 Wi-Fi / Bluetooth popup. `scripts/waybar-network.py` listens for NetworkManager
 D-Bus changes through Python GObject / libnm, with no periodic polling. Dummy
 kill-switch and bridge interfaces do not count as VPN or physical connections.
+The Bluetooth tab hides discoveries that only report an address, keeps paired
+devices visible, and shows a green check only while a device is connected.
 
 Proton's own application tray icon remains separate from the network indicator.
 `scripts/proton-tray-watch.py` starts at login and listens for tray-host and
