@@ -50,6 +50,16 @@ pub struct PanelWidgets {
     pub content_stack: Stack,
 }
 
+pub fn set_panel_visible(window: &ApplicationWindow, visible: bool) {
+    if visible {
+        window.set_keyboard_mode(KeyboardMode::Exclusive);
+        window.present();
+    } else {
+        window.set_visible(false);
+        window.set_keyboard_mode(KeyboardMode::None);
+    }
+}
+
 /// Build the main floating panel window with all UI components.
 pub fn build_window(app: &Application) -> PanelWidgets {
     let config = Config::load();

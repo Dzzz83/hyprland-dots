@@ -4,7 +4,7 @@
 //! - `scanning` — scan-on-show, initial scan, scan button
 //! - `connection` — WiFi toggle, network click, password dialog
 //! - `live_updates` — D-Bus signal subscriptions for real-time changes
-//! - `shortcuts` — Escape key, reload polling
+//! - `shortcuts` — Escape key and reload action
 
 mod bluetooth;
 mod bt_live_updates;
@@ -16,6 +16,7 @@ mod shortcuts;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use gtk4::glib;
 use gtk4::prelude::*;
@@ -67,14 +68,8 @@ struct AppState {
 
 
 
-/// Set up all event handlers, kick off the initial scan, start live updates,
-/// and wire scan-on-show polling.
-pub fn setup(
-    widgets: &PanelWidgets,
-    wifi: WifiManager,
-    scan_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    panel_state: crate::daemon::PanelState,
-) {
+/// Set up the controller and start the initial scan and live updates.
+pub fn setup(widgets: &PanelWidgets, wifi: WifiManager, panel_visible: Arc<AtomicBool>) {
     let state = Rc::new(RefCell::new(AppState {
         wifi,
         networks: Vec::new(),
@@ -98,25 +93,15 @@ pub fn setup(
     connection::setup_wifi_toggle(widgets, Rc::clone(&state));
     connection::setup_network_click(widgets, Rc::clone(&state));
     connection::setup_password_actions(widgets, Rc::clone(&state));
-    live_updates::setup_live_updates(widgets, Rc::clone(&state), panel_state.visible.clone());
-    scanning::setup_scan_on_show(widgets, Rc::clone(&state), scan_requested);
+    live_updates::setup_live_updates(widgets, Rc::clone(&state), panel_visible);
     bluetooth::setup_bluetooth(widgets, Rc::clone(&state));
     bt_live_updates::setup_bt_live_updates(widgets, Rc::clone(&state));
     setup_scan_button_dispatch(widgets, Rc::clone(&state));
     setup_wifi_tab_sync(widgets, Rc::clone(&state));
-    if widgets.wifi_tab.is_active() {
-        scanning::start_wifi_auto_scan(
-            Rc::clone(&state),
-            widgets.wifi_tab.clone(),
-            widgets.network_list_box.clone(),
-            widgets.status_label.clone(),
-        );
-    }
-    let reload_requested = panel_state.reload_requested.clone();
-    shortcuts::setup_dismissal(widgets, panel_state.clone());
-    shortcuts::setup_reload_on_request(widgets, Rc::clone(&state), reload_requested);
+    shortcuts::setup_dismissal(widgets);
+    shortcuts::setup_reload_on_request(widgets, Rc::clone(&state));
     scanning::setup_initial_state(widgets, Rc::clone(&state));
-    setup_visibility_pause(widgets, Rc::clone(&state), panel_state);
+    setup_visibility_scans(widgets, state);
 }
 
 /// Clone the WifiManager out of the RefCell (avoids holding borrow across await).
@@ -273,97 +258,60 @@ fn setup_wifi_tab_sync(widgets: &PanelWidgets, state: Rc<RefCell<AppState>>) {
     });
 }
 
-/// Stop background scans when the panel is hidden; resume when shown.
-fn setup_visibility_pause(
-    widgets: &PanelWidgets,
-    state: Rc<RefCell<AppState>>,
-    panel_state: crate::daemon::PanelState,
-) {
-    use std::sync::atomic::Ordering;
-
-    let last_visible = Rc::new(RefCell::new(panel_state.visible.load(Ordering::Relaxed)));
+/// Scan the selected tab while visible and help NetworkManager reconnect when hidden.
+fn setup_visibility_scans(widgets: &PanelWidgets, state: Rc<RefCell<AppState>>) {
     let wifi_tab = widgets.wifi_tab.clone();
     let bt_tab = widgets.bt_tab.clone();
     let wifi_list_box = widgets.network_list_box.clone();
     let bt_list_box = widgets.bt_list_box.clone();
     let status = widgets.status_label.clone();
 
-    glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-        let visible = panel_state.visible.load(Ordering::Relaxed);
-        let mut last = last_visible.borrow_mut();
-        if *last != visible {
-            *last = visible;
-            if !visible {
-                scanning::stop_wifi_auto_scan(&state);
-                // Stop bg reconnect too — panel is opening so fast loop takes over.
-                scanning::stop_wifi_bg_reconnect(&state);
-                bluetooth::stop_bt_background_tasks(&state);
-                let state_bt = Rc::clone(&state);
+    if !widgets.window.is_visible() {
+        scanning::reconnect_when_hidden(Rc::clone(&state), &widgets.window);
+    }
+    let update_scans = move |window: &gtk4::ApplicationWindow| {
+        if window.is_visible() {
+            scanning::stop_wifi_bg_reconnect(&state);
+            if wifi_tab.is_active() {
+                scanning::start_wifi_auto_scan(
+                    Rc::clone(&state),
+                    wifi_tab.clone(),
+                    wifi_list_box.clone(),
+                    status.clone(),
+                );
+            }
+            if bt_tab.is_active() {
+                let state = Rc::clone(&state);
+                let bt_tab = bt_tab.clone();
+                let bt_list_box = bt_list_box.clone();
+                let status = status.clone();
+                let window = window.downgrade();
                 glib::spawn_future_local(async move {
-                    bluetooth::stop_bt_discovery(state_bt).await;
-                });
-
-                // If Wi-Fi is currently disconnected, start the slow background
-                // reconnect loop so NM can find and join a saved network.
-                let state_bg = Rc::clone(&state);
-                glib::spawn_future_local(async move {
-                    let wifi = get_wifi(&state_bg);
-                    // NM device state 100 = Activated (connected).
-                    // We check by asking for the active connection path;
-                    // a path of "/" means no active connection.
-                    let is_connected = match wifi.connection().call_method(
-                        Some("org.freedesktop.NetworkManager"),
-                        wifi.wifi_device_path(),
-                        Some("org.freedesktop.DBus.Properties"),
-                        "Get",
-                        &(
-                            "org.freedesktop.NetworkManager.Device",
-                            "ActiveConnection",
-                        ),
-                    ).await {
-                        Ok(msg) => {
-                            let path: zbus::zvariant::OwnedObjectPath =
-                                msg.body().deserialize().unwrap_or_else(|_| {
-                                    zbus::zvariant::OwnedObjectPath::try_from("/").unwrap()
-                                });
-                            path.as_str() != "/"
-                        }
-                        Err(_) => false,
-                    };
-
-                    if !is_connected {
-                        log::info!("Panel hidden while disconnected — starting bg reconnect loop");
-                        scanning::start_wifi_bg_reconnect(state_bg);
-                    } else {
-                        log::info!("Panel hidden while connected — no bg reconnect needed");
-                    }
-                });
-            } else {
-                if wifi_tab.is_active() {
-                    scanning::start_wifi_auto_scan(
-                        Rc::clone(&state),
-                        wifi_tab.clone(),
-                        wifi_list_box.clone(),
-                        status.clone(),
-                    );
-                }
-                if bt_tab.is_active() {
-                    let state_bt = Rc::clone(&state);
-                    let bt_tab = bt_tab.clone();
-                    let bt_list_box = bt_list_box.clone();
-                    let status = status.clone();
-                    glib::spawn_future_local(async move {
+                    if let Some(window) = window.upgrade().filter(|window| window.is_visible()) {
                         bluetooth::resume_bt_background_tasks(
-                            state_bt,
-                            bt_tab,
-                            bt_list_box,
-                            status,
+                            state, &window, bt_tab, bt_list_box, status,
                         )
                         .await;
-                    });
-                }
+                    }
+                });
             }
+            return;
         }
-        glib::ControlFlow::Continue
-    });
+
+        scanning::stop_wifi_auto_scan(&state);
+        bluetooth::stop_bt_background_tasks(&state);
+        let bt_state = Rc::clone(&state);
+        let bt_window = window.downgrade();
+        glib::spawn_future_local(async move {
+            if bt_window.upgrade().is_some_and(|window| !window.is_visible()) {
+                bluetooth::stop_bt_discovery(bt_state).await;
+            }
+        });
+
+        scanning::reconnect_when_hidden(Rc::clone(&state), window);
+    };
+    if widgets.window.is_visible() {
+        update_scans(&widgets.window);
+    }
+    widgets.window.connect_visible_notify(update_scans);
 }

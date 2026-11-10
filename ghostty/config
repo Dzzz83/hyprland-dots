@@ -1,6 +1,9 @@
 font-family = JetBrainsMono Nerd Font
 font-size = 13
 
+# Keep idle terminal event loops out of Linux I/O wait accounting.
+async-backend = epoll
+
 theme = catppuccin-mocha
 background-opacity = 0.8
 

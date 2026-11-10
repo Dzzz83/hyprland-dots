@@ -65,6 +65,14 @@ impl WifiManager {
         Ok(())
     }
 
+    pub async fn has_active_connection(&self) -> zbus::Result<bool> {
+        let device = DeviceProxy::builder(&self.connection)
+            .path(self.wifi_device_path.clone())?
+            .build()
+            .await?;
+        Ok(device.active_connection().await?.as_str() != "/")
+    }
+
     /// Get a list of available networks (deduplicated by SSID).
     pub async fn get_networks(&self) -> zbus::Result<Vec<Network>> {
         let wireless = WirelessProxy::builder(&self.connection)

@@ -535,6 +535,7 @@ pub(super) fn stop_bt_background_tasks(state: &Rc<RefCell<AppState>>) {
 
 pub(super) async fn resume_bt_background_tasks(
     state: Rc<RefCell<AppState>>,
+    window: &gtk4::ApplicationWindow,
     bt_tab: gtk4::ToggleButton,
     list_box: gtk4::ListBox,
     status: gtk4::Label,
@@ -553,7 +554,7 @@ pub(super) async fn resume_bt_background_tasks(
             true
         }
     };
-    if !powered {
+    if !powered || !window.is_visible() || !bt_tab.is_active() {
         return;
     }
     start_bt_background_tasks(state, bt_tab, list_box, status);

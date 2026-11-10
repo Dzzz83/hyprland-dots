@@ -1,4 +1,4 @@
-//! Scanning — initial state, scan-on-show polling, and manual scan button.
+//! Scanning — initial state, automatic scans, and manual scan button.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,46 +15,23 @@ const WIFI_AUTO_SCAN_INTERVAL_MS: u64 = 15000;
 /// Interval for the background reconnect scan when panel is hidden and disconnected.
 const WIFI_BG_RECONNECT_INTERVAL_MS: u64 = 60_000;
 
-/// Poll the scan_requested flag and trigger scan+refresh when set.
-/// This runs on the GTK main thread via glib::timeout_add_local.
-pub(super) fn setup_scan_on_show(
-    widgets: &PanelWidgets,
-    state: Rc<RefCell<AppState>>,
-    scan_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    let list_box = widgets.network_list_box.clone();
-    let status = widgets.status_label.clone();
-    let switch = widgets.wifi_switch.clone();
+struct ScanGuard(Rc<RefCell<AppState>>);
 
-    glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-        if scan_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            let state = Rc::clone(&state);
-            let list_box = list_box.clone();
-            let status = status.clone();
-            let switch = switch.clone();
-
-            glib::spawn_future_local(async move {
-                let wifi = get_wifi(&state);
-
-                // Update WiFi switch state
-                match wifi.is_wifi_enabled().await {
-                    Ok(enabled) => switch.set_active(enabled),
-                    Err(e) => log::error!("Failed to get WiFi state: {e}"),
-                }
-
-                // Scan and refresh
-                if let Err(e) = wifi.request_scan().await {
-                    log::warn!("Scan-on-show scan failed: {e}");
-                }
-                glib::timeout_future(std::time::Duration::from_millis(
-                    WIFI_SCAN_RESULT_WAIT_MS,
-                ))
-                .await;
-                refresh_list(&state, &list_box, &status).await;
-            });
+impl ScanGuard {
+    fn start(state: &Rc<RefCell<AppState>>) -> Option<Self> {
+        let mut app = state.borrow_mut();
+        if app.wifi_scan_in_progress {
+            return None;
         }
-        glib::ControlFlow::Continue
-    });
+        app.wifi_scan_in_progress = true;
+        Some(Self(Rc::clone(state)))
+    }
+}
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        self.0.borrow_mut().wifi_scan_in_progress = false;
+    }
 }
 
 /// Initial state: check WiFi status and trigger first scan.
@@ -65,7 +42,11 @@ pub(super) fn setup_initial_state(widgets: &PanelWidgets, state: Rc<RefCell<AppS
     let spinner = widgets.spinner.clone();
     let scrolled = widgets.network_scroll.clone();
 
+    let Some(scan) = ScanGuard::start(&state) else {
+        return;
+    };
     glib::spawn_future_local(async move {
+        let _scan = scan;
         let wifi = get_wifi(&state);
 
         // Set WiFi switch to current state
@@ -175,6 +156,23 @@ pub(super) fn stop_wifi_auto_scan(state: &Rc<RefCell<AppState>>) {
     }
 }
 
+pub(super) fn reconnect_when_hidden(
+    state: Rc<RefCell<AppState>>,
+    window: &gtk4::ApplicationWindow,
+) {
+    let window = window.downgrade();
+    glib::spawn_future_local(async move {
+        let Some(window) = window.upgrade().filter(|window| !window.is_visible()) else {
+            return;
+        };
+        let wifi = get_wifi(&state);
+        let is_connected = wifi.has_active_connection().await.unwrap_or(false);
+        if !window.is_visible() && !is_connected {
+            start_wifi_bg_reconnect(state);
+        }
+    });
+}
+
 /// Start a slow background scan loop (every 60 s) to help NetworkManager
 /// find and autoconnect to saved networks while the panel is hidden.
 ///
@@ -187,45 +185,32 @@ pub(super) fn start_wifi_bg_reconnect(state: Rc<RefCell<AppState>>) {
         return;
     }
 
-    // Fire an immediate scan right now — don't wait 60 s for the first one.
-    glib::spawn_future_local({
-        let state = Rc::clone(&state);
-        async move {
-            let wifi = get_wifi(&state);
-            if let Err(e) = wifi.request_scan().await {
-                log::debug!("BG reconnect: immediate scan failed (may not be an error): {e}");
-            } else {
-                log::info!("BG reconnect: immediate scan triggered");
-            }
-        }
-    });
-
-    // Then repeat every 60 s until the timer is removed.
     let scan_id = glib::timeout_add_local(
         std::time::Duration::from_millis(WIFI_BG_RECONNECT_INTERVAL_MS),
         {
             let state = Rc::clone(&state);
             move || {
-                // If the source was cleared externally, stop the timer.
-                if state.borrow().wifi_bg_reconnect_source.is_none() {
-                    return glib::ControlFlow::Break;
-                }
-                let state_clone = Rc::clone(&state);
-                glib::spawn_future_local(async move {
-                    let wifi = get_wifi(&state_clone);
-                    if let Err(e) = wifi.request_scan().await {
-                        log::debug!("BG reconnect: periodic scan failed: {e}");
-                    } else {
-                        log::info!("BG reconnect: periodic scan triggered");
-                    }
-                });
+                glib::spawn_future_local(run_reconnect_scan(Rc::clone(&state)));
                 glib::ControlFlow::Continue
             }
         },
     );
-
     state.borrow_mut().wifi_bg_reconnect_source = Some(scan_id);
+    glib::spawn_future_local(run_reconnect_scan(state));
     log::info!("BG reconnect loop started (interval: 60 s)");
+}
+
+async fn run_reconnect_scan(state: Rc<RefCell<AppState>>) {
+    // A visibility or connection change may have stopped the loop since this was queued.
+    if state.borrow().wifi_bg_reconnect_source.is_none() {
+        return;
+    }
+    let Some(_scan) = ScanGuard::start(&state) else {
+        return;
+    };
+    if let Err(error) = get_wifi(&state).request_scan().await {
+        log::debug!("BG reconnect scan failed: {error}");
+    }
 }
 
 /// Stop the background reconnect scan loop.
@@ -249,24 +234,15 @@ async fn run_wifi_scan(
     status: gtk4::Label,
     manual_ui: Option<ManualWifiScanUi>,
 ) {
-    struct ScanGuard(Rc<RefCell<AppState>>);
-    impl Drop for ScanGuard {
-        fn drop(&mut self) {
-            self.0.borrow_mut().wifi_scan_in_progress = false;
-        }
+    if manual_ui.is_none() && state.borrow().wifi_auto_scan_source.is_none() {
+        return;
     }
-
-    {
-        let mut st = state.borrow_mut();
-        if st.wifi_scan_in_progress {
-            if let Some(ui) = manual_ui {
-                ui.scan_btn.set_sensitive(true);
-            }
-            return;
+    let Some(_scan) = ScanGuard::start(&state) else {
+        if let Some(ui) = manual_ui {
+            ui.scan_btn.set_sensitive(true);
         }
-        st.wifi_scan_in_progress = true;
-    }
-    let _guard = ScanGuard(Rc::clone(&state));
+        return;
+    };
 
     let wifi = get_wifi(&state);
     match wifi.is_wifi_enabled().await {
@@ -294,12 +270,15 @@ async fn run_wifi_scan(
 
     if let Err(e) = wifi.request_scan().await {
         log::error!("Scan failed: {e}");
-        status.set_text("Scan failed");
         if let Some(ui) = manual_ui {
+            status.set_text("Scan failed");
             ui.spinner.set_spinning(false);
             ui.spinner.set_visible(false);
             ui.scrolled.set_visible(true);
             ui.scan_btn.set_sensitive(true);
+        } else {
+            // NetworkManager can rate-limit scans. Show the networks it already knows about.
+            refresh_list(&state, &list_box, &status).await;
         }
         return;
     }

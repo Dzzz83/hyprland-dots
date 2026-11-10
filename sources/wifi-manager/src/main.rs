@@ -5,10 +5,13 @@ mod dbus;
 mod ui;
 
 use clap::Parser;
+use std::sync::atomic::Ordering;
+
+use daemon::PanelCommand;
 use gtk4::Application;
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4_layer_shell::{KeyboardMode, LayerShell};
+use ui::window::set_panel_visible;
 
 /// A floating WiFi manager for Wayland compositors (Hyprland/Sway)
 #[derive(Parser, Debug)]
@@ -101,29 +104,29 @@ fn main() {
         // Build the UI (starts hidden)
         let widgets = ui::window::build_window(app);
 
-        // Create a send-safe weak reference for cross-thread window access
-        let window_ref = {
-            use gtk4::glib::object::ObjectExt;
-            widgets.window.downgrade().into() // SendWeakRef
-        };
-        let window_ref: glib::SendWeakRef<gtk4::ApplicationWindow> = window_ref;
-
-        // Create panel state with visibility toggle callback
-        // This callback is called from the D-Bus thread, so it dispatches
-        // to the GTK main thread via MainContext::invoke (thread-safe).
-        let panel_state = daemon::PanelState::new(move |visible| {
+        let window_ref = glib::SendWeakRef::from(widgets.window.downgrade());
+        let panel_state = daemon::PanelState::new(move |command| {
             let window_ref = window_ref.clone();
-            glib::MainContext::default().invoke(move || {
+            // Resolve toggles against the actual window on the GTK thread.
+            glib::MainContext::default().spawn(async move {
                 if let Some(window) = window_ref.upgrade() {
-                    if visible {
-                        window.set_keyboard_mode(KeyboardMode::Exclusive);
-                        window.present();
-                    } else {
-                        window.set_visible(false);
-                        window.set_keyboard_mode(KeyboardMode::None);
+                    match command {
+                        PanelCommand::Toggle => set_panel_visible(&window, !window.is_visible()),
+                        PanelCommand::Show => set_panel_visible(&window, true),
+                        PanelCommand::Hide => set_panel_visible(&window, false),
+                        PanelCommand::Reload => {
+                            ui::window::reload_css();
+                            if let Some(action) = window.lookup_action("refresh-networks") {
+                                action.activate(None);
+                            }
+                        }
                     }
                 }
-            });
+            })
+        });
+        let visible = panel_state.visible.clone();
+        widgets.window.connect_visible_notify(move |window| {
+            visible.store(window.is_visible(), Ordering::Relaxed);
         });
 
         // Register the D-Bus daemon service
@@ -143,22 +146,16 @@ fn main() {
         });
 
         // Connect to NetworkManager and set up the app controller
-        let panel_state_for_app = panel_state.clone();
         glib::spawn_future_local(async move {
             match dbus::network_manager::WifiManager::new().await {
                 Ok(wifi) => {
                     log::info!("NetworkManager D-Bus connection established");
                     let config = config::Config::load();
-                    app::setup(
-                        &widgets,
-                        wifi,
-                        panel_state_for_app.scan_requested.clone(),
-                        panel_state_for_app.clone(),
-                    );
+                    app::setup(&widgets, wifi, panel_state.visible);
 
                     // Only show panel on start if configured
                     if config.show_on_start {
-                        panel_state_for_app.show();
+                        set_panel_visible(&widgets.window, true);
                     }
                 }
                 Err(e) => {
@@ -167,7 +164,7 @@ fn main() {
                         .status_label
                         .set_text("Error: NetworkManager unavailable");
                     // Still show the panel so user sees the error
-                    panel_state_for_app.show();
+                    set_panel_visible(&widgets.window, true);
                 }
             }
         });

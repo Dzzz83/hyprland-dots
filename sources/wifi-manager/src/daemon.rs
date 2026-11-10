@@ -1,20 +1,27 @@
 //! D-Bus daemon service — exposes Toggle/Show/Hide methods on the session bus.
 //!
 //! This allows `wifi-manager --toggle` to control a running instance.
-//! The interface is registered at `com.github.wifi_manager.WifiManager`
-//! on the session bus at path `/com/github/wifi_manager/WifiManager`.
+//! The interface is registered at `com.github.wifi_manager.Daemon`
+//! on the session bus at path `/com/github/wifi_manager/Daemon`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use zbus::interface;
+use gtk4::glib;
+use zbus::{fdo, interface};
 
 /// The D-Bus interface name and path.
 pub const DBUS_NAME: &str = "com.github.wifi_manager.Daemon";
 pub const DBUS_PATH: &str = "/com/github/wifi_manager/Daemon";
 
-/// Thread-safe callback type for toggling visibility from D-Bus thread.
-type ToggleFn = Arc<dyn Fn(bool) + Send + Sync>;
+pub enum PanelCommand {
+    Toggle,
+    Show,
+    Hide,
+    Reload,
+}
+
+type Dispatch = Arc<dyn Fn(PanelCommand) -> glib::JoinHandle<()> + Send + Sync>;
 
 /// State shared between the D-Bus service and the GTK window.
 /// Must be Send + Sync because zbus runs on its own async runtime.
@@ -22,41 +29,21 @@ type ToggleFn = Arc<dyn Fn(bool) + Send + Sync>;
 pub struct PanelState {
     /// Whether the panel is currently visible.
     pub visible: Arc<AtomicBool>,
-    /// Flag set by show() — polled by GTK main thread to trigger scan-on-show.
-    pub scan_requested: Arc<AtomicBool>,
-    /// Flag set by reload() — polled by GTK main thread to reload config/CSS.
-    pub reload_requested: Arc<AtomicBool>,
-    /// Callback to toggle visibility — dispatches to GTK main thread.
-    toggle_fn: ToggleFn,
+    dispatch: Dispatch,
 }
 
 impl PanelState {
-    pub fn new(toggle_fn: impl Fn(bool) + Send + Sync + 'static) -> Self {
+    pub fn new(dispatch: impl Fn(PanelCommand) -> glib::JoinHandle<()> + Send + Sync + 'static) -> Self {
         Self {
             visible: Arc::new(AtomicBool::new(false)),
-            scan_requested: Arc::new(AtomicBool::new(false)),
-            reload_requested: Arc::new(AtomicBool::new(false)),
-            toggle_fn: Arc::new(toggle_fn),
+            dispatch: Arc::new(dispatch),
         }
     }
 
-    pub fn show(&self) {
-        self.visible.store(true, Ordering::Relaxed);
-        self.scan_requested.store(true, Ordering::Relaxed);
-        (self.toggle_fn)(true);
-    }
-
-    pub fn hide(&self) {
-        self.visible.store(false, Ordering::Relaxed);
-        (self.toggle_fn)(false);
-    }
-
-    pub fn toggle(&self) {
-        if self.visible.load(Ordering::Relaxed) {
-            self.hide();
-        } else {
-            self.show();
-        }
+    async fn dispatch(&self, command: PanelCommand) -> fdo::Result<()> {
+        (self.dispatch)(command)
+            .await
+            .map_err(|error| fdo::Error::Failed(error.to_string()))
     }
 }
 
@@ -68,27 +55,27 @@ struct DaemonInterface {
 #[interface(name = "com.github.wifi_manager.Daemon")]
 impl DaemonInterface {
     /// Toggle panel visibility.
-    fn toggle(&self) {
+    async fn toggle(&self) -> fdo::Result<()> {
         log::info!("D-Bus Toggle() called");
-        self.state.toggle();
+        self.state.dispatch(PanelCommand::Toggle).await
     }
 
     /// Show the panel.
-    fn show(&self) {
+    async fn show(&self) -> fdo::Result<()> {
         log::info!("D-Bus Show() called");
-        self.state.show();
+        self.state.dispatch(PanelCommand::Show).await
     }
 
     /// Hide the panel.
-    fn hide(&self) {
+    async fn hide(&self) -> fdo::Result<()> {
         log::info!("D-Bus Hide() called");
-        self.state.hide();
+        self.state.dispatch(PanelCommand::Hide).await
     }
 
     /// Reload config and CSS.
-    fn reload(&self) {
+    async fn reload(&self) -> fdo::Result<()> {
         log::info!("D-Bus Reload() called");
-        self.state.reload_requested.store(true, Ordering::Relaxed);
+        self.state.dispatch(PanelCommand::Reload).await
     }
 
     /// Check if the panel is visible.

@@ -49,7 +49,8 @@
         "restart-interval": 5,
         "exec-on-event": false,
         "tooltip": true,
-        "on-click": "python3 -B $HOME/.config/hypr/scripts/battery-panel.py --toggle",
+        // Reuse the running popup without loading GTK in a second Python process.
+        "on-click": "busctl --user --auto-start=no call com.local.BatteryPanel /com/local/BatteryPanel org.freedesktop.Application Activate 'a{sv}' 0 >/dev/null 2>&1 || python3 -B $HOME/.config/hypr/scripts/battery-panel.py --toggle",
     },
 
     "pulseaudio": {
