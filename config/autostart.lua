@@ -13,7 +13,7 @@ hl.on("hyprland.start", function()
     hl.exec_cmd("python3 $HOME/.config/hypr/scripts/proton-tray-watch.py")
     hl.exec_cmd("swaync")
     -- Use the tested rendering path for Lenovo's system-authentication dialog.
-    hl.exec_cmd("env QT_QUICK_BACKEND=software QT_STYLE_OVERRIDE=Fusion /usr/lib/polkit-kde-authentication-agent-1")
+    hl.exec_cmd("env QT_QUICK_BACKEND=software QT_STYLE_OVERRIDE=Fusion QT_QPA_PLATFORMTHEME=gtk3 /usr/lib/polkit-kde-authentication-agent-1")
     hl.exec_cmd("python3 $HOME/.config/hypr/scripts/display-temperature.py start")
     hl.exec_cmd("$HOME/.local/bin/wifi-manager")
 

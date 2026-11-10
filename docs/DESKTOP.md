@@ -49,10 +49,10 @@ Standard, Fast or Conservation (around 60%, controlled by Lenovo firmware).
 The popup and bar share `scripts/power_backend.py`. Conservation uses UPower's
 charging-limit API so its persistent policy agrees with the firmware; Fast
 uses the installed `pkexec /usr/bin/legion_cli` control and may require system
-authentication. The installed KDE Polkit agent starts at login with software
-rendering and the Fusion style, avoiding the authentication-dialog crash seen
-with the session's default rendering/theme settings. No passwordless sudo rule
-or new privileged service is installed.
+authentication. The KDE Polkit agent starts at login with software rendering
+and the Fusion style to avoid the authentication dialog crash. It uses the
+GTK 3 platform theme for its colors. No passwordless sudo rule or new privileged
+service is installed.
 
 Battery runtime uses UPower's estimate while discharging. A measured discharge
 rate is cached in `$XDG_CACHE_HOME/hypr/battery-use.json` (normally `~/.cache/hypr/`)
